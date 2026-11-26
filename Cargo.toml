@@ -13,7 +13,7 @@ version = "0.1.0"
 [workspace.dependencies]
 tv-core = { path = "crates/tv-core" }
 
-rune = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d", features = ["native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "4918969f04dce020f63b34e024368a86e5e1857d" }
 
 async-trait = "0.1"
@@ -27,6 +27,7 @@ rustls-pki-types = "1"
 rustls-webpki = "0.103"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlparser = "0.64"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "fs"] }

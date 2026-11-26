@@ -18,9 +18,11 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::connection::{ConnectionProfile, PasswordMode, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
-    TablePage, TableStats, TableStructure,
+    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
+    TablePage, TableStats, TableStructure, TransactionOutcome,
 };
+use crate::explain::{ExplainPlan, build_explain_sql};
+use crate::staging::build_fk_where_clause;
 use std::collections::HashMap;
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
@@ -40,6 +42,7 @@ pub struct PostgresSession {
     use_tls_for_cancel: bool,
     disconnected: Arc<AtomicBool>,
     conn_task: Mutex<Option<JoinHandle<()>>>,
+    tx_lock: tokio::sync::Mutex<()>,
 }
 
 impl Drop for PostgresSession {
@@ -89,6 +92,7 @@ impl PostgresSession {
             use_tls_for_cancel: used_tls,
             disconnected,
             conn_task: Mutex::new(Some(conn_task)),
+            tx_lock: tokio::sync::Mutex::new(()),
         };
 
         let (info, log) = session.fetch_server_info().await?;
@@ -784,6 +788,186 @@ impl DbSession for PostgresSession {
             }
             Err(err) => Err(map_pg_err(err)),
         }
+    }
+
+    async fn execute_transaction(
+        &self,
+        statements: &[String],
+    ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        self.ensure_alive()?;
+        if statements.is_empty() {
+            return Err(DbError::InvalidInput("no SQL statements to execute in transaction".to_owned()));
+        }
+        let _tx_guard = self.tx_lock.lock().await;
+        let total_start = Instant::now();
+        let mut logs = Vec::with_capacity(statements.len() + 2);
+        let mut total_rows_affected = 0u64;
+        let mut executed = 0usize;
+
+        let begin_start = Instant::now();
+        if let Err(pg_err) = self.client.simple_query("BEGIN").await {
+            let mapped = map_pg_err(pg_err);
+            logs.push(ExecutedSql {
+                sql: "BEGIN;".to_owned(),
+                duration_ms: begin_start.elapsed().as_millis() as u64,
+                error: Some(mapped.to_string()),
+            });
+            return Err(mapped);
+        }
+        logs.push(ExecutedSql {
+            sql: "BEGIN;".to_owned(),
+            duration_ms: begin_start.elapsed().as_millis() as u64,
+            error: None,
+        });
+
+        for raw_stmt in statements {
+            let stmt = raw_stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            let stmt_start = Instant::now();
+            match self.client.simple_query(stmt).await {
+                Ok(messages) => {
+                    for msg in messages {
+                        if let SimpleQueryMessage::CommandComplete(affected) = msg {
+                            total_rows_affected = total_rows_affected.saturating_add(affected);
+                        }
+                    }
+                    executed += 1;
+                    logs.push(ExecutedSql {
+                        sql: stmt.to_owned(),
+                        duration_ms: stmt_start.elapsed().as_millis() as u64,
+                        error: None,
+                    });
+                }
+                Err(pg_err) => {
+                    let mapped = map_pg_err(pg_err);
+                    drop(self.client.simple_query("ROLLBACK").await);
+                    return Err(mapped);
+                }
+            }
+        }
+
+        let commit_start = Instant::now();
+        match self.client.simple_query("COMMIT").await {
+            Ok(_) => {
+                logs.push(ExecutedSql {
+                    sql: "COMMIT;".to_owned(),
+                    duration_ms: commit_start.elapsed().as_millis() as u64,
+                    error: None,
+                });
+                Ok((
+                    TransactionOutcome {
+                        statements_executed: executed,
+                        total_rows_affected,
+                        elapsed_ms: total_start.elapsed().as_millis() as u64,
+                    },
+                    logs,
+                ))
+            }
+            Err(pg_err) => {
+                let mapped = map_pg_err(pg_err);
+                drop(self.client.simple_query("ROLLBACK").await);
+                Err(mapped)
+            }
+        }
+    }
+
+    async fn explain_sql(&self, statement: &str, analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError> {
+        self.ensure_alive()?;
+        let trimmed = statement.trim();
+        if trimmed.is_empty() {
+            return Err(DbError::InvalidInput("cannot explain an empty SQL statement".to_owned()));
+        }
+        let explain_query = build_explain_sql(trimmed, analyze);
+        let start = Instant::now();
+        let messages = match self.client.simple_query(&explain_query).await {
+            Ok(msgs) => msgs,
+            Err(err) => return Err(map_pg_err(err)),
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let mut chunks = Vec::new();
+        for msg in messages {
+            if let SimpleQueryMessage::Row(row) = msg
+                && let Some(cell) = row.get(0)
+            {
+                chunks.push(cell.to_owned());
+            }
+        }
+        let raw_json = chunks.join("\n");
+        let plan = ExplainPlan::parse_json(trimmed.to_owned(), analyze, &raw_json)
+            .map_err(|e| DbError::InvalidInput(e.to_string()))?;
+
+        Ok((
+            plan,
+            ExecutedSql {
+                sql: explain_query,
+                duration_ms,
+                error: None,
+            },
+        ))
+    }
+
+    async fn fetch_fk_row(
+        &self,
+        fk: &ForeignKeyRef,
+        value: &CellValue,
+        source_col: &ColumnMeta,
+    ) -> Result<(FkPeekRow, ExecutedSql), DbError> {
+        self.ensure_alive()?;
+        let Some(where_clause) = build_fk_where_clause(&fk.target_column, value, source_col) else {
+            return Err(DbError::InvalidInput("cannot peek NULL foreign-key value".to_owned()));
+        };
+
+        let (target_columns, _) = self
+            .fetch_column_metas(&fk.target_schema, &fk.target_table)
+            .await?;
+        if target_columns.is_empty() {
+            return Err(DbError::InvalidInput(format!(
+                "target table {}.{} has no columns",
+                fk.target_schema, fk.target_table
+            )));
+        }
+
+        let req = PageRequest {
+            schema: fk.target_schema.clone(),
+            table: fk.target_table.clone(),
+            filter_where: Some(where_clause.clone()),
+            sort: None,
+            limit: 1,
+            offset: 0,
+        };
+        let sql = build_table_page_sql(&fk.target_schema, &fk.target_table, &target_columns, &req, 1, 0);
+        let start = Instant::now();
+        let pg_rows = self.client.query(&sql, &[]).await.map_err(map_pg_err)?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let row = if let Some(first) = pg_rows.into_iter().next() {
+            let mut cells = Vec::with_capacity(target_columns.len());
+            for (idx, col) in target_columns.iter().enumerate() {
+                let raw = first.try_get::<usize, Option<String>>(idx).map_err(map_pg_err)?;
+                cells.push(CellValue::parse_from_pg_text(&col.udt_name, raw));
+            }
+            Some(cells)
+        } else {
+            None
+        };
+
+        Ok((
+            FkPeekRow {
+                fk: fk.clone(),
+                lookup_display: format!("{} = {}", fk.target_column, value.display_compact()),
+                columns: target_columns,
+                row,
+                elapsed_ms,
+            },
+            ExecutedSql {
+                sql,
+                duration_ms: elapsed_ms,
+                error: None,
+            },
+        ))
     }
 }
 

@@ -5,7 +5,8 @@ use std::env;
 use tokio::runtime::Runtime;
 use tv_core::engine::postgres::PostgresSession;
 use tv_core::{
-    CellValue, ConnectionProfile, DbError, DbObjectKind, DbSession, PageRequest, PasswordMode, SortSpec, SslMode,
+    CellValue, ConnectionProfile, DbError, DbObjectKind, DbSession, ForeignKeyRef, PageRequest, PasswordMode,
+    SortSpec, SslMode, StagedCellValue, StagedChanges,
 };
 
 fn local_pg_user() -> String {
@@ -394,5 +395,120 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
         assert!(cancel_start.elapsed() < std::time::Duration::from_secs(3));
 
         shared.ping().await.expect("ping succeeds");
+
+        // 1. Live FK Peek lookup
+        let (peek, peek_log) = shared
+            .fetch_fk_row(
+                &ForeignKeyRef {
+                    constraint_name: "students_group_id_fkey".to_owned(),
+                    target_schema: "public".to_owned(),
+                    target_table: "study_groups".to_owned(),
+                    target_column: "group_id".to_owned(),
+                },
+                &CellValue::Int(1),
+                &structure.columns[10],
+            )
+            .await
+            .expect("fetch_fk_row succeeds");
+        assert!(peek_log.sql.contains("\"public\".\"study_groups\""));
+        let peek_row = peek.row.expect("study group 1 exists");
+        assert_eq!(peek_row[0], CellValue::Int(1));
+        assert_eq!(peek_row[1], CellValue::Text("Study Room F".to_owned()));
+
+        let null_peek = shared
+            .fetch_fk_row(&structure.columns[10].foreign_key.clone().expect("fk"), &CellValue::Null, &structure.columns[10])
+            .await;
+        assert!(matches!(null_peek, Err(DbError::InvalidInput(_))));
+
+        // 2. Live Visual EXPLAIN (FORMAT JSON) & EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        let join_sql = "SELECT s.full_name, g.room_name FROM public.students s JOIN public.study_groups g ON g.group_id = s.group_id ORDER BY s.student_id";
+        let (est_plan, _) = shared
+            .explain_sql(join_sql, false)
+            .await
+            .expect("estimated explain succeeds");
+        assert!(!est_plan.analyzed);
+        assert!(est_plan.node_count() >= 1);
+
+        let (ana_plan, ana_log) = shared
+            .explain_sql(join_sql, true)
+            .await
+            .expect("analyze explain succeeds");
+        assert!(ana_log.sql.starts_with("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)"));
+        assert!(ana_plan.analyzed);
+        assert!(ana_plan.execution_time_ms.is_some());
+        assert!(ana_plan.root.actual_total_time_ms.is_some());
+
+        // 3. Staged transactional commit (UPDATE with apostrophe/jsonb/bytea + INSERT + DELETE)
+        let mut staged = StagedChanges::new();
+        staged.stage_cell_edit(
+            0,
+            &page1.rows[0],
+            2,
+            StagedCellValue::Literal("Troy 'T-Bone' Barnes".to_owned()),
+        );
+        staged.stage_cell_edit(0, &page1.rows[0], 5, StagedCellValue::Literal("3.55".to_owned()));
+        staged.stage_cell_edit(0, &page1.rows[0], 8, StagedCellValue::Literal(r#"{"ac":"Master"}"#.to_owned()));
+        staged.stage_cell_edit(0, &page1.rows[0], 9, StagedCellValue::Literal("\\xcafebabe".to_owned()));
+
+        let draft = staged.stage_insert_row(&page1.columns);
+        staged.stage_insert_cell_edit(draft, 0, StagedCellValue::Literal("5".to_owned()));
+        staged.stage_insert_cell_edit(draft, 1, StagedCellValue::Literal("22222222-3333-4444-5555-666666666666".to_owned()));
+        staged.stage_insert_cell_edit(draft, 2, StagedCellValue::Literal("Pierce Hawthorne".to_owned()));
+        staged.stage_insert_cell_edit(draft, 6, StagedCellValue::Literal("Law".to_owned()));
+        staged.stage_insert_cell_edit(draft, 10, StagedCellValue::Literal("1".to_owned()));
+
+        // Delete Jeff (row index 1 of page2, student_id = 4)
+        staged.toggle_delete_row(100, &page2.rows[1]);
+        let commit_stmts = staged
+            .build_statements("public", "students", &page1.columns)
+            .expect("build staged statements");
+        let (tx_out, tx_logs) = shared
+            .execute_transaction(&commit_stmts)
+            .await
+            .expect("commit staged transaction succeeds");
+        assert_eq!(tx_out.statements_executed, 3);
+        assert_eq!(tx_logs.len(), 5); // BEGIN + 3 stmts + COMMIT
+
+        let (after_commit, _) = shared
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "student_id".to_owned(),
+                    ascending: true,
+                }),
+                limit: 50,
+                offset: 0,
+            })
+            .await
+            .expect("refetch after commit");
+        assert_eq!(after_commit.rows.len(), 4);
+        assert_eq!(after_commit.rows[0][2], CellValue::Text("Troy 'T-Bone' Barnes".to_owned()));
+        assert_eq!(after_commit.rows[0][5], CellValue::Numeric("3.55".to_owned()));
+        assert_eq!(after_commit.rows[0][9], CellValue::Bytes(vec![0xca, 0xfe, 0xba, 0xbe]));
+        assert_eq!(after_commit.rows[3][0], CellValue::Int(5));
+        assert_eq!(after_commit.rows[3][2], CellValue::Text("Pierce Hawthorne".to_owned()));
+
+        // 4. Transactional rollback guarantees atomicity when second statement violates PK
+        let rollback_stmts = vec![
+            "UPDATE \"public\".\"students\" SET \"full_name\" = 'Should Rollback' WHERE \"student_id\" = 1;".to_owned(),
+            "INSERT INTO \"public\".\"students\" (\"student_id\", \"id\", \"full_name\", \"major\") VALUES (1, '33333333-3333-4444-5555-666666666666', 'Evil Abed', 'Film');".to_owned(),
+        ];
+        let rollback_err = shared.execute_transaction(&rollback_stmts).await;
+        assert!(matches!(rollback_err, Err(DbError::QueryFailed { .. })));
+
+        let (after_rollback, _) = shared
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("student_id = 1".to_owned()),
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("refetch after rollback");
+        assert_eq!(after_rollback.rows[0][2], CellValue::Text("Troy 'T-Bone' Barnes".to_owned()));
     });
 }

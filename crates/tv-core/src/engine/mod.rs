@@ -1,5 +1,6 @@
 pub mod postgres;
 
+use crate::explain::ExplainPlan;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -295,6 +296,14 @@ impl CellValue {
         }
     }
 
+    /// Returns editable text suitable for inline grid/inspector editing (`""` for `Null`).
+    pub fn to_edit_string(&self) -> String {
+        match self {
+            Self::Null => String::new(),
+            other => other.copy_text(),
+        }
+    }
+
     /// Returns pretty-formatted JSON when the cell holds JSON/JSONB.
     pub fn pretty_json(&self) -> Option<String> {
         let Self::Json(raw) = self else {
@@ -467,6 +476,24 @@ pub struct ExecutedSql {
     pub error: Option<String>,
 }
 
+/// Outcome reported after committing staged table edits inside one SQL transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransactionOutcome {
+    pub statements_executed: usize,
+    pub total_rows_affected: u64,
+    pub elapsed_ms: u64,
+}
+
+/// Referenced target row fetched when peeking a foreign-key cell value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FkPeekRow {
+    pub fk: ForeignKeyRef,
+    pub lookup_display: String,
+    pub columns: Vec<ColumnMeta>,
+    pub row: Option<Vec<CellValue>>,
+    pub elapsed_ms: u64,
+}
+
 /// Engine-agnostic database session contract used by the workspace worker.
 #[async_trait]
 pub trait DbSession: Send + Sync {
@@ -482,6 +509,17 @@ pub trait DbSession: Send + Sync {
         statements: &[String],
         row_limit: Option<usize>,
     ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError>;
+    async fn execute_transaction(
+        &self,
+        statements: &[String],
+    ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError>;
+    async fn explain_sql(&self, statement: &str, analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError>;
+    async fn fetch_fk_row(
+        &self,
+        fk: &ForeignKeyRef,
+        value: &CellValue,
+        source_col: &ColumnMeta,
+    ) -> Result<(FkPeekRow, ExecutedSql), DbError>;
     async fn cancel_running_query(&self) -> Result<(), DbError>;
     async fn ping(&self) -> Result<(), DbError>;
 }

@@ -4,9 +4,12 @@ use chrono::{Datelike, Utc};
 use tempfile::tempdir;
 use tv_core::engine::postgres::{quote_ident, synthesize_table_ddl};
 use tv_core::{
-    AccentColor, CellValue, ColumnMeta, ConnectionId, ConnectionProfile, ConnectionStore, EnvTag, ForeignKeyRef,
-    IndexInfo, NewHistoryEntry, PasswordMode, QueryStore, SafetyPolicy, SavedQuery, SavedQueryId, SortOrder,
-    SslMode, StoreData, UrlParseError, ValidationError, cursor_line_col, format_sql, split_statements,
+    AccentColor, CellValue, ColumnMeta, ConnectionId, ConnectionProfile, ConnectionStore, EnvTag, ExplainPlan,
+    ExportFormat, ForeignKeyRef, IndexInfo, NewHistoryEntry, PasswordMode, QueryStatementResult, QueryStore,
+    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SortOrder, SslMode, StagedCellValue, StagedChanges,
+    StagingError, StatementRisk, StoreData, UrlParseError, ValidationError, build_explain_sql,
+    build_fk_where_clause, cursor_line_col, evaluate_sql_safety, evaluate_staged_commit_safety, export_csv,
+    export_json, export_rows, export_sql_inserts, format_sql, inspect_statement, split_statements,
     statement_at_cursor,
 };
 
@@ -323,4 +326,348 @@ fn query_store_persists_history_and_saved_queries_roundtrip() {
 
     store.delete_saved_query(qid).expect("delete saved");
     assert!(store.get_saved_query(qid).expect("get deleted").is_none());
+}
+
+fn sample_greendale_columns() -> Vec<ColumnMeta> {
+    vec![
+        ColumnMeta {
+            name: "student_id".to_owned(),
+            data_type: "integer".to_owned(),
+            udt_name: "int4".to_owned(),
+            nullable: false,
+            default_expr: Some("nextval('students_student_id_seq'::regclass)".to_owned()),
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "full_name".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "email".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "gpa".to_owned(),
+            data_type: "numeric(4,2)".to_owned(),
+            udt_name: "numeric".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "profile".to_owned(),
+            data_type: "jsonb".to_owned(),
+            udt_name: "jsonb".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "badge".to_owned(),
+            data_type: "bytea".to_owned(),
+            udt_name: "bytea".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+    ]
+}
+
+#[test]
+fn safety_guardrails_classify_and_enforce_policies() {
+    assert_eq!(
+        inspect_statement("SELECT * FROM public.students WHERE gpa >= 3.5").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement("EXPLAIN SELECT * FROM public.students").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement("EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM public.students").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement("EXPLAIN ANALYZE DELETE FROM public.students WHERE student_id = 1").risk,
+        StatementRisk::WriteDml
+    );
+    assert_eq!(
+        inspect_statement("UPDATE public.students SET gpa = 4.0 WHERE student_id = 3").risk,
+        StatementRisk::WriteDml
+    );
+    assert_eq!(
+        inspect_statement("UPDATE public.students SET gpa = 0.0").risk,
+        StatementRisk::Destructive
+    );
+    assert_eq!(
+        inspect_statement("DELETE FROM public.students").risk,
+        StatementRisk::Destructive
+    );
+    assert_eq!(
+        inspect_statement("DROP TABLE public.students").risk,
+        StatementRisk::Destructive
+    );
+    assert_eq!(
+        inspect_statement("WITH d AS (DELETE FROM public.students WHERE student_id = 1 RETURNING *) SELECT * FROM d")
+            .risk,
+        StatementRisk::WriteDml
+    );
+
+    // Unparseable SQL fails closed as a write rather than bypassing guardrails.
+    let unparsed = inspect_statement("DO $$ BEGIN RAISE NOTICE 'greendale'; END $$;");
+    assert!(!unparsed.parsed);
+    assert!(unparsed.risk > StatementRisk::ReadOnly);
+
+    let writes = vec!["UPDATE public.students SET gpa = 3.9 WHERE student_id = 1".to_owned()];
+    let reads = vec!["SELECT full_name FROM public.students".to_owned()];
+    let destructive = vec!["DELETE FROM public.students".to_owned()];
+
+    assert_eq!(evaluate_sql_safety(SafetyPolicy::ReadOnly, EnvTag::Local, &reads), SafetyDecision::Allow);
+    assert!(matches!(
+        evaluate_sql_safety(SafetyPolicy::ReadOnly, EnvTag::Local, &writes),
+        SafetyDecision::Block { .. }
+    ));
+    assert!(matches!(
+        evaluate_sql_safety(SafetyPolicy::StagedOnly, EnvTag::Staging, &writes),
+        SafetyDecision::Block { .. }
+    ));
+    assert!(matches!(
+        evaluate_sql_safety(SafetyPolicy::ConfirmWrites, EnvTag::Development, &writes),
+        SafetyDecision::RequireConfirmation { is_destructive: false, .. }
+    ));
+    assert!(matches!(
+        evaluate_sql_safety(SafetyPolicy::Unrestricted, EnvTag::Production, &destructive),
+        SafetyDecision::RequireConfirmation { is_destructive: true, .. }
+    ));
+    assert_eq!(
+        evaluate_sql_safety(SafetyPolicy::Unrestricted, EnvTag::Local, &destructive),
+        SafetyDecision::Allow
+    );
+
+    assert!(evaluate_staged_commit_safety(SafetyPolicy::ReadOnly).is_err());
+    assert!(evaluate_staged_commit_safety(SafetyPolicy::StagedOnly).is_ok());
+}
+
+#[test]
+fn staged_changes_build_transaction_diff_and_revert_cleanly() {
+    let cols = sample_greendale_columns();
+    let row0 = vec![
+        CellValue::Int(1),
+        CellValue::Text("Troy Barnes".to_owned()),
+        CellValue::Text("troy@greendale.edu".to_owned()),
+        CellValue::Numeric("3.45".to_owned()),
+        CellValue::Json(r#"{"handshake":true}"#.to_owned()),
+        CellValue::Bytes(vec![0xde, 0xad]),
+    ];
+    let row1 = vec![
+        CellValue::Int(2),
+        CellValue::Text("Abed Nadir".to_owned()),
+        CellValue::Null,
+        CellValue::Numeric("3.92".to_owned()),
+        CellValue::Null,
+        CellValue::Null,
+    ];
+
+    let mut staged = StagedChanges::new();
+    // Edit Troy's name with an embedded apostrophe and revert email back to original.
+    staged.stage_cell_edit(0, &row0, 1, StagedCellValue::Literal("Troy 'T-Bone' Barnes".to_owned()));
+    staged.stage_cell_edit(0, &row0, 2, StagedCellValue::Null);
+    assert_eq!(staged.update_count(), 1);
+    staged.stage_cell_edit(0, &row0, 2, StagedCellValue::Literal("troy@greendale.edu".to_owned()));
+    assert_eq!(staged.effective_existing_cell(0, 2), None);
+
+    // Insert Pierce as a draft row keeping PK default.
+    let draft_id = staged.stage_insert_row(&cols);
+    assert!(matches!(staged.inserts[0].values[0], StagedCellValue::DefaultExpr));
+    staged.stage_insert_cell_edit(draft_id, 1, StagedCellValue::Literal("Pierce Hawthorne".to_owned()));
+    staged.stage_insert_cell_edit(draft_id, 3, StagedCellValue::Literal("2.15".to_owned()));
+    staged.stage_insert_cell_edit(draft_id, 5, StagedCellValue::Literal("cafe".to_owned()));
+
+    // Toggle delete on row 1, discarding any pending update on that row.
+    staged.stage_cell_edit(1, &row1, 1, StagedCellValue::Literal("Abed Temp".to_owned()));
+    assert!(staged.toggle_delete_row(1, &row1));
+    assert!(!staged.is_row_updated(1));
+    assert!(staged.is_row_deleted(1));
+
+    let tx_sql = staged
+        .build_transaction_sql("public", "students", &cols)
+        .expect("build tx sql");
+    assert!(tx_sql.starts_with("BEGIN;\n"));
+    assert!(tx_sql.contains("UPDATE \"public\".\"students\" SET \"full_name\" = 'Troy ''T-Bone'' Barnes' WHERE \"student_id\" = 1;"));
+    assert!(tx_sql.contains("INSERT INTO \"public\".\"students\" (\"full_name\", \"email\", \"gpa\", \"profile\", \"badge\") VALUES ('Pierce Hawthorne', NULL, 2.15, NULL, '\\xcafe'::bytea);"));
+    assert!(tx_sql.contains("DELETE FROM \"public\".\"students\" WHERE \"student_id\" = 2;"));
+    assert!(tx_sql.ends_with("COMMIT;\n"));
+
+    let (before, after) = staged.build_diff_texts("public", "students", &cols);
+    assert!(before.contains("Troy Barnes"));
+    assert!(after.contains("Troy ''T-Bone'' Barnes"));
+    assert!(after.contains("Pierce Hawthorne"));
+    assert!(before.contains("Abed Nadir"));
+
+    // Updating existing rows without a PK is refused safely.
+    let mut no_pk_cols = cols.clone();
+    no_pk_cols[0].is_primary_key = false;
+    assert!(matches!(
+        staged.build_statements("public", "students", &no_pk_cols),
+        Err(StagingError::MissingPrimaryKey { .. })
+    ));
+
+    // FK WHERE filter helper skips NULL and escapes strings cleanly.
+    assert_eq!(
+        build_fk_where_clause("group_id", &CellValue::Int(1), &cols[0]),
+        Some("\"group_id\" = 1".to_owned())
+    );
+    assert_eq!(build_fk_where_clause("group_id", &CellValue::Null, &cols[0]), None);
+}
+
+#[test]
+fn explain_parser_computes_exclusive_metrics_and_skew() {
+    let raw = r#"[
+      {
+        "Plan": {
+          "Node Type": "Hash Join",
+          "Join Type": "Inner",
+          "Startup Cost": 1.15,
+          "Total Cost": 24.50,
+          "Plan Rows": 100,
+          "Plan Width": 64,
+          "Actual Startup Time": 0.420,
+          "Actual Total Time": 4.200,
+          "Actual Rows": 8,
+          "Actual Loops": 1,
+          "Hash Cond": "(s.group_id = g.group_id)",
+          "Shared Hit Blocks": 14,
+          "Shared Read Blocks": 2,
+          "Plans": [
+            {
+              "Node Type": "Seq Scan",
+              "Relation Name": "students",
+              "Schema": "public",
+              "Alias": "s",
+              "Startup Cost": 0.00,
+              "Total Cost": 18.00,
+              "Plan Rows": 1,
+              "Plan Width": 40,
+              "Actual Startup Time": 0.050,
+              "Actual Total Time": 1.500,
+              "Actual Rows": 250,
+              "Actual Loops": 1,
+              "Filter": "(gpa >= 3.0)",
+              "Rows Removed by Filter": 2
+            },
+            {
+              "Node Type": "Hash",
+              "Startup Cost": 1.05,
+              "Total Cost": 1.05,
+              "Plan Rows": 4,
+              "Plan Width": 24,
+              "Actual Startup Time": 0.120,
+              "Actual Total Time": 0.200,
+              "Actual Rows": 4,
+              "Actual Loops": 1,
+              "Plans": []
+            }
+          ]
+        },
+        "Planning Time": 0.312,
+        "Execution Time": 4.350
+      }
+    ]"#;
+
+    assert_eq!(
+        build_explain_sql("SELECT * FROM public.students;", true),
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT * FROM public.students"
+    );
+    let plan = ExplainPlan::parse_json("SELECT * FROM public.students".to_owned(), true, raw)
+        .expect("parse explain json");
+    assert!(plan.analyzed);
+    assert_eq!(plan.node_count(), 3);
+    assert_eq!(plan.total_shared_hits(), 14);
+    assert_eq!(plan.total_shared_reads(), 2);
+
+    let root_excl = plan.root.exclusive_time_ms().expect("exclusive ms");
+    assert!((root_excl - 2.5).abs() < 0.001, "expected ~2.5ms got {root_excl}");
+    assert!(plan.root.children[0].row_estimate_ratio().is_some());
+    assert_eq!(
+        plan.root.children[0].relation_display().as_deref(),
+        Some("public.students")
+    );
+
+    // Also auto-detects when executed inline from SQL editor
+    let qres = QueryStatementResult {
+        sql: "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM public.students".to_owned(),
+        columns: vec![ColumnMeta {
+            name: "QUERY PLAN".to_owned(),
+            data_type: "json".to_owned(),
+            udt_name: "json".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        }],
+        rows: vec![vec![CellValue::Json(raw.to_owned())]],
+        rows_affected: None,
+        truncated: false,
+        total_rows_seen: 1,
+        elapsed_ms: 4,
+        error: None,
+    };
+    assert!(ExplainPlan::try_extract_from_result(&qres).is_some());
+}
+
+#[test]
+fn export_formats_csv_json_and_sql_inserts_with_proper_escaping() {
+    let cols = sample_greendale_columns();
+    let rows = vec![vec![
+        CellValue::Int(1),
+        CellValue::Text("Troy \"T-Bone\", Jr.".to_owned()),
+        CellValue::Null,
+        CellValue::Numeric("3.45".to_owned()),
+        CellValue::Json(r#"{"campus":"Greendale"}"#.to_owned()),
+        CellValue::Bytes(vec![0xca, 0xfe]),
+    ]];
+
+    let csv = export_csv(&cols, &rows);
+    assert!(csv.starts_with("student_id,full_name,email,gpa,profile,badge\n"));
+    assert!(csv.contains("1,\"Troy \"\"T-Bone\"\", Jr.\",,3.45,\"{\"\"campus\"\":\"\"Greendale\"\"}\",\\xcafe\n"));
+
+    let json = export_json(&cols, &rows);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid exported json");
+    assert_eq!(parsed[0]["student_id"], 1);
+    assert_eq!(parsed[0]["email"], serde_json::Value::Null);
+    assert_eq!(parsed[0]["profile"]["campus"], "Greendale");
+
+    let sql = export_sql_inserts(Some("public"), "students", &cols, &rows);
+    assert!(sql.contains("INSERT INTO \"public\".\"students\" (\"student_id\", \"full_name\", \"email\", \"gpa\", \"profile\", \"badge\") VALUES (1, 'Troy \"T-Bone\", Jr.', NULL, 3.45, '{\"campus\":\"Greendale\"}'::jsonb, '\\xcafe'::bytea);"));
+
+    let via_dispatch = export_rows(ExportFormat::SqlInsert, None, "custom_query", &cols, &rows);
+    assert!(via_dispatch.starts_with("INSERT INTO \"custom_query\""));
 }
