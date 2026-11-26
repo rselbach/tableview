@@ -1,3 +1,5 @@
 #![forbid(unsafe_code)]
 
-fn main() {}
+fn main() {
+    tv_app::run();
+}
