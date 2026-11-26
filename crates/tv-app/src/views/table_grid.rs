@@ -42,10 +42,15 @@ pub fn build_tab_bar(session: &SessionState, k: &Kit, cx: &Cx<AppState>) -> El {
         } else {
             base_title.to_owned()
         };
-        let tab_icon = match tab.object_kind() {
-            Some(DbObjectKind::View) => &icons::VIEW_EYE,
-            Some(DbObjectKind::MaterializedView) => &icons::MATERIALIZED_VIEW,
+        let tab_icon = match (&tab.content, tab.object_kind()) {
+            (crate::state::TabContent::Query(_), _) => &icons::SQL_QUERY,
+            (_, Some(DbObjectKind::View)) => &icons::VIEW_EYE,
+            (_, Some(DbObjectKind::MaterializedView)) => &icons::MATERIALIZED_VIEW,
             _ => &icons::TABLE,
+        };
+        let dirty_title = match &tab.content {
+            crate::state::TabContent::Query(q) if q.is_dirty() => format!("{display_title} •"),
+            _ => display_title,
         };
         let status = if tab.is_loading() {
             Some(TabItemStatus::Busy)
@@ -54,7 +59,7 @@ pub fn build_tab_bar(session: &SessionState, k: &Kit, cx: &Cx<AppState>) -> El {
         } else {
             None
         };
-        entries.push((tab.id.to_string(), display_title, tab_icon, status));
+        entries.push((tab.id.to_string(), dirty_title, tab_icon, status));
     }
 
     let items: Vec<TabItem<'_, AppState>> = entries
@@ -67,11 +72,23 @@ pub fn build_tab_bar(session: &SessionState, k: &Kit, cx: &Cx<AppState>) -> El {
         })
         .collect();
 
+    let new_query_btn = IconButton::new(&icons::PLUS)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label("New SQL query")
+        .help("New SQL query")
+        .shortcut("mod+t")
+        .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_new_query_tab(tx))
+        .build(k)
+        .key("tab-bar-new-query-btn");
+
     let strip = TabStrip::new(&strip_key, TabOrientation::Horizontal)
         .label("Open workspace tabs")
         .tabs(items)
         .active(active_id_str.as_deref())
         .viewport_width(cx.layout_size(&strip_key).map(|sz| sz[0]))
+        .trailing_action(new_query_btn)
+        .trailing_width(28.0)
         .drag_state(&session.tab_drag, move |s: &mut AppState| s.tab_drag_mut(sid))
         .fill(c.layer_01)
         .on_select(|s: &mut AppState, id, tx| {
@@ -356,14 +373,16 @@ fn build_data_grid(
             let Some(val) = page.rows.get(row_idx).and_then(|r| r.get(col_idx)) else {
                 return Cell::text("");
             };
-            match val {
-                CellValue::Null => Cell::el(null_pill_el(null_bg, null_fg, null_border, small_font, radius_xs)),
-                CellValue::Bool(b) => Cell::text(if *b { "true" } else { "false" })
-                    .mono()
-                    .color(if *b { bool_true_fg } else { muted_fg }),
-                v if v.is_mono() => Cell::text(v.display_compact()).mono(),
-                v => Cell::text(v.display_compact()),
-            }
+            render_cell_value(
+                val,
+                null_bg,
+                null_fg,
+                null_border,
+                bool_true_fg,
+                muted_fg,
+                small_font,
+                radius_xs,
+            )
         })
         .zebra(true)
         .scroll_wide(true)
@@ -962,14 +981,35 @@ fn format_constraints(col: &ColumnMeta) -> String {
     parts.join(" · ")
 }
 
-fn is_numeric_udt(udt: &str) -> bool {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_cell_value(
+    val: &CellValue,
+    null_bg: Color,
+    null_fg: Color,
+    null_border: Color,
+    bool_true_fg: Color,
+    muted_fg: Color,
+    small_font: TextStyle,
+    radius_xs: f32,
+) -> Cell {
+    match val {
+        CellValue::Null => Cell::el(null_pill_el(null_bg, null_fg, null_border, small_font, radius_xs)),
+        CellValue::Bool(b) => Cell::text(if *b { "true" } else { "false" })
+            .mono()
+            .color(if *b { bool_true_fg } else { muted_fg }),
+        v if v.is_mono() => Cell::text(v.display_compact()).mono(),
+        v => Cell::text(v.display_compact()),
+    }
+}
+
+pub(crate) fn is_numeric_udt(udt: &str) -> bool {
     matches!(
         udt,
         "int2" | "int4" | "int8" | "float4" | "float8" | "numeric" | "money"
     )
 }
 
-fn initial_col_width(col: &ColumnMeta) -> f32 {
+pub(crate) fn initial_col_width(col: &ColumnMeta) -> f32 {
     let base: f32 = match col.udt_name.as_str() {
         "uuid" => 248.0,
         "timestamptz" | "timestamp" => 214.0,

@@ -6,10 +6,12 @@ use rune::{ColorScheme, PointerPress, TextEdit, Tx};
 use rune_kit::shell::TabDragState;
 use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
-    AccentColor, ColumnSummary, ConnectionId, ConnectionProfile, ConnectionStore, DatabaseInfo, DbObject, DbObjectKind,
-    EnvTag, ExecutedSql, PageRequest, PasswordMode, RequestId, SafetyPolicy, SchemaInfo, SessionId, SortOrder,
-    SortSpec, SslMode, StoreData, TabId, TablePage, TableStructure,
+    AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, ConnectionStore,
+    DatabaseInfo, DbObject, DbObjectKind, EnvTag, ExecutedSql, PageRequest, PasswordMode, QueryBatchResult,
+    QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo,
+    SessionId, SortOrder, SortSpec, SslMode, StoreData, TabId, TablePage, TableStructure,
 };
+use tv_core::sql::{cursor_line_col, format_sql, split_statements, statement_at_cursor};
 
 use crate::worker::{WorkerBridge, WorkerCmd, WorkerEvent};
 
@@ -304,6 +306,18 @@ pub struct PasswordPromptState {
     pub error: Option<String>,
 }
 
+/// Modal state for saving or naming a SQL query in the local SQLite library.
+#[derive(Clone, Debug)]
+pub struct SaveQueryModalState {
+    pub session_id: SessionId,
+    pub tab_id: TabId,
+    pub editing_id: Option<SavedQueryId>,
+    pub name: TextEdit,
+    pub folder: TextEdit,
+    pub scope_all_connections: bool,
+    pub error: Option<String>,
+}
+
 /// Active modal dialog overlay. At most one modal is open at a time.
 #[derive(Clone, Debug, Default)]
 pub enum OverlayState {
@@ -313,6 +327,7 @@ pub enum OverlayState {
     ImportUrl(ImportUrlState),
     Picker(PickerState),
     PasswordPrompt(PasswordPromptState),
+    SaveQuery(Box<SaveQueryModalState>),
     DeleteConfirm(ConnectionId),
 }
 
@@ -447,9 +462,115 @@ impl TableTabState {
     }
 }
 
+/// Row-limit presets offered in the SQL workbench action bar.
+pub const QUERY_LIMIT_OPTIONS: &[(Option<usize>, &str)] = &[
+    (Some(100), "Limit 100"),
+    (Some(500), "Limit 500"),
+    (Some(1000), "Limit 1,000"),
+    (Some(5000), "Limit 5,000"),
+    (None, "No limit"),
+];
+
+/// One statement result pane rendered under the SQL editor.
+pub struct QueryResultTabState {
+    pub statement: QueryStatementResult,
+    pub table: TableState,
+    pub selected_row: Option<usize>,
+}
+
+/// Interactive state for one SQL query workbench tab (editor, live timer, multi-result grids).
+pub struct QueryTabState {
+    pub tab_id: TabId,
+    pub title: String,
+    pub saved_query_id: Option<SavedQueryId>,
+    pub editor: TextEdit,
+    pub saved_snapshot: String,
+    pub row_limit: Option<usize>,
+    pub limit_dropdown_open: bool,
+    pub split_ratio: f32,
+    pub running: bool,
+    pub cancelling: bool,
+    pub active_req_id: Option<RequestId>,
+    pub elapsed_ms: u64,
+    pub results: Vec<QueryResultTabState>,
+    pub active_result: usize,
+    pub batch_error: Option<String>,
+    pub batch_cancelled: bool,
+    pub total_duration_ms: Option<u64>,
+    pub inspector_search: TextEdit,
+    pub inspector_json_pretty: bool,
+}
+
+impl QueryTabState {
+    pub fn new(
+        tab_id: TabId,
+        title: String,
+        initial_sql: String,
+        saved_query_id: Option<SavedQueryId>,
+    ) -> Self {
+        let editor = TextEdit::new(&initial_sql).with_line_home_end(true);
+        Self {
+            tab_id,
+            title,
+            saved_query_id,
+            editor,
+            saved_snapshot: initial_sql,
+            row_limit: Some(1000),
+            limit_dropdown_open: false,
+            split_ratio: 0.42,
+            running: false,
+            cancelling: false,
+            active_req_id: None,
+            elapsed_ms: 0,
+            results: Vec::new(),
+            active_result: 0,
+            batch_error: None,
+            batch_cancelled: false,
+            total_duration_ms: None,
+            inspector_search: TextEdit::new(""),
+            inspector_json_pretty: true,
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        if self.saved_query_id.is_some() {
+            self.editor.text != self.saved_snapshot
+        } else {
+            !self.editor.text.trim().is_empty() && self.editor.text != self.saved_snapshot
+        }
+    }
+
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        cursor_line_col(&self.editor.text, self.editor.focus)
+    }
+
+    pub fn row_limit_label(&self) -> &'static str {
+        QUERY_LIMIT_OPTIONS
+            .iter()
+            .find(|(limit, _)| *limit == self.row_limit)
+            .map_or("Limit 1,000", |(_, label)| *label)
+    }
+
+    pub fn active_result_state(&self) -> Option<&QueryResultTabState> {
+        self.results.get(self.active_result)
+    }
+
+    pub fn active_result_state_mut(&mut self) -> Option<&mut QueryResultTabState> {
+        self.results.get_mut(self.active_result)
+    }
+
+    pub fn selected_result_row(&self) -> Option<(&[ColumnMeta], &[CellValue])> {
+        let res = self.active_result_state()?;
+        let row_idx = res.selected_row?;
+        let row = res.statement.rows.get(row_idx)?;
+        Some((&res.statement.columns, row.as_slice()))
+    }
+}
+
 /// Content variants hosted inside a workspace tab.
 pub enum TabContent {
     Table(Box<TableTabState>),
+    Query(Box<QueryTabState>),
 }
 
 /// A tab open inside a [`SessionState`].
@@ -480,45 +601,83 @@ impl WorkspaceTab {
         }
     }
 
+    pub fn new_query(
+        id: TabId,
+        title: String,
+        initial_sql: String,
+        saved_query_id: Option<SavedQueryId>,
+    ) -> Self {
+        Self {
+            id,
+            content: TabContent::Query(Box::new(QueryTabState::new(
+                id,
+                title,
+                initial_sql,
+                saved_query_id,
+            ))),
+        }
+    }
+
     pub fn title(&self) -> &str {
         match &self.content {
             TabContent::Table(t) => &t.object_name,
+            TabContent::Query(q) => &q.title,
         }
     }
 
     pub fn schema_and_name(&self) -> Option<(&str, &str)> {
         match &self.content {
             TabContent::Table(t) => Some((&t.schema, &t.object_name)),
+            TabContent::Query(_) => None,
         }
     }
 
     pub fn object_kind(&self) -> Option<DbObjectKind> {
         match &self.content {
             TabContent::Table(t) => Some(t.object_kind),
+            TabContent::Query(_) => None,
         }
     }
 
     pub fn is_loading(&self) -> bool {
         match &self.content {
             TabContent::Table(t) => t.page_loading || t.structure_loading,
+            TabContent::Query(q) => q.running,
         }
     }
 
     pub fn has_error(&self) -> bool {
         match &self.content {
             TabContent::Table(t) => t.page_error.is_some() || t.filter_error.is_some() || t.structure_error.is_some(),
+            TabContent::Query(q) => q.batch_error.is_some() || q.results.iter().any(|r| r.statement.error.is_some()),
         }
     }
 
     pub fn as_table(&self) -> Option<&TableTabState> {
         match &self.content {
             TabContent::Table(t) => Some(t),
+            TabContent::Query(_) => None,
         }
     }
 
     pub fn as_table_mut(&mut self) -> Option<&mut TableTabState> {
         match &mut self.content {
             TabContent::Table(t) => Some(t),
+            TabContent::Query(_) => None,
+        }
+    }
+
+    pub fn as_query(&self) -> Option<&QueryTabState> {
+        match &self.content {
+            TabContent::Query(q) => Some(q),
+            TabContent::Table(_) => None,
+        }
+    }
+
+    pub fn as_query_mut(&mut self) -> Option<&mut QueryTabState> {
+        match &mut self.content {
+            TabContent::Query(q) => Some(q),
+            TabContent::Table(_) => None,
         }
     }
 }
@@ -548,6 +707,9 @@ pub struct SessionState {
     pub tabs: Vec<WorkspaceTab>,
     pub active_tab: Option<TabId>,
     pub tab_drag: TabDragState,
+    pub saved_queries: Vec<SavedQuery>,
+    pub query_history: Vec<QueryHistoryEntry>,
+    pub query_seq: u64,
 }
 
 impl SessionState {
@@ -569,6 +731,9 @@ impl SessionState {
             tabs: Vec::new(),
             active_tab: None,
             tab_drag: TabDragState::new(),
+            saved_queries: Vec::new(),
+            query_history: Vec::new(),
+            query_seq: 1,
         }
     }
 
@@ -588,6 +753,14 @@ impl SessionState {
 
     pub fn active_table_tab_mut(&mut self) -> Option<&mut TableTabState> {
         self.active_tab_mut().and_then(WorkspaceTab::as_table_mut)
+    }
+
+    pub fn active_query_tab(&self) -> Option<&QueryTabState> {
+        self.active_tab().and_then(WorkspaceTab::as_query)
+    }
+
+    pub fn active_query_tab_mut(&mut self) -> Option<&mut QueryTabState> {
+        self.active_tab_mut().and_then(WorkspaceTab::as_query_mut)
     }
 
     pub fn tab_mut(&mut self, tab_id: TabId) -> Option<&mut WorkspaceTab> {
@@ -735,7 +908,84 @@ impl AppState {
     }
 
     pub fn active_inspector_search_mut(&mut self) -> &mut TextEdit {
-        self.active_table_edit_mut(|tab| &mut tab.inspector_search)
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Table,
+            Query,
+        }
+        let found = match self.screen {
+            Screen::Workspace(sid) => self.sessions.get(&sid).and_then(|sess| {
+                let tab = sess.active_tab()?;
+                match &tab.content {
+                    TabContent::Table(_) => Some((sid, Kind::Table)),
+                    TabContent::Query(_) => Some((sid, Kind::Query)),
+                }
+            }),
+            Screen::Launcher => None,
+        };
+        match found {
+            Some((sid, Kind::Table)) => self
+                .sessions
+                .get_mut(&sid)
+                .and_then(SessionState::active_table_tab_mut)
+                .map_or(&mut self.fallback_edit, |t| &mut t.inspector_search),
+            Some((sid, Kind::Query)) => self
+                .sessions
+                .get_mut(&sid)
+                .and_then(SessionState::active_query_tab_mut)
+                .map_or(&mut self.fallback_edit, |q| &mut q.inspector_search),
+            None => &mut self.fallback_edit,
+        }
+    }
+
+    pub fn active_query_editor_mut(&mut self) -> &mut TextEdit {
+        if let Screen::Workspace(sid) = self.screen
+            && self.sessions.get(&sid).and_then(SessionState::active_query_tab).is_some()
+            && let Some(tab) = self.sessions.get_mut(&sid).and_then(SessionState::active_query_tab_mut)
+        {
+            return &mut tab.editor;
+        }
+        &mut self.fallback_edit
+    }
+
+    pub fn active_query_result_table(&self) -> &TableState {
+        self.active_session()
+            .and_then(SessionState::active_query_tab)
+            .and_then(QueryTabState::active_result_state)
+            .map_or(&self.fallback_table, |r| &r.table)
+    }
+
+    pub fn active_query_result_table_mut(&mut self) -> &mut TableState {
+        if let Screen::Workspace(sid) = self.screen
+            && self
+                .sessions
+                .get(&sid)
+                .and_then(SessionState::active_query_tab)
+                .and_then(QueryTabState::active_result_state)
+                .is_some()
+            && let Some(res) = self
+                .sessions
+                .get_mut(&sid)
+                .and_then(SessionState::active_query_tab_mut)
+                .and_then(QueryTabState::active_result_state_mut)
+        {
+            return &mut res.table;
+        }
+        &mut self.fallback_table
+    }
+
+    pub fn save_query_name_mut(&mut self) -> &mut TextEdit {
+        match &mut self.overlay {
+            OverlayState::SaveQuery(m) => &mut m.name,
+            _ => &mut self.fallback_edit,
+        }
+    }
+
+    pub fn save_query_folder_mut(&mut self) -> &mut TextEdit {
+        match &mut self.overlay {
+            OverlayState::SaveQuery(m) => &mut m.folder,
+            _ => &mut self.fallback_edit,
+        }
     }
 
     pub fn tab_drag_mut(&mut self, sid: SessionId) -> &mut TabDragState {
@@ -820,12 +1070,24 @@ impl AppState {
     }
 
     pub fn alloc_session_id(&mut self) -> SessionId {
+        while self.sessions.contains_key(&SessionId::new(self.next_session_id)) {
+            self.next_session_id += 1;
+        }
         let id = SessionId::new(self.next_session_id);
         self.next_session_id += 1;
         id
     }
 
     pub fn alloc_tab_id(&mut self) -> TabId {
+        let max_existing = self
+            .sessions
+            .values()
+            .flat_map(|s| s.tabs.iter().map(|t| t.id.get()))
+            .max()
+            .unwrap_or(0);
+        if self.next_tab_id <= max_existing {
+            self.next_tab_id = max_existing + 1;
+        }
         let id = TabId::new(self.next_tab_id);
         self.next_tab_id += 1;
         id
@@ -1157,6 +1419,10 @@ impl AppState {
         self.sync_window_title(tx);
 
         if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::LoadQueryLibrary {
+                session_id,
+                connection_id,
+            });
             worker.send(WorkerCmd::Connect {
                 session_id,
                 req_id,
@@ -1195,8 +1461,12 @@ impl AppState {
         } else {
             session.status = ConnectionState::Connecting;
         }
-        session.tabs.clear();
-        session.active_tab = None;
+        session.tabs.retain(|t| matches!(t.content, TabContent::Query(_)));
+        if let Some(active) = session.active_tab
+            && !session.tabs.iter().any(|t| t.id == active)
+        {
+            session.active_tab = session.tabs.last().map(|t| t.id);
+        }
         session.tab_drag = TabDragState::new();
         self.overlay = OverlayState::None;
         self.sync_window_title(tx);
@@ -1363,17 +1633,15 @@ impl AppState {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        let Some(target) = session
-            .tabs
-            .iter()
-            .find(|t| t.id == tab_id)
-            .and_then(|t| t.schema_and_name().map(|(s, n)| (s.to_owned(), n.to_owned())))
-        else {
+        let Some(tab) = session.tabs.iter().find(|t| t.id == tab_id) else {
             return;
         };
+        let target = tab.schema_and_name().map(|(s, n)| (s.to_owned(), n.to_owned()));
         session.active_tab = Some(tab_id);
-        if let ConnectionState::Connected(ref mut data) = session.status {
-            data.selected_object = Some(target);
+        if let Some(obj) = target
+            && let ConnectionState::Connected(ref mut data) = session.status
+        {
+            data.selected_object = Some(obj);
         }
         self.sync_window_title(tx);
     }
@@ -1663,15 +1931,430 @@ impl AppState {
         let Some(idx) = row_id.strip_prefix("r-").and_then(|s| s.parse::<usize>().ok()) else {
             return;
         };
-        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
-            tab.selected_row = Some(idx);
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_tab_mut) else {
+            return;
+        };
+        match &mut tab.content {
+            TabContent::Table(t) => t.selected_row = Some(idx),
+            TabContent::Query(q) => {
+                if let Some(res) = q.active_result_state_mut() {
+                    res.selected_row = Some(idx);
+                }
+            }
         }
     }
 
     pub fn clear_active_tab_row_selection(&mut self) {
-        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
-            tab.selected_row = None;
-            tab.data_table.clear_selection();
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_tab_mut) else {
+            return;
+        };
+        match &mut tab.content {
+            TabContent::Table(t) => {
+                t.selected_row = None;
+                t.data_table.clear_selection();
+            }
+            TabContent::Query(q) => {
+                if let Some(res) = q.active_result_state_mut() {
+                    res.selected_row = None;
+                    res.table.clear_selection();
+                }
+            }
+        }
+    }
+
+    pub fn open_new_query_tab(&mut self, tx: &mut Tx) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let tab_id = self.alloc_tab_id();
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let seq = session.query_seq;
+        session.query_seq += 1;
+        let tab = WorkspaceTab::new_query(tab_id, format!("Query {seq}"), String::new(), None);
+        session.tabs.push(tab);
+        session.active_tab = Some(tab_id);
+        let editor_key = format!("sql-editor-{}", tab_id.get());
+        self.sync_window_title(tx);
+        tx.focus_when_shown(editor_key, true);
+    }
+
+    pub fn insert_newline_in_active_query_editor(&mut self) {
+        if self.active_session().and_then(SessionState::active_query_tab).is_some() {
+            self.active_query_editor_mut().insert("\n");
+        }
+    }
+
+    pub fn format_active_query_sql(&mut self) -> bool {
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) else {
+            return false;
+        };
+        let formatted = format_sql(&tab.editor.text);
+        if formatted == tab.editor.text {
+            return true;
+        }
+        let len = tab.editor.text.len();
+        tab.editor.set_selection(0, len);
+        tab.editor.insert(&formatted);
+        true
+    }
+
+    pub fn set_active_query_row_limit(&mut self, limit: Option<usize>) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+            tab.row_limit = limit;
+            tab.limit_dropdown_open = false;
+        }
+    }
+
+    pub fn select_active_query_result_tab(&mut self, index: usize) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut)
+            && index < tab.results.len()
+        {
+            tab.active_result = index;
+        }
+    }
+
+    pub fn set_active_query_split_ratio(&mut self, ratio: f32) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+            tab.split_ratio = ratio.clamp(0.18, 0.80);
+        }
+    }
+
+    pub fn toggle_active_inspector_json_pretty(&mut self) {
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_tab_mut) else {
+            return;
+        };
+        match &mut tab.content {
+            TabContent::Table(t) => t.inspector_json_pretty = !t.inspector_json_pretty,
+            TabContent::Query(q) => q.inspector_json_pretty = !q.inspector_json_pretty,
+        }
+    }
+
+    pub fn run_active_query(&mut self, all: bool) -> bool {
+        let Screen::Workspace(session_id) = self.screen else {
+            return false;
+        };
+        let req_id = self.alloc_req_id();
+        let dispatch = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return false;
+            };
+            let connection_id = session.profile.id;
+            let connection_name = session.profile.name.clone();
+            let database = session
+                .status
+                .as_connected()
+                .and_then(|c| c.active_database.clone());
+            let is_connected = session.status.as_connected().is_some();
+            let Some(tab_id) = session.active_tab else {
+                return false;
+            };
+            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut) else {
+                return false;
+            };
+            if tab.running {
+                return true;
+            }
+            if !is_connected {
+                tab.batch_error = Some("Database is not connected. Reconnect before running queries.".to_owned());
+                return true;
+            }
+
+            let extracted = if all {
+                let stmts = split_statements(&tab.editor.text);
+                if stmts.is_empty() {
+                    None
+                } else {
+                    let sql_text = tab.editor.text.trim().to_owned();
+                    Some((stmts.into_iter().map(|s| s.sql).collect(), sql_text))
+                }
+            } else {
+                statements_for_current(&tab.editor)
+            };
+
+            let Some((statements, executed_sql_text)) = extracted else {
+                self.set_notice("No SQL statement to execute", false);
+                return true;
+            };
+
+            tab.running = true;
+            tab.cancelling = false;
+            tab.active_req_id = Some(req_id);
+            tab.elapsed_ms = 0;
+            tab.batch_error = None;
+            tab.batch_cancelled = false;
+            tab.limit_dropdown_open = false;
+
+            Some((
+                tab_id,
+                connection_id,
+                connection_name,
+                database,
+                statements,
+                executed_sql_text,
+                tab.row_limit,
+            ))
+        };
+
+        match (&self.worker, dispatch) {
+            (
+                Some(worker),
+                Some((tab_id, connection_id, connection_name, database, statements, executed_sql_text, row_limit)),
+            ) => {
+                worker.send(WorkerCmd::ExecuteSql {
+                    session_id,
+                    tab_id,
+                    req_id,
+                    connection_id,
+                    connection_name,
+                    database,
+                    statements,
+                    executed_sql_text,
+                    row_limit,
+                });
+            }
+            (None, Some(_)) => {
+                // In headless/no-worker scenes, avoid getting stuck in a running spinner.
+                if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+                    tab.running = false;
+                    tab.active_req_id = None;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    pub fn cancel_active_query(&mut self) -> bool {
+        let Screen::Workspace(session_id) = self.screen else {
+            return false;
+        };
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) else {
+            return false;
+        };
+        if !tab.running {
+            return false;
+        }
+        if !tab.cancelling {
+            tab.cancelling = true;
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCmd::CancelQuery { session_id });
+            }
+        }
+        true
+    }
+
+    pub fn open_save_query_modal(&mut self, tx: &mut Tx) -> bool {
+        let Screen::Workspace(session_id) = self.screen else {
+            return false;
+        };
+        let info = {
+            let Some(session) = self.sessions.get(&session_id) else {
+                return false;
+            };
+            let connection_id = session.profile.id;
+            let Some(tab) = session.active_query_tab() else {
+                return false;
+            };
+            let existing = tab
+                .saved_query_id
+                .and_then(|qid| session.saved_queries.iter().find(|s| s.id == qid))
+                .cloned();
+            (
+                tab.tab_id,
+                tab.title.clone(),
+                tab.editor.text.clone(),
+                tab.saved_query_id,
+                connection_id,
+                existing,
+            )
+        };
+        let (tab_id, title, sql, saved_id, session_connection_id, existing) = info;
+
+        if let (Some(id), Some(existing_q)) = (saved_id, existing) {
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCmd::SaveQuery {
+                    session_id,
+                    tab_id: Some(tab_id),
+                    session_connection_id,
+                    connection_id: existing_q.connection_id,
+                    id: Some(id),
+                    folder: existing_q.folder,
+                    name: existing_q.name.clone(),
+                    sql,
+                });
+            }
+            self.set_notice(format!("Saved \"{}\"", existing_q.name), false);
+            return true;
+        }
+
+        self.overlay = OverlayState::SaveQuery(Box::new(SaveQueryModalState {
+            session_id,
+            tab_id,
+            editing_id: saved_id,
+            name: TextEdit::new(&title),
+            folder: TextEdit::new(""),
+            scope_all_connections: false,
+            error: None,
+        }));
+        tx.focus_when_shown("save-query-name", true);
+        true
+    }
+
+    pub fn submit_save_query_modal(&mut self, tx: &mut Tx) {
+        let OverlayState::SaveQuery(ref mut modal) = self.overlay else {
+            return;
+        };
+        let name = modal.name.text.trim().to_owned();
+        if name.is_empty() {
+            modal.error = Some("Query name cannot be empty".to_owned());
+            return;
+        }
+        let folder = non_empty_opt(&modal.folder.text);
+        let session_id = modal.session_id;
+        let tab_id = modal.tab_id;
+        let editing_id = modal.editing_id;
+        let scope_all = modal.scope_all_connections;
+
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            self.overlay = OverlayState::None;
+            return;
+        };
+        let session_connection_id = session.profile.id;
+        let target_connection_id = if scope_all { None } else { Some(session_connection_id) };
+        let sql = session
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(WorkspaceTab::as_query)
+            .map(|q| q.editor.text.clone())
+            .unwrap_or_default();
+
+        let local_id = editing_id.unwrap_or_default();
+        if self.worker.is_none() {
+            // Update local in-memory state immediately in headless mode.
+            let saved = SavedQuery {
+                id: local_id,
+                connection_id: target_connection_id,
+                folder,
+                name: name.clone(),
+                sql: sql.clone(),
+                updated_at: chrono::Utc::now(),
+            };
+            session.saved_queries.retain(|q| q.id != local_id);
+            session.saved_queries.insert(0, saved);
+            if let Some(q) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut) {
+                q.saved_query_id = Some(local_id);
+                q.title = name.clone();
+                q.saved_snapshot = sql;
+            }
+        } else if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::SaveQuery {
+                session_id,
+                tab_id: Some(tab_id),
+                session_connection_id,
+                connection_id: target_connection_id,
+                id: editing_id,
+                folder,
+                name: name.clone(),
+                sql,
+            });
+        }
+        self.overlay = OverlayState::None;
+        self.sync_window_title(tx);
+        self.set_notice(format!("Saved query \"{name}\""), false);
+    }
+
+    pub fn open_saved_query(&mut self, query_id: SavedQueryId, tx: &mut Tx) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let existing_tab = self.sessions.get(&session_id).and_then(|s| {
+            s.tabs
+                .iter()
+                .find(|t| t.as_query().is_some_and(|q| q.saved_query_id == Some(query_id)))
+                .map(|t| t.id)
+        });
+        if let Some(tab_id) = existing_tab {
+            self.activate_tab(tab_id, tx);
+            tx.focus_when_shown(format!("sql-editor-{}", tab_id.get()), true);
+            return;
+        }
+        let tab_id = self.alloc_tab_id();
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(saved) = session.saved_queries.iter().find(|q| q.id == query_id).cloned() else {
+            return;
+        };
+        let tab = WorkspaceTab::new_query(tab_id, saved.name, saved.sql, Some(saved.id));
+        session.tabs.push(tab);
+        session.active_tab = Some(tab_id);
+        self.sync_window_title(tx);
+        tx.focus_when_shown(format!("sql-editor-{}", tab_id.get()), true);
+    }
+
+    pub fn open_history_entry(&mut self, entry_id: i64, tx: &mut Tx) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let tab_id = self.alloc_tab_id();
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(entry) = session.query_history.iter().find(|h| h.id == entry_id).cloned() else {
+            return;
+        };
+        let seq = session.query_seq;
+        session.query_seq += 1;
+        let title = concise_sql_title(&entry.sql, seq);
+        let tab = WorkspaceTab::new_query(tab_id, title, entry.sql, None);
+        session.tabs.push(tab);
+        session.active_tab = Some(tab_id);
+        self.sync_window_title(tx);
+        tx.focus_when_shown(format!("sql-editor-{}", tab_id.get()), true);
+    }
+
+    pub fn delete_saved_query(&mut self, id: SavedQueryId) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let connection_id = session.profile.id;
+        session.saved_queries.retain(|q| q.id != id);
+        for tab in &mut session.tabs {
+            if let Some(q) = tab.as_query_mut()
+                && q.saved_query_id == Some(id)
+            {
+                q.saved_query_id = None;
+            }
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::DeleteSavedQuery {
+                session_id,
+                connection_id,
+                id,
+            });
+        }
+    }
+
+    pub fn clear_query_history(&mut self) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let connection_id = session.profile.id;
+        session.query_history.clear();
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::ClearQueryHistory {
+                session_id,
+                connection_id: Some(connection_id),
+            });
         }
     }
 
@@ -1882,6 +2565,11 @@ impl AppState {
                     return;
                 }
                 append_logs(&mut session.console_entries, logs);
+                let db_changed = session
+                    .status
+                    .as_connected()
+                    .and_then(|c| c.active_database.as_deref())
+                    != Some(active_database.as_str());
                 if let ConnectionState::Connected(ref mut data) = session.status {
                     data.databases = databases;
                     data.active_database = Some(active_database);
@@ -1889,11 +2577,19 @@ impl AppState {
                     data.active_schema = active_schema;
                     data.objects = objects;
                     data.expanded_columns.clear();
-                    data.selected_object = None;
+                    if db_changed {
+                        data.selected_object = None;
+                    }
                 }
-                session.tabs.clear();
-                session.active_tab = None;
-                session.tab_drag = TabDragState::new();
+                if db_changed {
+                    session.tabs.retain(|t| matches!(t.content, TabContent::Query(_)));
+                    if let Some(active) = session.active_tab
+                        && !session.tabs.iter().any(|t| t.id == active)
+                    {
+                        session.active_tab = session.tabs.last().map(|t| t.id);
+                    }
+                    session.tab_drag = TabDragState::new();
+                }
                 if self.screen == Screen::Workspace(session_id) {
                     self.sync_window_title(tx);
                 }
@@ -2021,6 +2717,124 @@ impl AppState {
                 }
             }
 
+            WorkerEvent::QueryTick {
+                session_id,
+                tab_id,
+                req_id,
+                elapsed_ms,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
+                    && tab.active_req_id == Some(req_id)
+                    && tab.running
+                {
+                    tab.elapsed_ms = elapsed_ms;
+                }
+            }
+
+            WorkerEvent::QueryCompleted {
+                session_id,
+                tab_id,
+                req_id,
+                result,
+                logs,
+                recorded_history,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                append_logs(&mut session.console_entries, logs);
+                if let Some(entry) = recorded_history {
+                    session.query_history.insert(0, entry);
+                    if session.query_history.len() > 200 {
+                        session.query_history.truncate(200);
+                    }
+                }
+                let disconnected = matches!(result, Err(tv_core::DbError::Disconnected));
+                if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
+                    && tab.active_req_id == Some(req_id)
+                {
+                    tab.running = false;
+                    tab.cancelling = false;
+                    tab.active_req_id = None;
+                    match result {
+                        Ok(batch) => {
+                            let BatchOutcomes {
+                                results,
+                                total_duration_ms,
+                                cancelled,
+                                error_msg,
+                            } = unpack_batch(tab_id, batch);
+                            tab.elapsed_ms = total_duration_ms;
+                            tab.total_duration_ms = Some(total_duration_ms);
+                            tab.batch_cancelled = cancelled;
+                            tab.batch_error = error_msg;
+                            tab.results = results;
+                            tab.active_result = 0;
+                        }
+                        Err(err) => {
+                            tab.batch_cancelled = matches!(err, tv_core::DbError::Cancelled);
+                            tab.batch_error = Some(err.to_string());
+                        }
+                    }
+                }
+                if disconnected {
+                    session.status = ConnectionState::Disconnected {
+                        reason: Some("Disconnected from database".to_owned()),
+                    };
+                    if self.screen == Screen::Workspace(session_id) {
+                        self.sync_window_title(tx);
+                    }
+                }
+            }
+
+            WorkerEvent::QueryLibraryLoaded {
+                session_id,
+                saved_queries,
+                history,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.saved_queries = saved_queries;
+                    session.query_history = history;
+                }
+            }
+
+            WorkerEvent::SavedQueryMutated {
+                session_id,
+                tab_id,
+                saved,
+                saved_queries,
+                error,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.saved_queries = saved_queries;
+                    if let (Some(saved_q), Some(tid)) = (saved, tab_id)
+                        && let Some(tab) = session.tab_mut(tid).and_then(WorkspaceTab::as_query_mut)
+                    {
+                        tab.saved_query_id = Some(saved_q.id);
+                        tab.title = saved_q.name;
+                        tab.saved_snapshot = saved_q.sql;
+                        if self.screen == Screen::Workspace(session_id) {
+                            self.sync_window_title(tx);
+                        }
+                    }
+                }
+                if let Some(err) = error {
+                    self.set_notice(err, true);
+                }
+            }
+
+            WorkerEvent::HistoryCleared {
+                session_id,
+                history,
+            } => {
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.query_history = history;
+                }
+            }
+
             WorkerEvent::OperationFailed {
                 session_id,
                 req_id,
@@ -2088,16 +2902,21 @@ impl AppState {
             None => "TableView".to_owned(),
             Some(session) => match &session.status {
                 ConnectionState::Connected(data) => {
-                    let active_obj = session
-                        .active_tab()
-                        .and_then(WorkspaceTab::schema_and_name)
-                        .or_else(|| data.selected_object.as_ref().map(|(s, o)| (s.as_str(), o.as_str())));
-                    match (&data.active_database, active_obj) {
-                        (Some(db), Some((schema, obj))) => {
+                    let active_tab = session.active_tab();
+                    match (&data.active_database, active_tab, &data.selected_object) {
+                        (Some(db), Some(tab), _) => match &tab.content {
+                            TabContent::Table(t) => format!(
+                                "{} — {} — {}.{}",
+                                session.profile.name, db, t.schema, t.object_name
+                            ),
+                            TabContent::Query(q) => format!("{} — {} — {}", session.profile.name, db, q.title),
+                        },
+                        (Some(db), None, Some((schema, obj))) => {
                             format!("{} — {} — {}.{}", session.profile.name, db, schema, obj)
                         }
-                        (Some(db), None) => format!("{} — {}", session.profile.name, db),
-                        (None, _) => format!("{} — TableView", session.profile.name),
+                        (Some(db), None, None) => format!("{} — {}", session.profile.name, db),
+                        (None, Some(tab), _) => format!("{} — {}", session.profile.name, tab.title()),
+                        (None, None, _) => format!("{} — TableView", session.profile.name),
                     }
                 }
                 _ => format!("{} (Disconnected) — TableView", session.profile.name),
@@ -2116,4 +2935,66 @@ fn append_logs(entries: &mut Vec<ConsoleLogEntry>, logs: Vec<ExecutedSql>) {
         let excess = entries.len() - MAX_LOGS;
         entries.drain(0..excess);
     }
+}
+
+struct BatchOutcomes {
+    results: Vec<QueryResultTabState>,
+    total_duration_ms: u64,
+    cancelled: bool,
+    error_msg: Option<String>,
+}
+
+fn unpack_batch(tab_id: TabId, batch: QueryBatchResult) -> BatchOutcomes {
+    let tid = tab_id.get();
+    let results = batch
+        .results
+        .into_iter()
+        .enumerate()
+        .map(|(idx, statement)| QueryResultTabState {
+            statement,
+            table: TableState::new().key(format!("tv-qres-{tid}-{idx}")),
+            selected_row: None,
+        })
+        .collect();
+    let error_msg = if batch.cancelled {
+        Some("Query cancelled".to_owned())
+    } else {
+        None
+    };
+    BatchOutcomes {
+        results,
+        total_duration_ms: batch.total_elapsed_ms,
+        cancelled: batch.cancelled,
+        error_msg,
+    }
+}
+
+fn statements_for_current(editor: &TextEdit) -> Option<(Vec<String>, String)> {
+    if editor.anchor != editor.focus {
+        let sel = editor.selected();
+        let stmts = split_statements(sel);
+        if !stmts.is_empty() {
+            let texts = stmts.into_iter().map(|s| s.sql).collect();
+            return Some((texts, sel.trim().to_owned()));
+        }
+    }
+    let stmt = statement_at_cursor(&editor.text, editor.anchor, editor.focus)?;
+    let sql = stmt.sql;
+    Some((vec![sql.clone()], sql))
+}
+
+fn concise_sql_title(sql: &str, fallback_seq: u64) -> String {
+    let first_line = sql
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .unwrap_or("");
+    if first_line.is_empty() {
+        return format!("Query {fallback_seq}");
+    }
+    let mut out: String = first_line.chars().take(24).collect();
+    if first_line.chars().count() > 24 {
+        out.push('…');
+    }
+    out
 }

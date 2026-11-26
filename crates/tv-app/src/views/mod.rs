@@ -2,6 +2,7 @@ pub mod connection_form;
 pub mod inspector;
 pub mod launcher;
 pub mod pickers;
+pub mod query_editor;
 pub mod table_grid;
 pub mod workspace;
 
@@ -54,6 +55,9 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         }
         OverlayState::PasswordPrompt(prompt) => {
             connection_form::build_password_prompt(prompt, &k, &mut layer);
+        }
+        OverlayState::SaveQuery(modal) => {
+            query_editor::build_save_query_modal(modal, &k, &mut layer);
         }
         OverlayState::DeleteConfirm(id) => {
             connection_form::build_delete_confirm(s, *id, &k, &mut layer);

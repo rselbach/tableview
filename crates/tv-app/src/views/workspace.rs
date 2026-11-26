@@ -1,3 +1,4 @@
+use chrono::Local;
 use rune::{Cx, El, ScrollSpec, Tx, col, el, icon, rich, row, spacer, text};
 use rune_kit::shell::SidebarToggle;
 use rune_kit::syntax::{self, SyntaxTheme};
@@ -5,7 +6,7 @@ use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl, Select,
     SelectAppearance, Sidebar, Spinner, SplitView, TextInput, Toolbar,
 };
-use tv_core::{DbObject, DbObjectKind, SafetyPolicy};
+use tv_core::{DbObject, DbObjectKind, QueryHistoryEntry, SafetyPolicy, SavedQuery};
 
 use crate::icons;
 use crate::platform::{self, Action};
@@ -14,7 +15,7 @@ use crate::state::{
     WorkspaceTab,
 };
 use crate::theme;
-use crate::views::{empty_cta, inspector, pill_badge, table_grid};
+use crate::views::{empty_cta, inspector, pill_badge, query_editor, table_grid};
 
 /// Builds the full database workspace screen (`SplitView` + environment strip + console).
 pub fn build(
@@ -103,6 +104,16 @@ fn build_toolbar(s: &AppState, session: &SessionState, k: &Kit) -> Toolbar {
                 .disabled(!has_connected)
                 .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_picker(PickerKind::Database, tx))
                 .build(k),
+        )
+        .child(
+            Button::new("SQL")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Regular)
+                .icon(&icons::SQL_QUERY)
+                .shortcut("mod+t")
+                .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_new_query_tab(tx))
+                .build(k)
+                .key("toolbar-new-sql"),
         );
 
     let status_pill = build_status_pill(session, k);
@@ -293,41 +304,67 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
         })
         .build(k);
 
+    let search_placeholder = match session.sidebar_tab {
+        SidebarTab::Items => "Search for item…",
+        SidebarTab::Queries => "Search saved queries…",
+        SidebarTab::History => "Search query history…",
+    };
+
     let search = TextInput::new(&session.sidebar_search)
-        .label("Filter items")
-        .placeholder("Search for item…")
+        .label("Filter sidebar")
+        .placeholder(search_placeholder)
         .leading_icon(k.glyph.search)
         .clear_button()
         .width(None)
         .on_edit(AppState::sidebar_search_mut)
         .build(k);
 
-    let filter_btn = IconButton::new(&icons::FILTER)
-        .variant(if session.show_system_schemas {
-            IconButtonVariant::Ghost
-        } else {
-            IconButtonVariant::GhostMuted
-        })
-        .control_size(ControlSize::Regular)
-        .label("Toggle system schemas")
-        .help(if session.show_system_schemas {
-            "Hide system schemas"
-        } else {
-            "Show system schemas"
-        })
-        .on_press(|s: &mut AppState| {
-            if let Some(sess) = s.active_session_mut() {
-                sess.show_system_schemas = !sess.show_system_schemas;
-            }
-        })
-        .build(k);
+    let trailing_action = match session.sidebar_tab {
+        SidebarTab::Items => IconButton::new(&icons::FILTER)
+            .variant(if session.show_system_schemas {
+                IconButtonVariant::Ghost
+            } else {
+                IconButtonVariant::GhostMuted
+            })
+            .control_size(ControlSize::Regular)
+            .label("Toggle system schemas")
+            .help(if session.show_system_schemas {
+                "Hide system schemas"
+            } else {
+                "Show system schemas"
+            })
+            .on_press(|s: &mut AppState| {
+                if let Some(sess) = s.active_session_mut() {
+                    sess.show_system_schemas = !sess.show_system_schemas;
+                }
+            })
+            .build(k),
+        SidebarTab::Queries => IconButton::new(&icons::PLUS)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Regular)
+            .label("New SQL query")
+            .help("New SQL query")
+            .shortcut("mod+t")
+            .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_new_query_tab(tx))
+            .build(k)
+            .key("sidebar-new-query-btn"),
+        SidebarTab::History => IconButton::new(&icons::TRASH)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Regular)
+            .label("Clear query history")
+            .help("Clear query history")
+            .disabled(session.query_history.is_empty())
+            .on_press(|s: &mut AppState| s.clear_query_history())
+            .build(k)
+            .key("sidebar-clear-history-btn"),
+    };
 
     let search_row = row()
         .w_full()
         .gap(6.0)
         .center_y()
         .child(el().grow(1.0).min_w(0.0).child(search))
-        .child(filter_btn);
+        .child(trailing_action);
 
     let mut sb = Sidebar::new()
         .label("Database objects")
@@ -421,18 +458,99 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
             }
         },
         SidebarTab::Queries => {
-            sb = sb.child(sidebar_message(
-                "Saved SQL queries arrive in Milestone 3.",
-                None,
-                k,
-            ));
+            let needle = session.sidebar_search.text.trim().to_ascii_lowercase();
+            let matches: Vec<&SavedQuery> = session
+                .saved_queries
+                .iter()
+                .filter(|q| {
+                    needle.is_empty()
+                        || q.name.to_ascii_lowercase().contains(&needle)
+                        || q.sql.to_ascii_lowercase().contains(&needle)
+                        || q.folder
+                            .as_deref()
+                            .is_some_and(|f| f.to_ascii_lowercase().contains(&needle))
+                })
+                .collect();
+            let total = matches.len();
+            if matches.is_empty() {
+                sb = sb.child(sidebar_message(
+                    if session.saved_queries.is_empty() {
+                        "No saved queries yet. Open a SQL tab (⌘T) and press ⌘S to save."
+                    } else {
+                        "No saved queries match your search."
+                    },
+                    Some(("New SQL Query (⌘T)", |s, tx| s.open_new_query_tab(tx))),
+                    k,
+                ));
+            } else {
+                let active_saved_id = session.active_query_tab().and_then(|q| q.saved_query_id);
+                for q in matches {
+                    let selected = active_saved_id == Some(q.id);
+                    sb = sb.child(build_saved_query_item(q, selected, k));
+                }
+            }
+            sb = sb.footer(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        Button::new("New SQL Query")
+                            .variant(ButtonVariant::Outline)
+                            .control_size(ControlSize::Small)
+                            .icon(&icons::PLUS)
+                            .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_new_query_tab(tx))
+                            .build(k),
+                    )
+                    .child(spacer())
+                    .child(text(format!("{total}")).font(k.ty.small).color(c.text_faint)),
+            );
         }
         SidebarTab::History => {
-            sb = sb.child(sidebar_message(
-                "Query history arrives in Milestone 3.",
-                None,
-                k,
-            ));
+            let needle = session.sidebar_search.text.trim().to_ascii_lowercase();
+            let matches: Vec<&QueryHistoryEntry> = session
+                .query_history
+                .iter()
+                .filter(|h| {
+                    needle.is_empty()
+                        || h.sql.to_ascii_lowercase().contains(&needle)
+                        || h.database_name
+                            .as_deref()
+                            .is_some_and(|d| d.to_ascii_lowercase().contains(&needle))
+                })
+                .collect();
+            let total = matches.len();
+            if matches.is_empty() {
+                sb = sb.child(sidebar_message(
+                    if session.query_history.is_empty() {
+                        "No executed SQL queries recorded yet."
+                    } else {
+                        "No history entries match your search."
+                    },
+                    None,
+                    k,
+                ));
+            } else {
+                for entry in matches {
+                    sb = sb.child(build_history_item(entry, k));
+                }
+            }
+            sb = sb.footer(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        Button::new("Clear History")
+                            .variant(ButtonVariant::GhostMuted)
+                            .control_size(ControlSize::Small)
+                            .disabled(session.query_history.is_empty())
+                            .on_press(|s: &mut AppState| s.clear_query_history())
+                            .build(k),
+                    )
+                    .child(spacer())
+                    .child(text(format!("{total}")).font(k.ty.small).color(c.text_faint)),
+            );
         }
     }
 
@@ -668,6 +786,7 @@ fn build_stage(
                 let tab_bar = table_grid::build_tab_bar(session, k, cx);
                 let body = match &active_tab.content {
                     TabContent::Table(table_tab) => table_grid::build_table_tab(s, session, table_tab, k, layer),
+                    TabContent::Query(query_tab) => query_editor::build_query_tab(s, session, query_tab, k, cx, layer),
                 };
                 return col()
                     .key("stage-tabs-shell")
@@ -698,6 +817,9 @@ fn build_stage(
                         .pt(4.0)
                         .child(empty_cta("Jump to Object (⌘P)", k, true, |s, tx| {
                             s.open_picker(PickerKind::QuickJump, tx);
+                        }))
+                        .child(empty_cta("New SQL Query (⌘T)", k, false, |s, tx| {
+                            s.open_new_query_tab(tx);
                         }))
                         .child(empty_cta("Switch Database (⌘K)", k, false, |s, tx| {
                             s.open_picker(PickerKind::Database, tx);
@@ -849,4 +971,147 @@ fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
         .fill(c.bg_base)
         .child(header)
         .child(body)
+}
+
+fn collapse_sql_preview(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_saved_query_item(q: &SavedQuery, selected: bool, k: &Kit) -> El {
+    let c = &k.c;
+    let query_id = q.id;
+    let del_id = q.id;
+    let preview = collapse_sql_preview(&q.sql);
+
+    let mut header_row = row()
+        .w_full()
+        .gap(5.0)
+        .center_y()
+        .child(icon(&icons::BOOKMARK, 12.0).color(if selected { c.text_accent } else { c.icon_muted }))
+        .child(
+            text(&q.name)
+                .font(if selected { k.ty.ui_medium } else { k.ty.ui_compact })
+                .color(c.text_base)
+                .grow(1.0)
+                .shrink()
+                .truncate(),
+        );
+
+    if q.connection_id.is_none() {
+        header_row = header_row.child(pill_badge(
+            format!("sidebar/saved/global/{query_id}"),
+            "Global",
+            c.layer_02,
+            c.text_faint,
+            c.border_muted,
+            k,
+        ));
+    } else if let Some(ref folder) = q.folder {
+        header_row = header_row.child(text(folder).font(k.ty.small).color(c.text_faint).truncate());
+    }
+
+    let delete_btn = IconButton::new(&icons::TRASH)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Mini)
+        .label(format!("Delete {}", q.name))
+        .help("Delete saved query")
+        .on_press(move |s: &mut AppState| s.delete_saved_query(del_id))
+        .build(k)
+        .key(format!("sidebar/saved/{query_id}/delete"));
+
+    row()
+        .key(format!("sidebar/saved/{query_id}"))
+        .role("listitem")
+        .label(&q.name)
+        .focusable(true)
+        .w_full()
+        .px(6.0)
+        .py(5.0)
+        .gap(4.0)
+        .center_y()
+        .radius(k.radius.sm)
+        .fill(if selected { c.layer_03 } else { rune::Color::TRANSPARENT })
+        .hover(c.hover)
+        .press(c.pressed)
+        .on_press_tx(move |s: &mut AppState, tx: &mut Tx| s.open_saved_query(query_id, tx))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(header_row)
+                .child(text(preview).font(k.ty.small).color(c.text_muted).truncate()),
+        )
+        .child(delete_btn)
+}
+
+fn build_history_item(entry: &QueryHistoryEntry, k: &Kit) -> El {
+    let c = &k.c;
+    let entry_id = entry.id;
+    let preview = collapse_sql_preview(&entry.sql);
+    let time_str = entry.executed_at.with_timezone(&Local).format("%H:%M").to_string();
+    let dot_color = if entry.error.is_some() {
+        c.danger.fg
+    } else {
+        c.success.fg
+    };
+
+    let mut meta_parts = Vec::new();
+    if let Some(ref db) = entry.database_name {
+        meta_parts.push(db.clone());
+    }
+    meta_parts.push(format!("{} ms", entry.duration_ms));
+    if let Some(rows) = entry.rows_count {
+        meta_parts.push(if rows == 1 {
+            "1 row".to_owned()
+        } else {
+            format!("{rows} rows")
+        });
+    } else if entry.error.is_some() {
+        meta_parts.push("failed".to_owned());
+    }
+    let meta = meta_parts.join(" · ");
+
+    row()
+        .key(format!("sidebar/history/{entry_id}"))
+        .role("listitem")
+        .label(&preview)
+        .focusable(true)
+        .w_full()
+        .px(6.0)
+        .py(5.0)
+        .gap(6.0)
+        .items_start()
+        .radius(k.radius.sm)
+        .fill(rune::Color::TRANSPARENT)
+        .hover(c.hover)
+        .press(c.pressed)
+        .on_press_tx(move |s: &mut AppState, tx: &mut Tx| s.open_history_entry(entry_id, tx))
+        .child(el().mt(5.0).size(7.0, 7.0).radius(3.5).fill(dot_color))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .center_y()
+                        .child(
+                            text(preview)
+                                .font(k.ty.mono)
+                                .color(c.text_base)
+                                .grow(1.0)
+                                .shrink()
+                                .truncate(),
+                        )
+                        .child(text(time_str).font(k.ty.small).color(c.text_faint)),
+                )
+                .child(text(meta).font(k.ty.small).color(if entry.error.is_some() {
+                    c.danger.fg
+                } else {
+                    c.text_muted
+                }).truncate()),
+        )
 }

@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 
+use chrono::{Duration, Utc};
 use rune::ColorScheme;
 use tv_core::{
     AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbObject, DbObjectKind,
-    EnvTag, ExecutedSql, ForeignKeyRef, IndexInfo, PasswordMode, RequestId, SafetyPolicy, SchemaInfo, SessionId,
-    SortSpec, SslMode, StoreData, TabId, TablePage, TableStats, TableStructure,
+    EnvTag, ExecutedSql, ForeignKeyRef, IndexInfo, PasswordMode, QueryHistoryEntry, QueryStatementResult, RequestId,
+    SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo, SessionId, SortSpec, SslMode, StoreData, TablePage,
+    TableStats, TableStructure,
 };
 
 use crate::state::{
     AppState, ColumnLoadState, ConnectedData, ConnectionFormState, ConnectionState, OverlayState, PickerKind,
-    PickerState, Screen, SessionState, TableViewMode, WorkspaceTab,
+    PickerState, QueryResultTabState, QueryTabState, SaveQueryModalState, Screen, SessionState, SidebarTab,
+    TableViewMode, WorkspaceTab,
 };
 
 /// Named headless scene entry registered on `AppSpec::scenes`.
@@ -30,6 +33,10 @@ pub const SCENES: &[SceneEntry] = &[
     ("workspace-structure", scene_workspace_structure),
     ("workspace-indexes", scene_workspace_indexes),
     ("workspace-filter-error", scene_workspace_filter_error),
+    ("workspace-sql-editor-dark", scene_workspace_sql_editor_dark),
+    ("workspace-sql-editor-light", scene_workspace_sql_editor_light),
+    ("workspace-sql-saved-queries", scene_workspace_sql_saved_queries),
+    ("workspace-save-query-modal", scene_workspace_save_query_modal),
 ];
 
 /// Builds deterministic Greendale Community College sample profiles for headless scenes and tests.
@@ -260,8 +267,8 @@ fn setup_connected_workspace(
         selected_object: Some(("public".to_owned(), "students".to_owned())),
     }));
 
-    let students_tab_id = TabId::new(1);
-    let courses_tab_id = TabId::new(2);
+    let students_tab_id = s.alloc_tab_id();
+    let courses_tab_id = s.alloc_tab_id();
     let mut students_tab = WorkspaceTab::new_table(
         students_tab_id,
         "public".to_owned(),
@@ -300,8 +307,255 @@ fn setup_connected_workspace(
     session.tabs = vec![students_tab, courses_tab];
     session.active_tab = Some(students_tab_id);
     session.console_entries = sample_logs();
+    let conn_id = session.profile.id;
+    session.saved_queries = sample_saved_queries(conn_id);
+    session.query_history = sample_query_history(conn_id);
     s.sessions.insert(sid, session);
     s.screen = Screen::Workspace(sid);
+}
+
+fn scene_workspace_sql_editor_dark(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, None);
+    let cols = sample_students_columns();
+    let full_page = sample_students_page(cols.clone());
+    let enrolled_rows: Vec<Vec<CellValue>> = full_page
+        .rows
+        .into_iter()
+        .filter(|r| matches!(r.get(4), Some(CellValue::Bool(true))))
+        .collect();
+    let enrolled_count = enrolled_rows.len();
+
+    let sql = concat!(
+        "-- Greendale Community College active roster\n",
+        "SELECT\n",
+        "    student_id,\n",
+        "    id,\n",
+        "    full_name,\n",
+        "    email,\n",
+        "    enrolled,\n",
+        "    gpa,\n",
+        "    profile,\n",
+        "    created_at,\n",
+        "    group_id\n",
+        "FROM public.students\n",
+        "WHERE enrolled = true\n",
+        "ORDER BY student_id;\n\n",
+        "SELECT COUNT(*) AS active_students FROM public.students WHERE enrolled = true;",
+    );
+
+    let tid = s.alloc_tab_id();
+    let mut qtab = QueryTabState::new(tid, "Active Greendale Roster".to_owned(), sql.to_owned(), None);
+    if let Some(saved_id) = s
+        .active_session()
+        .and_then(|sess| sess.saved_queries.first().map(|q| q.id))
+    {
+        qtab.saved_query_id = Some(saved_id);
+        qtab.saved_snapshot = sql.to_owned();
+    }
+    qtab.total_duration_ms = Some(11);
+    let mut t1 = rune_kit::TableState::new().key("tv-qres-3-0");
+    t1.select("r-0");
+    let res1 = QueryResultTabState {
+        statement: QueryStatementResult {
+            sql: "SELECT student_id, id, full_name, email, enrolled, gpa, profile, created_at, group_id FROM public.students WHERE enrolled = true ORDER BY student_id".to_owned(),
+            columns: cols,
+            rows: enrolled_rows,
+            rows_affected: None,
+            total_rows_seen: enrolled_count,
+            truncated: false,
+            elapsed_ms: 8,
+            error: None,
+        },
+        table: t1,
+        selected_row: Some(0),
+    };
+    let res2 = QueryResultTabState {
+        statement: QueryStatementResult {
+            sql: "SELECT COUNT(*) AS active_students FROM public.students WHERE enrolled = true".to_owned(),
+            columns: vec![ColumnMeta {
+                name: "active_students".to_owned(),
+                data_type: "bigint".to_owned(),
+                udt_name: "int8".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            }],
+            rows: vec![vec![CellValue::Int(enrolled_count as i64)]],
+            rows_affected: None,
+            total_rows_seen: 1,
+            truncated: false,
+            elapsed_ms: 3,
+            error: None,
+        },
+        table: rune_kit::TableState::new().key("tv-qres-3-1"),
+        selected_row: None,
+    };
+    qtab.results = vec![res1, res2];
+
+    if let Some(session) = s.active_session_mut() {
+        session.tabs.push(WorkspaceTab {
+            id: tid,
+            content: crate::state::TabContent::Query(Box::new(qtab)),
+        });
+        session.active_tab = Some(tid);
+    }
+}
+
+fn scene_workspace_sql_editor_light(s: &mut AppState) {
+    setup_connected_workspace(s, false, TableViewMode::Data, None);
+    let sql = "SELECT pg_sleep(5),\n       s.full_name,\n       g.topic\nFROM public.students s\nJOIN public.study_groups g ON g.group_id = s.group_id\nWHERE s.gpa >= 3.0;";
+    let tid = s.alloc_tab_id();
+    let mut qtab = QueryTabState::new(tid, "Query 1".to_owned(), sql.to_owned(), None);
+    qtab.running = true;
+    qtab.elapsed_ms = 2400;
+    qtab.active_req_id = Some(RequestId::new(99));
+
+    if let Some(session) = s.active_session_mut() {
+        session.sidebar_tab = SidebarTab::History;
+        session.tabs.push(WorkspaceTab {
+            id: tid,
+            content: crate::state::TabContent::Query(Box::new(qtab)),
+        });
+        session.active_tab = Some(tid);
+    }
+}
+
+fn scene_workspace_sql_saved_queries(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, None);
+    let saved_info = s.active_session().and_then(|sess| {
+        sess.saved_queries
+            .get(2)
+            .map(|sq| (sq.id, sq.name.clone(), sq.sql.clone()))
+    });
+    let Some((saved_id, saved_name, saved_sql)) = saved_info else {
+        return;
+    };
+    let tid = s.alloc_tab_id();
+    let mut qtab = QueryTabState::new(tid, saved_name, saved_sql.clone(), Some(saved_id));
+    qtab.total_duration_ms = Some(6);
+    qtab.results = vec![QueryResultTabState {
+        statement: QueryStatementResult {
+            sql: saved_sql,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_affected: Some(1),
+            total_rows_seen: 0,
+            truncated: false,
+            elapsed_ms: 6,
+            error: None,
+        },
+        table: rune_kit::TableState::new().key("tv-qres-3-0"),
+        selected_row: None,
+    }];
+
+    if let Some(session) = s.active_session_mut() {
+        session.sidebar_tab = SidebarTab::Queries;
+        session.tabs.push(WorkspaceTab {
+            id: tid,
+            content: crate::state::TabContent::Query(Box::new(qtab)),
+        });
+        session.active_tab = Some(tid);
+    }
+}
+
+fn scene_workspace_save_query_modal(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, None);
+    let tid = s.alloc_tab_id();
+    let sql = "SELECT full_name, gpa\nFROM public.students\nWHERE gpa >= 3.5\nORDER BY gpa DESC;";
+    let qtab = QueryTabState::new(tid, "Query 1".to_owned(), sql.to_owned(), None);
+
+    let sid = if let Some(session) = s.active_session_mut() {
+        session.tabs.push(WorkspaceTab {
+            id: tid,
+            content: crate::state::TabContent::Query(Box::new(qtab)),
+        });
+        session.active_tab = Some(tid);
+        session.id
+    } else {
+        SessionId::new(1)
+    };
+
+    s.overlay = OverlayState::SaveQuery(Box::new(SaveQueryModalState {
+        session_id: sid,
+        tab_id: tid,
+        editing_id: None,
+        name: rune::TextEdit::new("Dean's Honor List"),
+        folder: rune::TextEdit::new("Reporting"),
+        scope_all_connections: false,
+        error: None,
+    }));
+}
+
+fn sample_saved_queries(conn_id: tv_core::ConnectionId) -> Vec<SavedQuery> {
+    let now = Utc::now();
+    vec![
+        SavedQuery {
+            id: SavedQueryId::new(),
+            connection_id: Some(conn_id),
+            folder: Some("Roster".to_owned()),
+            name: "Active Greendale Roster".to_owned(),
+            sql: "SELECT student_id, full_name, email, gpa FROM public.students WHERE enrolled = true ORDER BY gpa DESC;".to_owned(),
+            updated_at: now - Duration::minutes(5),
+        },
+        SavedQuery {
+            id: SavedQueryId::new(),
+            connection_id: None,
+            folder: Some("Analytics".to_owned()),
+            name: "Study Group Enrollment".to_owned(),
+            sql: "SELECT g.topic, COUNT(s.student_id) AS members FROM public.study_groups g LEFT JOIN public.students s ON s.group_id = g.group_id GROUP BY g.topic;".to_owned(),
+            updated_at: now - Duration::hours(2),
+        },
+        SavedQuery {
+            id: SavedQueryId::new(),
+            connection_id: Some(conn_id),
+            folder: Some("Admin".to_owned()),
+            name: "Fix Dean Pelton Budget".to_owned(),
+            sql: "UPDATE public.students SET enrolled = true WHERE full_name = 'Jeff Winger';".to_owned(),
+            updated_at: now - Duration::days(1),
+        },
+    ]
+}
+
+fn sample_query_history(conn_id: tv_core::ConnectionId) -> Vec<QueryHistoryEntry> {
+    let now = Utc::now();
+    vec![
+        QueryHistoryEntry {
+            id: 1,
+            connection_id: Some(conn_id),
+            connection_name: "greendale_local".to_owned(),
+            database_name: Some("greendale_idp_dev".to_owned()),
+            sql: "SELECT student_id, full_name, gpa FROM public.students WHERE enrolled = true ORDER BY student_id;".to_owned(),
+            executed_at: now - Duration::minutes(3),
+            duration_ms: 8,
+            rows_count: Some(6),
+            error: None,
+        },
+        QueryHistoryEntry {
+            id: 2,
+            connection_id: Some(conn_id),
+            connection_name: "greendale_local".to_owned(),
+            database_name: Some("greendale_idp_dev".to_owned()),
+            sql: "UPDATE public.students SET gpa = 3.95 WHERE full_name = 'Annie Edison';".to_owned(),
+            executed_at: now - Duration::minutes(19),
+            duration_ms: 4,
+            rows_count: Some(1),
+            error: None,
+        },
+        QueryHistoryEntry {
+            id: 3,
+            connection_id: Some(conn_id),
+            connection_name: "greendale_local".to_owned(),
+            database_name: Some("greendale_idp_dev".to_owned()),
+            sql: "SELECT * FROM public.nonexistent_table;".to_owned(),
+            executed_at: now - Duration::hours(1),
+            duration_ms: 2,
+            rows_count: None,
+            error: Some("relation \"public.nonexistent_table\" does not exist".to_owned()),
+        },
+    ]
 }
 
 fn sample_students_columns() -> Vec<ColumnMeta> {

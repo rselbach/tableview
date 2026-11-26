@@ -11,6 +11,12 @@ pub enum Action {
     OpenConnectionSwitcher,
     OpenDatabasePicker,
     QuickJumpObject,
+    NewQueryTab,
+    RunCurrentQuery,
+    RunAllQueries,
+    CancelQuery,
+    FormatSql,
+    SaveQuery,
     ToggleSidebar,
     ToggleConsole,
     ToggleInspector,
@@ -33,10 +39,34 @@ pub const fn primary_prefix() -> &'static str {
     if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" }
 }
 
+fn is_primary_enter(ev: &KeyEvent) -> bool {
+    if ev.key != Key::Enter || ev.mods.alt {
+        return false;
+    }
+    if cfg!(target_os = "macos") {
+        ev.mods.cmd && !ev.mods.ctrl
+    } else {
+        ev.mods.ctrl && !ev.mods.cmd
+    }
+}
+
 /// Translates a `KeyEvent` into a TableView [`Action`].
 pub fn action_for_key(ev: &KeyEvent) -> Option<Action> {
     if ev.key == Key::Escape {
         return Some(Action::DismissOverlay);
+    }
+    if is_primary_enter(ev) {
+        return Some(if ev.mods.shift {
+            Action::RunAllQueries
+        } else {
+            Action::RunCurrentQuery
+        });
+    }
+    if ev.is_command('t') && !ev.mods.shift && !ev.mods.alt {
+        return Some(Action::NewQueryTab);
+    }
+    if ev.is_command('s') && !ev.mods.shift && !ev.mods.alt {
+        return Some(Action::SaveQuery);
     }
     if ev.is_command('k') {
         return Some(if ev.mods.shift {
@@ -71,11 +101,23 @@ pub fn action_for_key(ev: &KeyEvent) -> Option<Action> {
     if (ev.is_command(']') || ev.is_command('}')) && ev.mods.shift && !ev.mods.alt {
         return Some(Action::NextTab);
     }
-    if ev.is_command('f') && !ev.mods.shift && !ev.mods.alt {
-        return Some(Action::FocusFilter);
+    if ev.is_command('f') {
+        if ev.mods.shift && !ev.mods.alt {
+            return Some(Action::FormatSql);
+        }
+        if !ev.mods.shift && !ev.mods.alt {
+            return Some(Action::FocusFilter);
+        }
+        return None;
     }
-    if ev.is_command('.') && ev.mods.alt {
-        return Some(Action::Disconnect);
+    if ev.is_command('.') {
+        if ev.mods.alt {
+            return Some(Action::Disconnect);
+        }
+        if !ev.mods.shift && !ev.mods.ctrl {
+            return Some(Action::CancelQuery);
+        }
+        return None;
     }
     if ev.is_command('n') && !ev.mods.shift && !ev.mods.alt {
         return Some(Action::NewConnection);
@@ -125,6 +167,12 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
                         return true;
                     }
                 }
+                if let Some(q) = session.active_query_tab_mut()
+                    && q.limit_dropdown_open
+                {
+                    q.limit_dropdown_open = false;
+                    return true;
+                }
             }
             false
         }
@@ -168,6 +216,19 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
                 false
             }
         }
+        Action::NewQueryTab => {
+            if matches!(s.screen, Screen::Workspace(_)) {
+                s.open_new_query_tab(tx);
+                true
+            } else {
+                false
+            }
+        }
+        Action::RunCurrentQuery => s.run_active_query(false),
+        Action::RunAllQueries => s.run_active_query(true),
+        Action::CancelQuery => s.cancel_active_query(),
+        Action::FormatSql => s.format_active_query_sql(),
+        Action::SaveQuery => s.open_save_query_modal(tx),
         Action::ToggleSidebar => {
             if let Some(session) = s.active_session_mut() {
                 session.sidebar_pane.toggle();
@@ -325,6 +386,37 @@ pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
         ),
         item_with_shortcut("conn-quick-jump", "Jump to Table…", "Connection", "mod+p", |s, tx| {
             dispatch_action(s, Action::QuickJumpObject, tx);
+        }),
+        MenuItem::separator().menu("Connection"),
+        item_with_shortcut("query-new", "New SQL Query", "Connection", "mod+t", |s, tx| {
+            dispatch_action(s, Action::NewQueryTab, tx);
+        }),
+        item_with_shortcut(
+            "query-run-current",
+            "Run Current Query",
+            "Connection",
+            "mod+enter",
+            |s, tx| {
+                dispatch_action(s, Action::RunCurrentQuery, tx);
+            },
+        ),
+        item_with_shortcut(
+            "query-run-all",
+            "Run All Queries",
+            "Connection",
+            "mod+shift+enter",
+            |s, tx| {
+                dispatch_action(s, Action::RunAllQueries, tx);
+            },
+        ),
+        item_with_shortcut("query-cancel", "Cancel Running Query", "Connection", "mod+period", |s, tx| {
+            dispatch_action(s, Action::CancelQuery, tx);
+        }),
+        item_with_shortcut("query-format", "Format SQL", "Connection", "mod+shift+f", |s, tx| {
+            dispatch_action(s, Action::FormatSql, tx);
+        }),
+        item_with_shortcut("query-save", "Save Query…", "Connection", "mod+s", |s, tx| {
+            dispatch_action(s, Action::SaveQuery, tx);
         }),
         MenuItem::new("Connection Launcher", |s, tx| {
             dispatch_action(s, Action::ShowLauncher, tx);

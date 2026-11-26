@@ -312,3 +312,228 @@ fn workspace_filter_bar_applies_and_clears_where_clause() {
         None
     );
 }
+
+#[test]
+fn sql_workbench_opens_formats_and_saves_query() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-connected-dark");
+
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 2);
+
+    // Cmd+T opens a new SQL workbench tab and focuses its editor.
+    rt.key(KeyEvent {
+        key: Key::Command('t'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 3);
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_query_tab()
+            .is_some()
+    );
+    let tab_id = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_tab
+        .expect("active tab")
+        .get();
+    let editor_key = format!("sql-editor-{tab_id}");
+    assert!(rt.find(&editor_key).is_some());
+
+    // Typing SQL and pressing Enter inserts a newline rather than submitting away.
+    rt.key(KeyEvent::from(Key::Text("select full_name, gpa".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Text("from public.students where gpa >= 3.5".to_owned())));
+    rt.frame(0.0);
+    let typed = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_query_tab()
+        .expect("query tab")
+        .editor
+        .text
+        .clone();
+    assert!(typed.contains('\n'), "plain Enter should insert newline in SQL editor: {typed:?}");
+
+    // Format button uppercases SQL keywords cleanly.
+    rt.frame(0.5);
+    let (fx, fy) = rt.find("query-format-btn").expect("format button");
+    rt.pointer_down(fx, fy);
+    rt.pointer_up(fx, fy);
+    rt.frame(0.1);
+    let formatted = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_query_tab()
+        .expect("query tab")
+        .editor
+        .text
+        .clone();
+    assert!(formatted.contains("SELECT"));
+    assert!(formatted.contains("FROM"));
+    assert!(formatted.contains("WHERE"));
+
+    // Cmd+S opens the Save Query modal; replacing name and submitting saves to library.
+    rt.key(KeyEvent {
+        key: Key::Command('s'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.5);
+    assert!(matches!(rt.state.overlay, OverlayState::SaveQuery(_)));
+    assert!(rt.find("save-query-name").is_some());
+
+    rt.key(KeyEvent {
+        key: Key::Command('a'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Text("High GPA Roster".to_owned())));
+    rt.frame(0.0);
+
+    let (sx, sy) = rt.find("save-query-submit-btn").expect("save submit");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.1);
+
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+    let sess = rt.state.active_session().expect("session");
+    assert!(sess.saved_queries.iter().any(|q| q.name == "High GPA Roster"));
+    let active_q = sess.active_query_tab().expect("active query tab");
+    assert_eq!(active_q.title, "High GPA Roster");
+    assert!(!active_q.is_dirty());
+}
+
+#[test]
+fn sql_workbench_switches_multi_results_and_populates_inspector() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sql-editor-dark");
+
+    // Pre-selected row 0 populates the right inspector.
+    assert!(rt.find("inspector-row-fields").is_some());
+    assert!(rt.find("inspector/row-badge").is_some());
+
+    // Selecting row 1 (Abed Nadir) updates inspector and shows email NULL pill.
+    let r1 = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("r-1"))
+        .expect("second result row r-1");
+    let (rx, ry) = (r1.rect[0] + 100.0, r1.rect[1] + r1.rect[3] / 2.0);
+    rt.pointer_down(rx, ry);
+    rt.pointer_up(rx, ry);
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_query_tab()
+            .expect("query tab")
+            .active_result_state()
+            .expect("res0")
+            .selected_row,
+        Some(1)
+    );
+    assert!(rt.find("inspector/null/3").is_some());
+
+    // Switching to Result 2 updates active_result and displays active_students table.
+    let (tx, ty) = rt.find("query-result-tab-1").expect("result tab 1");
+    rt.pointer_down(tx, ty);
+    rt.pointer_up(tx, ty);
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_query_tab()
+            .expect("query tab")
+            .active_result,
+        1
+    );
+    assert!(rt.find("r-0").is_some());
+}
+
+#[test]
+fn sidebar_queries_and_history_open_without_duplicating_saved_tabs() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sql-saved-queries");
+
+    let first_saved = rt
+        .state
+        .active_session()
+        .expect("session")
+        .saved_queries[0]
+        .clone();
+    let initial_tabs = rt.state.active_session().expect("session").tabs.len();
+    assert_eq!(initial_tabs, 3);
+
+    // Click first saved query in sidebar -> opens tab 4.
+    let key = format!("sidebar/saved/{}", first_saved.id);
+    let (qx, qy) = rt.find(&key).expect("saved query sidebar item");
+    rt.pointer_down(qx, qy);
+    rt.pointer_up(qx, qy);
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 4);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_query_tab()
+            .expect("query tab")
+            .title,
+        first_saved.name
+    );
+
+    // Clicking the same saved query again focuses it without duplicating.
+    let (qx2, qy2) = rt.find(&key).expect("saved query sidebar item");
+    rt.pointer_down(qx2, qy2);
+    rt.pointer_up(qx2, qy2);
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 4);
+
+    // Switch sidebar to History and open history entry 1.
+    let hist_node = rt
+        .accessibility_tree()
+        .nodes
+        .into_iter()
+        .find(|(_, n)| n.label() == Some("History"))
+        .map(|(id, _)| id)
+        .expect("History sidebar tab");
+    let _ = hist_node;
+    let hist_tab = rt
+        .elements()
+        .into_iter()
+        .find(|e| e.key.as_deref().is_some_and(|k| k.ends_with("segment2")))
+        .expect("sidebar History segment");
+    rt.pointer_down(
+        hist_tab.rect[0] + hist_tab.rect[2] / 2.0,
+        hist_tab.rect[1] + hist_tab.rect[3] / 2.0,
+    );
+    rt.pointer_up(
+        hist_tab.rect[0] + hist_tab.rect[2] / 2.0,
+        hist_tab.rect[1] + hist_tab.rect[3] / 2.0,
+    );
+    rt.frame(0.5);
+
+    let (hx, hy) = rt.find("sidebar/history/1").expect("history entry 1");
+    rt.pointer_down(hx, hy);
+    rt.pointer_up(hx, hy);
+    rt.frame(0.1);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 5);
+}

@@ -126,3 +126,39 @@ pub static CHEVRON_RIGHT: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
+
+pub static SQL_QUERY: Icon = Icon {
+    name: "tv-sql-query",
+    view: 16.0,
+    body: r#"<rect x="2" y="2.5" width="12" height="11" rx="2" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M5 6.2L7 8L5 9.8M8.5 9.8H11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static PLAY: Icon = Icon {
+    name: "tv-play",
+    view: 16.0,
+    body: r#"<path d="M5 3.4L12.2 8L5 12.6V3.4Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="currentColor"/>"#,
+};
+
+pub static STOP_SQUARE: Icon = Icon {
+    name: "tv-stop-square",
+    view: 16.0,
+    body: r#"<rect x="4" y="4" width="8" height="8" rx="1.4" fill="currentColor"/>"#,
+};
+
+pub static BOOKMARK: Icon = Icon {
+    name: "tv-bookmark",
+    view: 16.0,
+    body: r#"<path d="M4.2 2.5H11.8C12.2 2.5 12.5 2.8 12.5 3.2V13.5L8 10.6L3.5 13.5V3.2C3.5 2.8 3.8 2.5 4.2 2.5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static CLOCK: Icon = Icon {
+    name: "tv-clock",
+    view: 16.0,
+    body: r#"<circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.3" fill="none"/><path d="M8 5V8.3L10.3 9.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static TRASH: Icon = Icon {
+    name: "tv-trash",
+    view: 16.0,
+    body: r#"<path d="M3 4.5H13M6 4.5V3H10V4.5M5 4.5V12.5C5 13.1 5.4 13.5 6 13.5H10C10.6 13.5 11 13.1 11 12.5V4.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};

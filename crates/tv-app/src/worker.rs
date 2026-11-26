@@ -1,13 +1,17 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use rune::Waker;
 use rune::credentials::Credentials;
 use tv_core::engine::postgres::{PostgresSession, quote_ident};
 use tv_core::{
     ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbError, DbObject, DbSession, ExecutedSql,
-    PageRequest, PasswordMode, RequestId, SchemaInfo, ServerInfo, SessionId, TabId, TablePage, TableStructure,
+    NewHistoryEntry, PageRequest, PasswordMode, QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId,
+    SavedQuery, SavedQueryId, SchemaInfo, ServerInfo, SessionId, TabId, TablePage, TableStructure,
 };
+
+const QUERY_HISTORY_LIMIT: usize = 200;
 
 /// Commands dispatched from the UI thread to the background database worker.
 #[derive(Debug)]
@@ -54,6 +58,43 @@ pub enum WorkerCmd {
         req_id: RequestId,
         schema: String,
         table: String,
+    },
+    ExecuteSql {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        connection_id: ConnectionId,
+        connection_name: String,
+        database: Option<String>,
+        statements: Vec<String>,
+        executed_sql_text: String,
+        row_limit: Option<usize>,
+    },
+    CancelQuery {
+        session_id: SessionId,
+    },
+    LoadQueryLibrary {
+        session_id: SessionId,
+        connection_id: ConnectionId,
+    },
+    SaveQuery {
+        session_id: SessionId,
+        tab_id: Option<TabId>,
+        session_connection_id: ConnectionId,
+        connection_id: Option<ConnectionId>,
+        id: Option<SavedQueryId>,
+        folder: Option<String>,
+        name: String,
+        sql: String,
+    },
+    DeleteSavedQuery {
+        session_id: SessionId,
+        connection_id: ConnectionId,
+        id: SavedQueryId,
+    },
+    ClearQueryHistory {
+        session_id: SessionId,
+        connection_id: Option<ConnectionId>,
     },
     Disconnect {
         session_id: SessionId,
@@ -136,6 +177,36 @@ pub enum WorkerEvent {
         result: Result<TableStructure, DbError>,
         logs: Vec<ExecutedSql>,
     },
+    QueryTick {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        elapsed_ms: u64,
+    },
+    QueryCompleted {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        result: Result<QueryBatchResult, DbError>,
+        logs: Vec<ExecutedSql>,
+        recorded_history: Option<QueryHistoryEntry>,
+    },
+    QueryLibraryLoaded {
+        session_id: SessionId,
+        saved_queries: Vec<SavedQuery>,
+        history: Vec<QueryHistoryEntry>,
+    },
+    SavedQueryMutated {
+        session_id: SessionId,
+        tab_id: Option<TabId>,
+        saved: Option<SavedQuery>,
+        saved_queries: Vec<SavedQuery>,
+        error: Option<String>,
+    },
+    HistoryCleared {
+        session_id: SessionId,
+        history: Vec<QueryHistoryEntry>,
+    },
     OperationFailed {
         session_id: SessionId,
         req_id: RequestId,
@@ -156,7 +227,7 @@ pub enum WorkerEvent {
 pub struct WorkerBridge {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCmd>,
     event_rx: mpsc::Receiver<WorkerEvent>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    waker: Arc<std::sync::Mutex<Option<Waker>>>,
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -165,7 +236,7 @@ impl WorkerBridge {
     pub fn spawn() -> Option<Self> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
-        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let waker: Arc<std::sync::Mutex<Option<Waker>>> = Arc::new(std::sync::Mutex::new(None));
         let worker_waker = Arc::clone(&waker);
 
         let thread = std::thread::Builder::new()
@@ -209,7 +280,7 @@ impl WorkerBridge {
     }
 }
 
-fn emit(tx: &mpsc::Sender<WorkerEvent>, waker: &Arc<Mutex<Option<Waker>>>, event: WorkerEvent) {
+fn emit(tx: &mpsc::Sender<WorkerEvent>, waker: &Arc<std::sync::Mutex<Option<Waker>>>, event: WorkerEvent) {
     if tx.send(event).is_ok()
         && let Ok(guard) = waker.lock()
         && let Some(w) = guard.as_ref()
@@ -261,18 +332,20 @@ fn pick_default_schema(schemas: &[SchemaInfo], preferred: Option<&str>) -> Optio
 async fn worker_loop(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<WorkerCmd>,
     event_tx: mpsc::Sender<WorkerEvent>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    waker: Arc<std::sync::Mutex<Option<Waker>>>,
 ) {
     let sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<PostgresSession>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let query_store: Option<Arc<QueryStore>> = QueryStore::open_default().ok().map(Arc::new);
 
     while let Some(cmd) = cmd_rx.recv().await {
         let sessions = Arc::clone(&sessions);
+        let query_store = query_store.clone();
         let event_tx = event_tx.clone();
         let waker = Arc::clone(&waker);
 
         tokio::spawn(async move {
-            handle_cmd(cmd, sessions, event_tx, waker).await;
+            handle_cmd(cmd, sessions, query_store, event_tx, waker).await;
         });
     }
 }
@@ -280,8 +353,9 @@ async fn worker_loop(
 async fn handle_cmd(
     cmd: WorkerCmd,
     sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<PostgresSession>>>>,
+    query_store: Option<Arc<QueryStore>>,
     event_tx: mpsc::Sender<WorkerEvent>,
-    waker: Arc<Mutex<Option<Waker>>>,
+    waker: Arc<std::sync::Mutex<Option<Waker>>>,
 ) {
     match cmd {
         WorkerCmd::Connect {
@@ -677,6 +751,258 @@ async fn handle_cmd(
                     },
                 ),
             }
+        }
+
+        WorkerCmd::ExecuteSql {
+            session_id,
+            tab_id,
+            req_id,
+            connection_id,
+            connection_name,
+            database,
+            statements,
+            executed_sql_text,
+            row_limit,
+        } => {
+            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::QueryCompleted {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(DbError::Disconnected),
+                        logs: Vec::new(),
+                        recorded_history: None,
+                    },
+                );
+                return;
+            };
+
+            let start = Instant::now();
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+
+            let exec_fut = session.execute_sql(&statements, row_limit);
+            tokio::pin!(exec_fut);
+
+            let outcome = loop {
+                tokio::select! {
+                    res = &mut exec_fut => break res,
+                    _ = ticker.tick() => {
+                        emit(
+                            &event_tx,
+                            &waker,
+                            WorkerEvent::QueryTick {
+                                session_id,
+                                tab_id,
+                                req_id,
+                                elapsed_ms: start.elapsed().as_millis() as u64,
+                            },
+                        );
+                    }
+                }
+            };
+
+            let (result, logs) = match outcome {
+                Ok((batch, logs)) => (Ok(batch), logs),
+                Err(error) => (Err(error), Vec::new()),
+            };
+
+            let recorded_history = if let Some(store) = query_store
+                && !executed_sql_text.trim().is_empty()
+            {
+                let (duration_ms, rows_count, error) = match &result {
+                    Ok(batch) => {
+                        let err = if batch.cancelled {
+                            Some("Query cancelled".to_owned())
+                        } else {
+                            batch.results.iter().find_map(|r| r.error.clone())
+                        };
+                        let rows = if batch.results.iter().any(|r| r.is_tabular()) {
+                            Some(batch.results.iter().map(|r| r.rows.len() as u64).sum())
+                        } else {
+                            batch
+                                .results
+                                .iter()
+                                .filter_map(|r| r.rows_affected)
+                                .reduce(|a, b| a + b)
+                        };
+                        (batch.total_elapsed_ms, rows, err)
+                    }
+                    Err(err) => (start.elapsed().as_millis() as u64, None, Some(err.to_string())),
+                };
+                let entry = NewHistoryEntry {
+                    connection_id: Some(connection_id),
+                    connection_name,
+                    database_name: database,
+                    sql: executed_sql_text,
+                    duration_ms,
+                    rows_count,
+                    error,
+                };
+                tokio::task::spawn_blocking(move || store.record_history(&entry).ok())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::QueryCompleted {
+                    session_id,
+                    tab_id,
+                    req_id,
+                    result,
+                    logs,
+                    recorded_history,
+                },
+            );
+        }
+
+        WorkerCmd::CancelQuery { session_id } => {
+            let session = sessions.lock().await.get(&session_id).cloned();
+            if let Some(session) = session {
+                drop(session.cancel_running_query().await);
+            }
+        }
+
+        WorkerCmd::LoadQueryLibrary {
+            session_id,
+            connection_id,
+        } => {
+            let (saved_queries, history) = if let Some(store) = query_store {
+                tokio::task::spawn_blocking(move || {
+                    let saved = store.list_saved_queries(Some(connection_id), None).unwrap_or_default();
+                    let hist = store
+                        .list_history(Some(connection_id), None, QUERY_HISTORY_LIMIT)
+                        .unwrap_or_default();
+                    (saved, hist)
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::QueryLibraryLoaded {
+                    session_id,
+                    saved_queries,
+                    history,
+                },
+            );
+        }
+
+        WorkerCmd::SaveQuery {
+            session_id,
+            tab_id,
+            session_connection_id,
+            connection_id,
+            id,
+            folder,
+            name,
+            sql,
+        } => {
+            let saved_query = SavedQuery {
+                id: id.unwrap_or_default(),
+                connection_id,
+                folder,
+                name,
+                sql,
+                updated_at: chrono::Utc::now(),
+            };
+            let (saved, saved_queries, error) = if let Some(store) = query_store {
+                let query_clone = saved_query.clone();
+                tokio::task::spawn_blocking(move || {
+                    let save_res = store.upsert_saved_query(&query_clone);
+                    let list = store
+                        .list_saved_queries(Some(session_connection_id), None)
+                        .unwrap_or_default();
+                    match save_res {
+                        Ok(()) => (Some(query_clone), list, None),
+                        Err(e) => (None, list, Some(e.to_string())),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| (None, Vec::new(), Some(e.to_string())))
+            } else {
+                (
+                    None,
+                    Vec::new(),
+                    Some("Local query store is unavailable".to_owned()),
+                )
+            };
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::SavedQueryMutated {
+                    session_id,
+                    tab_id,
+                    saved,
+                    saved_queries,
+                    error,
+                },
+            );
+        }
+
+        WorkerCmd::DeleteSavedQuery {
+            session_id,
+            connection_id,
+            id,
+        } => {
+            let (saved_queries, error) = if let Some(store) = query_store {
+                tokio::task::spawn_blocking(move || {
+                    let del_res = store.delete_saved_query(id);
+                    let list = store.list_saved_queries(Some(connection_id), None).unwrap_or_default();
+                    match del_res {
+                        Ok(()) => (list, None),
+                        Err(e) => (list, Some(e.to_string())),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| (Vec::new(), Some(e.to_string())))
+            } else {
+                (Vec::new(), Some("Local query store is unavailable".to_owned()))
+            };
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::SavedQueryMutated {
+                    session_id,
+                    tab_id: None,
+                    saved: None,
+                    saved_queries,
+                    error,
+                },
+            );
+        }
+
+        WorkerCmd::ClearQueryHistory {
+            session_id,
+            connection_id,
+        } => {
+            let history = if let Some(store) = query_store {
+                tokio::task::spawn_blocking(move || {
+                    drop(store.clear_history(connection_id));
+                    Vec::new()
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::HistoryCleared { session_id, history },
+            );
         }
 
         WorkerCmd::Disconnect { session_id } => {

@@ -1,28 +1,62 @@
 use chrono::Local;
-use rune::{El, ScrollSpec, Tx, col, rich, row, spacer, text};
+use rune::{El, ScrollSpec, TextEdit, Tx, col, rich, row, spacer, text};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{Button, ButtonVariant, ControlSize, Divider, IconButton, IconButtonVariant, Kit, TextInput};
-use tv_core::{CellValue, ColumnMeta, TablePage};
+use tv_core::{CellValue, ColumnMeta};
 
 use crate::icons;
-use crate::state::{AppState, SessionState, TableTabState, TableViewMode};
+use crate::state::{AppState, QueryTabState, SessionState, TableTabState, TableViewMode};
 use crate::views::table_grid::format_bytes_preview;
 use crate::views::{format_bytes, pill_badge};
 
-/// Builds the right-hand inspector showing either typed row fields or table metadata details.
+struct SelectedRowView<'a> {
+    row_number: usize,
+    columns: &'a [ColumnMeta],
+    cells: &'a [CellValue],
+    search: &'a TextEdit,
+    json_pretty: bool,
+    clear_help: &'static str,
+}
+
+/// Builds the right-hand inspector showing either typed row fields or table/query metadata details.
 pub fn build(session: &SessionState, k: &Kit) -> El {
     let c = &k.c;
     let active_table = session.active_table_tab();
+    let active_query = session.active_query_tab();
 
-    let selected_row_info = active_table.and_then(|tab| {
-        if tab.view_mode != TableViewMode::Data {
-            return None;
+    let selected_row_info = if let Some(tab) = active_table {
+        if tab.view_mode == TableViewMode::Data {
+            tab.page.as_ref().and_then(|page| {
+                let idx = tab.selected_row?;
+                let cells = page.rows.get(idx)?;
+                Some(SelectedRowView {
+                    row_number: (tab.offset + idx as i64 + 1).max(1) as usize,
+                    columns: &page.columns,
+                    cells,
+                    search: &tab.inspector_search,
+                    json_pretty: tab.inspector_json_pretty,
+                    clear_help: "Back to table details",
+                })
+            })
+        } else {
+            None
         }
-        let page = tab.page.as_ref()?;
-        let idx = tab.selected_row?;
-        let row_cells = page.rows.get(idx)?;
-        Some((tab, page, idx, row_cells))
-    });
+    } else if let Some(q) = active_query {
+        q.active_result_state().and_then(|res| {
+            let idx = res.selected_row?;
+            let cells = res.statement.rows.get(idx)?;
+            Some(SelectedRowView {
+                row_number: idx + 1,
+                columns: &res.statement.columns,
+                cells,
+                search: &q.inspector_search,
+                json_pretty: q.inspector_json_pretty,
+                clear_help: "Back to query summary",
+            })
+        })
+    } else {
+        None
+    };
 
     let mut header = row()
         .key("inspector-header")
@@ -34,12 +68,12 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
         .child(text("Details").font(k.ty.ui_medium).color(c.text_base));
 
-    if let Some((tab, _, row_idx, _)) = selected_row_info {
+    if let Some(ref sel) = selected_row_info {
         header = header
             .child(spacer())
             .child(pill_badge(
                 "inspector/row-badge",
-                format!("Row #{}", tab.offset + row_idx as i64 + 1),
+                format!("Row #{}", sel.row_number),
                 c.layer_02,
                 c.text_accent,
                 c.border_base,
@@ -50,13 +84,17 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                     .variant(IconButtonVariant::GhostMuted)
                     .control_size(ControlSize::Mini)
                     .label("Clear row selection")
-                    .help("Back to table details")
+                    .help(sel.clear_help)
                     .on_press(|s: &mut AppState| s.clear_active_tab_row_selection())
                     .build(k),
             );
     }
 
-    let search_bar = active_table.map(|tab| {
+    let search_edit = active_table
+        .map(|t| &t.inspector_search)
+        .or_else(|| active_query.map(|q| &q.inspector_search));
+
+    let search_bar = search_edit.map(|edit| {
         row()
             .key("inspector-search-row")
             .w_full()
@@ -64,7 +102,7 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
             .py(8.0)
             .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
             .child(
-                TextInput::new(&tab.inspector_search)
+                TextInput::new(edit)
                     .label("Search inspector fields")
                     .placeholder("Search for field…")
                     .leading_icon(k.glyph.search)
@@ -75,10 +113,12 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
             )
     });
 
-    let body = if let Some((tab, page, _row_idx, row_cells)) = selected_row_info {
-        build_row_fields_body(tab, page, row_cells, k)
+    let body = if let Some(sel) = selected_row_info {
+        build_row_fields_body(&sel, k)
     } else if let Some(tab) = active_table {
         build_table_stats_body(session, tab, k)
+    } else if let Some(q) = active_query {
+        build_query_overview_body(q, k)
     } else {
         col()
             .key("inspector-empty")
@@ -104,13 +144,13 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
     root.child(body)
 }
 
-fn build_row_fields_body(tab: &TableTabState, page: &TablePage, cells: &[CellValue], k: &Kit) -> El {
+fn build_row_fields_body(sel: &SelectedRowView<'_>, k: &Kit) -> El {
     let c = &k.c;
-    let query = tab.inspector_search.text.trim().to_ascii_lowercase();
+    let query = sel.search.text.trim().to_ascii_lowercase();
     let mut fields_col = col().key("inspector-row-fields").w_full().padding(12.0).gap(12.0);
     let mut shown = 0usize;
 
-    for (idx, (col_meta, val)) in page.columns.iter().zip(cells.iter()).enumerate() {
+    for (idx, (col_meta, val)) in sel.columns.iter().zip(sel.cells.iter()).enumerate() {
         if !query.is_empty()
             && !col_meta.name.to_ascii_lowercase().contains(&query)
             && !col_meta.udt_name.to_ascii_lowercase().contains(&query)
@@ -118,7 +158,7 @@ fn build_row_fields_body(tab: &TableTabState, page: &TablePage, cells: &[CellVal
             continue;
         }
         shown += 1;
-        fields_col = fields_col.child(build_typed_field(idx, col_meta, val, tab.inspector_json_pretty, k));
+        fields_col = fields_col.child(build_typed_field(idx, col_meta, val, sel.json_pretty, k));
     }
 
     if shown == 0 {
@@ -189,11 +229,7 @@ fn build_typed_field(
             Button::new(if json_pretty { "Raw" } else { "Pretty" })
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Mini)
-                .on_press(|s: &mut AppState| {
-                    if let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
-                        t.inspector_json_pretty = !t.inspector_json_pretty;
-                    }
-                })
+                .on_press(|s: &mut AppState| s.toggle_active_inspector_json_pretty())
                 .build(k),
         );
     }
@@ -377,6 +413,60 @@ fn build_table_stats_body(session: &SessionState, tab: &TableTabState, k: &Kit) 
                 .wrap(),
         );
     }
+
+    k.scroll_bar(
+        col()
+            .key("inspector-scroll")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec { stick_bottom: false })
+            .child(details),
+    )
+    .w_full()
+    .grow(1.0)
+    .min_h(0.0)
+}
+
+fn build_query_overview_body(tab: &QueryTabState, k: &Kit) -> El {
+    let c = &k.c;
+    let filter = tab.inspector_search.text.trim().to_ascii_lowercase();
+    let (line, col_num) = tab.cursor_line_col();
+    let status = if tab.running {
+        if tab.cancelling { "Cancelling" } else { "Running" }
+    } else if tab.batch_cancelled {
+        "Cancelled"
+    } else if tab.saved_query_id.is_some() {
+        if tab.is_dirty() { "Saved (modified)" } else { "Saved" }
+    } else {
+        "Scratchpad"
+    };
+    let last_duration = tab.total_duration_ms.map(|ms| format!("{ms} ms"));
+    let result_count = (!tab.results.is_empty()).then(|| format!("{} statement(s)", tab.results.len()));
+
+    let entries = [
+        ("query", Some(tab.title.clone())),
+        ("status", Some(status.to_owned())),
+        ("cursor", Some(format!("Ln {line}, Col {col_num}"))),
+        ("row_limit", Some(tab.row_limit_label().to_owned())),
+        ("results", result_count),
+        ("last_duration", last_duration),
+    ];
+
+    let mut details = col().key("inspector-query-overview").w_full().padding(12.0).gap(10.0);
+    for (key, val) in entries {
+        if !filter.is_empty() && !key.contains(&filter) {
+            continue;
+        }
+        details = details.child(inspector_meta_kv(key, val.as_deref(), k));
+    }
+    details = details.child(Divider::horizontal().build(k)).child(
+        text("Select any row in a tabular result below to inspect typed columns, JSONB payloads, and UTC/Local timestamps.")
+            .font(k.ty.small)
+            .color(c.text_faint)
+            .w_full()
+            .wrap(),
+    );
 
     k.scroll_bar(
         col()
