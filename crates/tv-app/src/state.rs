@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::Local;
-use rune::{ColorScheme, PointerPress, TextEdit, Tx};
+use rune::{ColorScheme, FileDialogOptions, PointerPress, TextEdit, Tx};
+use rune_kit::diff::{DiffMode, DiffState, FileDiff};
 use rune_kit::shell::TabDragState;
 use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
     AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, ConnectionStore,
-    DatabaseInfo, DbObject, DbObjectKind, EnvTag, ExecutedSql, PageRequest, PasswordMode, QueryBatchResult,
-    QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo,
-    SessionId, SortOrder, SortSpec, SslMode, StoreData, TabId, TablePage, TableStructure,
+    DatabaseInfo, DbObject, DbObjectKind, DraftRowId, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow,
+    ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult, QueryHistoryEntry, QueryStatementResult, RequestId,
+    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo, SessionId, SortOrder, SortSpec, SslMode,
+    StagedCellValue, StagedChanges, StatementInspection, StoreData, TabId, TablePage, TableStructure,
+    build_fk_where_clause, default_export_filename, evaluate_sql_safety, evaluate_staged_commit_safety, export_rows,
 };
 use tv_core::sql::{cursor_line_col, format_sql, split_statements, statement_at_cursor};
 
@@ -318,6 +321,44 @@ pub struct SaveQueryModalState {
     pub error: Option<String>,
 }
 
+/// Action held until the user confirms a safety guardrail dialog.
+#[derive(Clone, Debug)]
+pub enum PendingProtectedAction {
+    ExecuteSql {
+        statements: Vec<String>,
+        executed_sql_text: String,
+        row_limit: Option<usize>,
+    },
+    ExplainAnalyze {
+        statement: String,
+    },
+}
+
+/// Modal state for confirming mutating or destructive SQL on protected connections.
+#[derive(Clone, Debug)]
+pub struct SafetyConfirmModalState {
+    pub session_id: SessionId,
+    pub tab_id: TabId,
+    pub policy: SafetyPolicy,
+    pub env: EnvTag,
+    pub reason: String,
+    pub statements: Vec<StatementInspection>,
+    pub is_destructive: bool,
+    pub destructive_ack: bool,
+    pub pending: PendingProtectedAction,
+}
+
+/// Modal state for previewing and exporting tabular rows as CSV, JSON, or SQL INSERT.
+#[derive(Clone, Debug)]
+pub struct ExportModalState {
+    pub source_label: String,
+    pub schema: Option<String>,
+    pub table_name: TextEdit,
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<CellValue>>,
+    pub format: ExportFormat,
+}
+
 /// Active modal dialog overlay. At most one modal is open at a time.
 #[derive(Clone, Debug, Default)]
 pub enum OverlayState {
@@ -328,6 +369,8 @@ pub enum OverlayState {
     Picker(PickerState),
     PasswordPrompt(PasswordPromptState),
     SaveQuery(Box<SaveQueryModalState>),
+    SafetyConfirm(Box<SafetyConfirmModalState>),
+    Export(Box<ExportModalState>),
     DeleteConfirm(ConnectionId),
 }
 
@@ -378,6 +421,36 @@ impl TableViewMode {
     }
 }
 
+/// Distinguishes loaded page rows (`0..page.rows.len()`) from staged draft inserts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    Existing(usize),
+    Draft(DraftRowId),
+}
+
+/// Inline editor session for one cell in a table tab.
+#[derive(Clone, Debug)]
+pub struct ActiveCellEdit {
+    pub row_key: RowKey,
+    pub col_idx: usize,
+    pub edit: TextEdit,
+    pub set_null: bool,
+    pub set_default: bool,
+}
+
+/// Live or loading state for a foreign-key peek popover anchored next to a cell.
+#[derive(Clone, Debug)]
+pub struct FkPeekState {
+    pub anchor_key: String,
+    pub fk: ForeignKeyRef,
+    pub value: CellValue,
+    pub source_col: ColumnMeta,
+    pub req_id: Option<RequestId>,
+    pub loading: bool,
+    pub result: Option<FkPeekRow>,
+    pub error: Option<String>,
+}
+
 /// Interactive state for one open table or view tab (`Data | Structure | Indexes` + inspector state).
 pub struct TableTabState {
     pub schema: String,
@@ -403,10 +476,23 @@ pub struct TableTabState {
     pub structure_table: TableState,
     pub indexes_table: TableState,
     pub selected_row: Option<usize>,
+    pub selected_row_key: Option<RowKey>,
+    pub selected_cell: Option<(RowKey, usize)>,
+    pub editing_cell: Option<ActiveCellEdit>,
+    pub row_menu: Option<(RowKey, PointerPress)>,
+    pub staged: StagedChanges,
+    pub diff_drawer_open: bool,
+    pub diff_state: DiffState,
+    pub committing: bool,
+    pub commit_req_id: Option<RequestId>,
+    pub commit_error: Option<String>,
+    pub fk_peek: Option<FkPeekState>,
+    pub auto_select_first_row: bool,
     pub inspector_search: TextEdit,
     pub inspector_json_pretty: bool,
     pub header_menu: Option<(String, PointerPress)>,
     pub ddl_expanded: bool,
+    pub tab_id: TabId,
 }
 
 impl TableTabState {
@@ -443,10 +529,23 @@ impl TableTabState {
             structure_table: TableState::new().key(format!("tv-struct-{tid}")),
             indexes_table: TableState::new().key(format!("tv-idx-{tid}")),
             selected_row: None,
+            selected_row_key: None,
+            selected_cell: None,
+            editing_cell: None,
+            row_menu: None,
+            staged: StagedChanges::new(),
+            diff_drawer_open: false,
+            diff_state: DiffState::default(),
+            committing: false,
+            commit_req_id: None,
+            commit_error: None,
+            fk_peek: None,
+            auto_select_first_row: false,
             inspector_search: TextEdit::new(""),
             inspector_json_pretty: true,
             header_menu: None,
             ddl_expanded: true,
+            tab_id,
         }
     }
 
@@ -459,6 +558,126 @@ impl TableTabState {
             limit: self.page_size,
             offset: self.offset,
         }
+    }
+
+    pub fn active_row_key(&self) -> Option<RowKey> {
+        self.selected_row_key.or_else(|| self.selected_row.map(RowKey::Existing))
+    }
+
+    pub fn columns(&self) -> Option<&[ColumnMeta]> {
+        self.page
+            .as_ref()
+            .map(|p| p.columns.as_slice())
+            .or_else(|| self.structure.as_ref().map(|s| s.columns.as_slice()))
+    }
+
+    pub fn can_edit_table(&self, policy: SafetyPolicy) -> Result<(), &'static str> {
+        if policy == SafetyPolicy::ReadOnly {
+            return Err("Connection is Read-Only; editing is disabled");
+        }
+        if self.object_kind != DbObjectKind::Table {
+            return Err("Only base tables support inline row editing");
+        }
+        Ok(())
+    }
+
+    pub fn has_primary_key(&self) -> bool {
+        self.columns()
+            .is_some_and(|cols| cols.iter().any(|c| c.is_primary_key))
+    }
+
+    pub fn visual_row_count(&self) -> usize {
+        self.staged.inserts.len() + self.page.as_ref().map_or(0, |p| p.rows.len())
+    }
+
+    pub fn visual_row_key(&self, visual_idx: usize) -> Option<RowKey> {
+        if let Some(draft) = self.staged.inserts.get(visual_idx) {
+            return Some(RowKey::Draft(draft.id));
+        }
+        let page_idx = visual_idx.checked_sub(self.staged.inserts.len())?;
+        let page_len = self.page.as_ref().map_or(0, |p| p.rows.len());
+        (page_idx < page_len).then_some(RowKey::Existing(page_idx))
+    }
+
+    pub fn row_id_string(&self, visual_idx: usize) -> String {
+        match self.visual_row_key(visual_idx) {
+            Some(RowKey::Draft(id)) => id.to_string(),
+            Some(RowKey::Existing(i)) => format!("r-{i}"),
+            None => format!("r-missing-{visual_idx}"),
+        }
+    }
+
+    pub fn row_key_to_visual_idx(&self, row_key: RowKey) -> Option<usize> {
+        match row_key {
+            RowKey::Draft(id) => self.staged.inserts.iter().position(|d| d.id == id),
+            RowKey::Existing(idx) => {
+                let page_len = self.page.as_ref().map_or(0, |p| p.rows.len());
+                (idx < page_len).then_some(self.staged.inserts.len() + idx)
+            }
+        }
+    }
+
+    /// Returns the effective cell preview (applying pending staged values) for display & inspector.
+    pub fn effective_cell(&self, row_key: RowKey, col_idx: usize) -> CellValue {
+        let Some(cols) = self.columns() else {
+            return CellValue::Null;
+        };
+        let Some(col) = cols.get(col_idx) else {
+            return CellValue::Null;
+        };
+        match row_key {
+            RowKey::Draft(id) => self
+                .staged
+                .insert_row(id)
+                .and_then(|d| d.values.get(col_idx))
+                .map_or(CellValue::Null, |v| v.to_preview_cell(col)),
+            RowKey::Existing(idx) => {
+                if let Some(staged_val) = self.staged.effective_existing_cell(idx, col_idx) {
+                    staged_val.to_preview_cell(col)
+                } else {
+                    self.page
+                        .as_ref()
+                        .and_then(|p| p.rows.get(idx))
+                        .and_then(|r| r.get(col_idx))
+                        .cloned()
+                        .unwrap_or(CellValue::Null)
+                }
+            }
+        }
+    }
+
+    /// Recomputes `diff_state` from pending `staged` row changes and transactional SQL.
+    pub fn rebuild_diff_state(&mut self) {
+        if self.staged.is_empty() {
+            self.diff_state.set_files(Vec::new());
+            return;
+        }
+        let Some(cols) = self.columns() else {
+            self.diff_state.set_files(Vec::new());
+            return;
+        };
+        let (before, after) = self.staged.build_diff_texts(&self.schema, &self.object_name, cols);
+        let row_file = FileDiff::from_texts(format!("{}.{}.rows", self.schema, self.object_name), &before, &after);
+        let mut files = vec![row_file];
+        match self.staged.build_transaction_sql(&self.schema, &self.object_name, cols) {
+            Ok(sql) => {
+                files.push(FileDiff::between(
+                    None,
+                    Some(format!("{}.{}.sql", self.schema, self.object_name)),
+                    "",
+                    &sql,
+                ));
+            }
+            Err(err) => {
+                files.push(FileDiff::between(
+                    None,
+                    Some(format!("{}.{}.warning.txt", self.schema, self.object_name)),
+                    "",
+                    &err.to_string(),
+                ));
+            }
+        }
+        self.diff_state.set_files(files);
     }
 }
 
@@ -497,6 +716,12 @@ pub struct QueryTabState {
     pub batch_error: Option<String>,
     pub batch_cancelled: bool,
     pub total_duration_ms: Option<u64>,
+    pub explain_plan: Option<ExplainPlan>,
+    pub explain_loading: bool,
+    pub explain_req_id: Option<RequestId>,
+    pub explain_error: Option<String>,
+    pub show_explain: bool,
+    pub explain_raw_json: bool,
     pub inspector_search: TextEdit,
     pub inspector_json_pretty: bool,
 }
@@ -527,6 +752,12 @@ impl QueryTabState {
             batch_error: None,
             batch_cancelled: false,
             total_duration_ms: None,
+            explain_plan: None,
+            explain_loading: false,
+            explain_req_id: None,
+            explain_error: None,
+            show_explain: false,
+            explain_raw_json: false,
             inspector_search: TextEdit::new(""),
             inspector_json_pretty: true,
         }
@@ -641,15 +872,24 @@ impl WorkspaceTab {
 
     pub fn is_loading(&self) -> bool {
         match &self.content {
-            TabContent::Table(t) => t.page_loading || t.structure_loading,
-            TabContent::Query(q) => q.running,
+            TabContent::Table(t) => t.page_loading || t.structure_loading || t.committing,
+            TabContent::Query(q) => q.running || q.explain_loading,
         }
     }
 
     pub fn has_error(&self) -> bool {
         match &self.content {
-            TabContent::Table(t) => t.page_error.is_some() || t.filter_error.is_some() || t.structure_error.is_some(),
-            TabContent::Query(q) => q.batch_error.is_some() || q.results.iter().any(|r| r.statement.error.is_some()),
+            TabContent::Table(t) => {
+                t.page_error.is_some()
+                    || t.filter_error.is_some()
+                    || t.structure_error.is_some()
+                    || t.commit_error.is_some()
+            }
+            TabContent::Query(q) => {
+                q.batch_error.is_some()
+                    || q.explain_error.is_some()
+                    || q.results.iter().any(|r| r.statement.error.is_some())
+            }
         }
     }
 
@@ -818,6 +1058,7 @@ pub struct AppState {
     pub fallback_edit: TextEdit,
     pub fallback_table: TableState,
     pub fallback_tab_drag: TabDragState,
+    pub fallback_diff: DiffState,
 }
 
 impl AppState {
@@ -870,6 +1111,7 @@ impl AppState {
             fallback_edit: TextEdit::new(""),
             fallback_table: TableState::new().key("tv-fallback-table"),
             fallback_tab_drag: TabDragState::new(),
+            fallback_diff: DiffState::default(),
         }
     }
 
@@ -1051,6 +1293,46 @@ impl AppState {
             OverlayState::PasswordPrompt(p) => &mut p.password,
             _ => &mut self.fallback_edit,
         }
+    }
+
+    pub fn export_table_name_mut(&mut self) -> &mut TextEdit {
+        match &mut self.overlay {
+            OverlayState::Export(e) => &mut e.table_name,
+            _ => &mut self.fallback_edit,
+        }
+    }
+
+    pub fn inline_cell_edit_mut(&mut self) -> &mut TextEdit {
+        if let Screen::Workspace(sid) = self.screen
+            && self
+                .sessions
+                .get(&sid)
+                .and_then(SessionState::active_table_tab)
+                .is_some_and(|t| t.editing_cell.is_some())
+            && let Some(tab) = self.sessions.get_mut(&sid).and_then(SessionState::active_table_tab_mut)
+            && let Some(ref mut editing) = tab.editing_cell
+        {
+            editing.set_null = false;
+            editing.set_default = false;
+            return &mut editing.edit;
+        }
+        &mut self.fallback_edit
+    }
+
+    pub fn active_staged_diff(&self) -> &DiffState {
+        self.active_session()
+            .and_then(SessionState::active_table_tab)
+            .map_or(&self.fallback_diff, |t| &t.diff_state)
+    }
+
+    pub fn active_staged_diff_mut(&mut self) -> &mut DiffState {
+        if let Screen::Workspace(sid) = self.screen
+            && self.sessions.get(&sid).and_then(SessionState::active_table_tab).is_some()
+            && let Some(tab) = self.sessions.get_mut(&sid).and_then(SessionState::active_table_tab_mut)
+        {
+            return &mut tab.diff_state;
+        }
+        &mut self.fallback_diff
     }
 
     pub fn sidebar_pane_mut(&mut self, id: SessionId) -> &mut PaneState {
@@ -1789,106 +2071,187 @@ impl AppState {
     }
 
     pub fn apply_active_tab_filter(&mut self) {
-        {
+        let blocked = {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            let trimmed = tab.filter_input.text.trim();
-            tab.applied_filter = (!trimmed.is_empty()).then(|| trimmed.to_owned());
-            tab.filter_error = None;
-            tab.offset = 0;
-            tab.selected_row = None;
-            tab.data_table.clear_selection();
+            if tab.staged.has_changes() {
+                tab.diff_drawer_open = true;
+                true
+            } else {
+                let trimmed = tab.filter_input.text.trim();
+                tab.applied_filter = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+                tab.filter_error = None;
+                tab.offset = 0;
+                tab.selected_row = None;
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.editing_cell = None;
+                tab.data_table.clear_selection();
+                false
+            }
+        };
+        if blocked {
+            self.set_notice("Commit or discard staged changes before filtering rows", true);
+            return;
         }
         self.dispatch_active_tab_page();
     }
 
     pub fn clear_active_tab_filter(&mut self) {
-        {
+        let blocked = {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            tab.filter_input = TextEdit::new("");
-            tab.applied_filter = None;
-            tab.filter_error = None;
-            tab.offset = 0;
-            tab.selected_row = None;
-            tab.data_table.clear_selection();
+            if tab.staged.has_changes() {
+                tab.diff_drawer_open = true;
+                true
+            } else {
+                tab.filter_input = TextEdit::new("");
+                tab.applied_filter = None;
+                tab.filter_error = None;
+                tab.offset = 0;
+                tab.selected_row = None;
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.editing_cell = None;
+                tab.data_table.clear_selection();
+                false
+            }
+        };
+        if blocked {
+            self.set_notice("Commit or discard staged changes before clearing filter", true);
+            return;
         }
         self.dispatch_active_tab_page();
     }
 
     pub fn sort_active_tab(&mut self, column: String, ascending: bool) {
-        {
+        let blocked = {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            let dir = if ascending {
-                SortDir::Ascending
+            if tab.staged.has_changes() {
+                tab.diff_drawer_open = true;
+                true
             } else {
-                SortDir::Descending
-            };
-            tab.data_table.set_sort(column.clone(), dir);
-            tab.sort = Some(SortSpec { column, ascending });
-            tab.offset = 0;
-            tab.selected_row = None;
-            tab.data_table.clear_selection();
+                let dir = if ascending {
+                    SortDir::Ascending
+                } else {
+                    SortDir::Descending
+                };
+                tab.data_table.set_sort(column.clone(), dir);
+                tab.sort = Some(SortSpec { column, ascending });
+                tab.offset = 0;
+                tab.selected_row = None;
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.editing_cell = None;
+                tab.data_table.clear_selection();
+                false
+            }
+        };
+        if blocked {
+            self.set_notice("Commit or discard staged changes before sorting rows", true);
+            return;
         }
         self.dispatch_active_tab_page();
     }
 
     pub fn clear_active_tab_sort(&mut self) {
-        {
+        let blocked = {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            tab.sort = None;
-            tab.data_table.clear_sort();
-            tab.offset = 0;
-            tab.selected_row = None;
-            tab.data_table.clear_selection();
+            if tab.staged.has_changes() {
+                tab.diff_drawer_open = true;
+                true
+            } else {
+                tab.sort = None;
+                tab.data_table.clear_sort();
+                tab.offset = 0;
+                tab.selected_row = None;
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.editing_cell = None;
+                tab.data_table.clear_selection();
+                false
+            }
+        };
+        if blocked {
+            self.set_notice("Commit or discard staged changes before clearing sort", true);
+            return;
         }
         self.dispatch_active_tab_page();
     }
 
     pub fn set_active_tab_page_size(&mut self, page_size: i64) {
-        {
+        let blocked = {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            tab.page_size = page_size.clamp(10, 5000);
-            tab.page_size_open = false;
-            tab.offset = 0;
-            tab.selected_row = None;
-            tab.data_table.clear_selection();
+            if tab.staged.has_changes() {
+                tab.page_size_open = false;
+                tab.diff_drawer_open = true;
+                true
+            } else {
+                tab.page_size = page_size.clamp(10, 5000);
+                tab.page_size_open = false;
+                tab.offset = 0;
+                tab.selected_row = None;
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.editing_cell = None;
+                tab.data_table.clear_selection();
+                false
+            }
+        };
+        if blocked {
+            self.set_notice("Commit or discard staged changes before changing page size", true);
+            return;
         }
         self.dispatch_active_tab_page();
     }
 
     pub fn paginate_active_tab(&mut self, next: bool) {
+        let mut blocked = false;
         let changed = {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if next {
+            if tab.staged.has_changes() {
+                tab.diff_drawer_open = true;
+                blocked = true;
+                false
+            } else if next {
                 let has_more = tab.page.as_ref().is_some_and(|p| p.has_more);
                 if !has_more {
                     false
                 } else {
                     tab.offset += tab.page_size;
                     tab.selected_row = None;
+                    tab.selected_row_key = None;
+                    tab.selected_cell = None;
+                    tab.editing_cell = None;
                     tab.data_table.clear_selection();
                     true
                 }
             } else if tab.offset > 0 {
                 tab.offset = (tab.offset - tab.page_size).max(0);
                 tab.selected_row = None;
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.editing_cell = None;
                 tab.data_table.clear_selection();
                 true
             } else {
                 false
             }
         };
+        if blocked {
+            self.set_notice("Commit or discard staged changes before changing page", true);
+            return;
+        }
         if changed {
             self.dispatch_active_tab_page();
         }
@@ -1928,16 +2291,32 @@ impl AppState {
     }
 
     pub fn select_active_tab_row(&mut self, row_id: &str) {
-        let Some(idx) = row_id.strip_prefix("r-").and_then(|s| s.parse::<usize>().ok()) else {
-            return;
-        };
         let Some(tab) = self.active_session_mut().and_then(SessionState::active_tab_mut) else {
             return;
         };
         match &mut tab.content {
-            TabContent::Table(t) => t.selected_row = Some(idx),
+            TabContent::Table(t) => {
+                if let Some(idx) = row_id.strip_prefix("r-").and_then(|s| s.parse::<usize>().ok()) {
+                    t.selected_row = Some(idx);
+                    t.selected_row_key = Some(RowKey::Existing(idx));
+                    t.row_menu = None;
+                    if t.editing_cell.as_ref().is_some_and(|e| e.row_key != RowKey::Existing(idx)) {
+                        t.editing_cell = None;
+                    }
+                } else if let Some(draft_num) = row_id.strip_prefix("new-").and_then(|s| s.parse::<u64>().ok()) {
+                    let key = RowKey::Draft(DraftRowId(draft_num));
+                    t.selected_row = None;
+                    t.selected_row_key = Some(key);
+                    t.row_menu = None;
+                    if t.editing_cell.as_ref().is_some_and(|e| e.row_key != key) {
+                        t.editing_cell = None;
+                    }
+                }
+            }
             TabContent::Query(q) => {
-                if let Some(res) = q.active_result_state_mut() {
+                if let Some(idx) = row_id.strip_prefix("r-").and_then(|s| s.parse::<usize>().ok())
+                    && let Some(res) = q.active_result_state_mut()
+                {
                     res.selected_row = Some(idx);
                 }
             }
@@ -1951,6 +2330,9 @@ impl AppState {
         match &mut tab.content {
             TabContent::Table(t) => {
                 t.selected_row = None;
+                t.selected_row_key = None;
+                t.selected_cell = None;
+                t.editing_cell = None;
                 t.data_table.clear_selection();
             }
             TabContent::Query(q) => {
@@ -2012,6 +2394,13 @@ impl AppState {
             && index < tab.results.len()
         {
             tab.active_result = index;
+            tab.show_explain = false;
+        }
+    }
+
+    pub fn show_active_query_explain_tab(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+            tab.show_explain = true;
         }
     }
 
@@ -2031,21 +2420,636 @@ impl AppState {
         }
     }
 
-    pub fn run_active_query(&mut self, all: bool) -> bool {
-        let Screen::Workspace(session_id) = self.screen else {
+    pub fn handle_primary_save(&mut self, tx: &mut Tx) -> bool {
+        let is_table = self
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some();
+        if is_table {
+            if let Some(tab) = self.active_session().and_then(SessionState::active_table_tab)
+                && tab.staged.has_changes()
+            {
+                self.open_staged_diff_drawer();
+            } else {
+                self.set_notice("No staged changes to review", false);
+            }
+            return true;
+        }
+        self.open_save_query_modal(tx)
+    }
+
+    pub fn select_table_cell(&mut self, row_key: RowKey, col_idx: usize) {
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+            return;
+        };
+        let row_id = match row_key {
+            RowKey::Draft(id) => {
+                tab.selected_row = None;
+                id.to_string()
+            }
+            RowKey::Existing(idx) => {
+                tab.selected_row = Some(idx);
+                format!("r-{idx}")
+            }
+        };
+        tab.selected_row_key = Some(row_key);
+        tab.selected_cell = Some((row_key, col_idx));
+        tab.row_menu = None;
+        tab.data_table.select(row_id);
+        if tab
+            .editing_cell
+            .as_ref()
+            .is_some_and(|e| e.row_key != row_key || e.col_idx != col_idx)
+        {
+            tab.editing_cell = None;
+        }
+    }
+
+    pub fn begin_cell_edit(&mut self, row_key: RowKey, col_idx: usize, tx: &mut Tx) -> bool {
+        let Screen::Workspace(sid) = self.screen else {
             return false;
+        };
+        let Some(session) = self.sessions.get(&sid) else {
+            return false;
+        };
+        let policy = session.profile.safety;
+        let Some(tab) = session.active_table_tab() else {
+            return false;
+        };
+        if let Err(reason) = tab.can_edit_table(policy) {
+            self.set_notice(reason, true);
+            return false;
+        }
+        if matches!(row_key, RowKey::Existing(_)) && !tab.has_primary_key() {
+            self.set_notice("Table requires a primary key to edit existing rows safely", true);
+            return false;
+        }
+        let current = tab.effective_cell(row_key, col_idx);
+        let initial_text = match &current {
+            CellValue::Null => String::new(),
+            other => other.to_edit_string(),
+        };
+        let is_null = current.is_null();
+        let is_default = matches!(row_key, RowKey::Draft(id) if tab
+            .staged
+            .insert_row(id)
+            .and_then(|d| d.values.get(col_idx))
+            .is_some_and(|v| matches!(v, StagedCellValue::DefaultExpr)));
+
+        self.select_table_cell(row_key, col_idx);
+        if let Some(tab_mut) = self.sessions.get_mut(&sid).and_then(SessionState::active_table_tab_mut) {
+            if let RowKey::Existing(idx) = row_key
+                && tab_mut.staged.is_row_deleted(idx)
+            {
+                self.set_notice("Undo deletion on this row before editing cells", true);
+                return false;
+            }
+            let len = initial_text.len();
+            let mut edit = TextEdit::new(&initial_text);
+            edit.set_selection(0, len);
+            tab_mut.editing_cell = Some(ActiveCellEdit {
+                row_key,
+                col_idx,
+                edit,
+                set_null: is_null,
+                set_default: is_default,
+            });
+            tab_mut.fk_peek = None;
+            tab_mut.row_menu = None;
+        }
+        tx.focus_when_shown("inline-cell-editor", true);
+        true
+    }
+
+    pub fn cancel_inline_cell_edit(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.editing_cell = None;
+        }
+    }
+
+    pub fn commit_inline_cell_edit(&mut self) {
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+            return;
+        };
+        let Some(editing) = tab.editing_cell.take() else {
+            return;
+        };
+        let new_val = if editing.set_null {
+            StagedCellValue::Null
+        } else if editing.set_default {
+            StagedCellValue::DefaultExpr
+        } else {
+            StagedCellValue::Literal(editing.edit.text.clone())
+        };
+        match editing.row_key {
+            RowKey::Draft(id) => {
+                tab.staged.stage_insert_cell_edit(id, editing.col_idx, new_val);
+            }
+            RowKey::Existing(idx) => {
+                if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned() {
+                    tab.staged.stage_cell_edit(idx, &orig_row, editing.col_idx, new_val);
+                }
+            }
+        }
+        tab.commit_error = None;
+        tab.rebuild_diff_state();
+    }
+
+    pub fn stage_cell_null(&mut self, row_key: RowKey, col_idx: usize) {
+        let Some(policy) = self.active_session().map(|s| s.profile.safety) else {
+            return;
+        };
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+            return;
+        };
+        if let Err(reason) = tab.can_edit_table(policy) {
+            self.set_notice(reason, true);
+            return;
+        }
+        if matches!(row_key, RowKey::Existing(_)) && !tab.has_primary_key() {
+            self.set_notice("Table requires a primary key to edit existing rows safely", true);
+            return;
+        }
+        if tab
+            .columns()
+            .and_then(|c| c.get(col_idx))
+            .is_some_and(|c| !c.nullable)
+        {
+            self.set_notice("Column is NOT NULL", true);
+            return;
+        }
+        tab.editing_cell = None;
+        match row_key {
+            RowKey::Draft(id) => tab.staged.stage_insert_cell_edit(id, col_idx, StagedCellValue::Null),
+            RowKey::Existing(idx) => {
+                if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned() {
+                    tab.staged.stage_cell_edit(idx, &orig_row, col_idx, StagedCellValue::Null);
+                }
+            }
+        }
+        tab.commit_error = None;
+        tab.rebuild_diff_state();
+    }
+
+    pub fn insert_staged_row(&mut self, tx: &mut Tx) -> bool {
+        let Some(policy) = self.active_session().map(|s| s.profile.safety) else {
+            return false;
+        };
+        let first_editable = {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return false;
+            };
+            if let Err(reason) = tab.can_edit_table(policy) {
+                self.set_notice(reason, true);
+                return false;
+            }
+            let Some(cols) = tab.columns().map(|c| c.to_vec()) else {
+                self.set_notice("Load table columns before inserting a row", true);
+                return false;
+            };
+            let draft_id = tab.staged.stage_insert_row(&cols);
+            let col_idx = cols
+                .iter()
+                .position(|c| c.default_expr.is_none() && !c.is_primary_key)
+                .unwrap_or(0);
+            tab.commit_error = None;
+            tab.fk_peek = None;
+            tab.row_menu = None;
+            tab.rebuild_diff_state();
+            (RowKey::Draft(draft_id), col_idx)
+        };
+        self.begin_cell_edit(first_editable.0, first_editable.1, tx)
+    }
+
+    pub fn toggle_delete_row(&mut self, row_key: RowKey) {
+        let Some(policy) = self.active_session().map(|s| s.profile.safety) else {
+            return;
+        };
+        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+            return;
+        };
+        if let Err(reason) = tab.can_edit_table(policy) {
+            self.set_notice(reason, true);
+            return;
+        }
+        tab.editing_cell = None;
+        tab.row_menu = None;
+        match row_key {
+            RowKey::Draft(id) => {
+                tab.staged.remove_insert_row(id);
+                if tab.selected_row_key == Some(row_key) {
+                    tab.selected_row_key = None;
+                    tab.selected_cell = None;
+                    tab.data_table.clear_selection();
+                }
+            }
+            RowKey::Existing(idx) => {
+                if !tab.has_primary_key() {
+                    self.set_notice("Table requires a primary key to delete existing rows safely", true);
+                    return;
+                }
+                if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned() {
+                    tab.staged.toggle_delete_row(idx, &orig_row);
+                }
+            }
+        }
+        tab.commit_error = None;
+        tab.rebuild_diff_state();
+    }
+
+    pub fn toggle_delete_selected_row(&mut self) {
+        let row_key = self
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .and_then(TableTabState::active_row_key);
+        if let Some(rk) = row_key {
+            self.toggle_delete_row(rk);
+        }
+    }
+
+    pub fn open_staged_diff_drawer(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.commit_error = None;
+            tab.rebuild_diff_state();
+            tab.diff_drawer_open = true;
+        }
+    }
+
+    pub fn close_staged_diff_drawer(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.diff_drawer_open = false;
+        }
+    }
+
+    pub fn set_staged_diff_mode(&mut self, mode: DiffMode) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.diff_state.set_mode(mode);
+        }
+    }
+
+    pub fn discard_staged_changes(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.staged.clear();
+            tab.editing_cell = None;
+            tab.commit_error = None;
+            tab.diff_drawer_open = false;
+            if matches!(tab.selected_row_key, Some(RowKey::Draft(_))) {
+                tab.selected_row_key = None;
+                tab.selected_cell = None;
+                tab.data_table.clear_selection();
+            }
+            tab.rebuild_diff_state();
+        }
+        self.set_notice("Discarded staged changes", false);
+    }
+
+    pub fn commit_staged_changes(&mut self) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
         };
         let req_id = self.alloc_req_id();
         let dispatch = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let policy = session.profile.safety;
+            let Some(tab_id) = session.active_tab else {
+                return;
+            };
+            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+                return;
+            };
+            if tab.committing {
+                return;
+            }
+            if let Err(msg) = evaluate_staged_commit_safety(policy) {
+                tab.commit_error = Some(msg);
+                return;
+            }
+            let Some(cols) = tab.columns().map(|c| c.to_vec()) else {
+                tab.commit_error = Some("Missing table columns metadata".to_owned());
+                return;
+            };
+            let stmts = match tab.staged.build_statements(&tab.schema, &tab.object_name, &cols) {
+                Ok(s) => s,
+                Err(err) => {
+                    tab.commit_error = Some(err.to_string());
+                    return;
+                }
+            };
+            tab.committing = true;
+            tab.commit_req_id = Some(req_id);
+            tab.commit_error = None;
+            Some((tab_id, stmts))
+        };
+
+        let Some((tab_id, statements)) = dispatch else {
+            return;
+        };
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::CommitStagedChanges {
+                session_id,
+                tab_id,
+                req_id,
+                statements,
+            });
+        } else if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.committing = false;
+            tab.commit_req_id = None;
+            tab.staged.clear();
+            tab.diff_drawer_open = false;
+            tab.rebuild_diff_state();
+            self.set_notice("Committed staged changes", false);
+        }
+    }
+
+    pub fn open_fk_peek(
+        &mut self,
+        anchor_key: String,
+        fk: ForeignKeyRef,
+        value: CellValue,
+        source_col: ColumnMeta,
+    ) {
+        if value.is_null() {
+            return;
+        }
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let has_worker = self.worker.is_some();
+        let req_id = has_worker.then(|| self.alloc_req_id());
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(tab_id) = session.active_tab else {
+            return;
+        };
+        let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+            return;
+        };
+        tab.fk_peek = Some(FkPeekState {
+            anchor_key,
+            fk: fk.clone(),
+            value: value.clone(),
+            source_col: source_col.clone(),
+            req_id,
+            loading: has_worker,
+            result: None,
+            error: (!has_worker).then(|| "Connect to a live PostgreSQL database to load referenced rows.".to_owned()),
+        });
+        if let (Some(worker), Some(rid)) = (&self.worker, req_id) {
+            worker.send(WorkerCmd::FetchFkPeek {
+                session_id,
+                tab_id,
+                req_id: rid,
+                fk,
+                value,
+                source_col,
+            });
+        }
+    }
+
+    pub fn close_fk_peek(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.fk_peek = None;
+        }
+    }
+
+    pub fn jump_to_foreign_key(
+        &mut self,
+        fk: ForeignKeyRef,
+        value: CellValue,
+        source_col: ColumnMeta,
+        tx: &mut Tx,
+    ) {
+        let Some(where_clause) = build_fk_where_clause(&fk.target_column, &value, &source_col) else {
+            self.set_notice("Cannot follow a NULL foreign key", false);
+            return;
+        };
+        self.close_fk_peek();
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let existing_tab_id = self.sessions.get(&session_id).and_then(|sess| {
+            sess.tabs
+                .iter()
+                .find(|t| t.schema_and_name() == Some((fk.target_schema.as_str(), fk.target_table.as_str())))
+                .map(|t| t.id)
+        });
+
+        let has_worker = self.worker.is_some();
+        let page_req = has_worker.then(|| self.alloc_req_id());
+        let struct_req = (has_worker && existing_tab_id.is_none()).then(|| self.alloc_req_id());
+
+        let tab_id = if let Some(tid) = existing_tab_id {
+            tid
+        } else {
+            self.alloc_tab_id()
+        };
+
+        let request = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            if existing_tab_id.is_none() {
+                let kind = session
+                    .status
+                    .as_connected()
+                    .and_then(|c| {
+                        c.objects
+                            .iter()
+                            .find(|o| o.schema == fk.target_schema && o.name == fk.target_table)
+                            .map(|o| o.kind)
+                    })
+                    .unwrap_or(DbObjectKind::Table);
+                session.tabs.push(WorkspaceTab::new_table(
+                    tab_id,
+                    fk.target_schema.clone(),
+                    fk.target_table.clone(),
+                    kind,
+                    page_req,
+                    struct_req,
+                ));
+            }
+            if let ConnectionState::Connected(ref mut data) = session.status {
+                data.selected_object = Some((fk.target_schema.clone(), fk.target_table.clone()));
+            }
+            session.active_tab = Some(tab_id);
+            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+                return;
+            };
+            tab.view_mode = TableViewMode::Data;
+            tab.filter_input = TextEdit::new(&where_clause);
+            tab.applied_filter = Some(where_clause);
+            tab.filter_error = None;
+            tab.sort = None;
+            tab.offset = 0;
+            tab.selected_row = None;
+            tab.selected_row_key = None;
+            tab.selected_cell = None;
+            tab.editing_cell = None;
+            tab.fk_peek = None;
+            tab.data_table.clear_sort();
+            tab.data_table.clear_selection();
+            tab.auto_select_first_row = true;
+            if let Some(rid) = page_req {
+                tab.page_loading = true;
+                tab.latest_page_req = Some(rid);
+            }
+            tab.page_request()
+        };
+
+        self.sync_window_title(tx);
+        if let Some(worker) = &self.worker {
+            if let Some(rid) = page_req {
+                worker.send(WorkerCmd::FetchTablePage {
+                    session_id,
+                    tab_id,
+                    req_id: rid,
+                    request,
+                });
+            }
+            if let Some(rid) = struct_req {
+                worker.send(WorkerCmd::DescribeTable {
+                    session_id,
+                    tab_id,
+                    req_id: rid,
+                    schema: fk.target_schema,
+                    table: fk.target_table,
+                });
+            }
+        }
+    }
+
+    pub fn open_export_modal_for_active_tab(&mut self, tx: &mut Tx) -> bool {
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        let Some(tab) = session.active_tab() else {
+            return false;
+        };
+        let modal = match &tab.content {
+            TabContent::Table(t) => {
+                let Some(page) = &t.page else {
+                    self.set_notice("Load table rows before exporting", false);
+                    return true;
+                };
+                if page.columns.is_empty() {
+                    self.set_notice("No columns available to export", false);
+                    return true;
+                }
+                ExportModalState {
+                    source_label: format!("{}.{}", t.schema, t.object_name),
+                    schema: Some(t.schema.clone()),
+                    table_name: TextEdit::new(&t.object_name),
+                    columns: page.columns.clone(),
+                    rows: page.rows.clone(),
+                    format: ExportFormat::Csv,
+                }
+            }
+            TabContent::Query(q) => {
+                let Some(res) = q.active_result_state() else {
+                    self.set_notice("Run a query with tabular results before exporting", false);
+                    return true;
+                };
+                if !res.statement.is_tabular() {
+                    self.set_notice("Active statement has no tabular result to export", false);
+                    return true;
+                }
+                ExportModalState {
+                    source_label: q.title.clone(),
+                    schema: None,
+                    table_name: TextEdit::new("query_result"),
+                    columns: res.statement.columns.clone(),
+                    rows: res.statement.rows.clone(),
+                    format: ExportFormat::Csv,
+                }
+            }
+        };
+        self.overlay = OverlayState::Export(Box::new(modal));
+        tx.focus_when_shown("export-save-btn", true);
+        true
+    }
+
+    pub fn set_export_format(&mut self, format: ExportFormat) {
+        if let OverlayState::Export(ref mut modal) = self.overlay {
+            modal.format = format;
+        }
+    }
+
+    pub fn copy_export_to_clipboard(&mut self, tx: &mut Tx) {
+        let OverlayState::Export(ref modal) = self.overlay else {
+            return;
+        };
+        let content = export_rows(
+            modal.format,
+            modal.schema.as_deref(),
+            &modal.table_name.text,
+            &modal.columns,
+            &modal.rows,
+        );
+        let row_count = modal.rows.len();
+        let label = modal.format.label();
+        tx.copy(content);
+        self.overlay = OverlayState::None;
+        self.set_notice(format!("Copied {row_count} rows as {label}"), false);
+    }
+
+    pub fn save_export_to_file(&mut self, tx: &mut Tx) {
+        let OverlayState::Export(ref modal) = self.overlay else {
+            return;
+        };
+        let content = export_rows(
+            modal.format,
+            modal.schema.as_deref(),
+            &modal.table_name.text,
+            &modal.columns,
+            &modal.rows,
+        );
+        let filename = default_export_filename(&modal.table_name.text, modal.format);
+        let row_count = modal.rows.len();
+        let options = FileDialogOptions {
+            title: format!("Export as {}", modal.format.label()),
+            file_name: Some(filename),
+            ..Default::default()
+        }
+        .filter(modal.format.filter_name(), &[modal.format.extension()]);
+
+        tx.save_file(options, move |s: &mut Self, result, _| match result {
+            Ok(Some(path)) => match std::fs::write(&path, &content) {
+                Ok(()) => {
+                    s.overlay = OverlayState::None;
+                    s.set_notice(format!("Exported {row_count} rows to {}", path.display()), false);
+                }
+                Err(err) => {
+                    s.set_notice(format!("Failed to write export file: {err}"), true);
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                s.set_notice(format!("Export dialog failed: {err}"), true);
+            }
+        });
+    }
+
+    pub fn run_active_query(&mut self, all: bool) -> bool {
+        let Screen::Workspace(session_id) = self.screen else {
+            return false;
+        };
+        struct ReadyQuery {
+            tab_id: TabId,
+            policy: SafetyPolicy,
+            env: EnvTag,
+            statements: Vec<String>,
+            executed_sql_text: String,
+            row_limit: Option<usize>,
+        }
+        let outcome = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
                 return false;
             };
-            let connection_id = session.profile.id;
-            let connection_name = session.profile.name.clone();
-            let database = session
-                .status
-                .as_connected()
-                .and_then(|c| c.active_database.clone());
+            let policy = session.profile.safety;
+            let env = session.profile.env;
             let is_connected = session.status.as_connected().is_some();
             let Some(tab_id) = session.active_tab else {
                 return false;
@@ -2058,6 +3062,7 @@ impl AppState {
             }
             if !is_connected {
                 tab.batch_error = Some("Database is not connected. Reconnect before running queries.".to_owned());
+                tab.show_explain = false;
                 return true;
             }
 
@@ -2078,52 +3083,256 @@ impl AppState {
                 return true;
             };
 
+            ReadyQuery {
+                tab_id,
+                policy,
+                env,
+                statements,
+                executed_sql_text,
+                row_limit: tab.row_limit,
+            }
+        };
+
+        let ReadyQuery {
+            tab_id,
+            policy,
+            env,
+            statements,
+            executed_sql_text,
+            row_limit,
+        } = outcome;
+
+        match evaluate_sql_safety(policy, env, &statements) {
+            SafetyDecision::Allow => {
+                self.dispatch_query_execution(session_id, tab_id, statements, executed_sql_text, row_limit);
+            }
+            SafetyDecision::Block { reason, .. } => {
+                if let Some(session) = self.sessions.get_mut(&session_id)
+                    && let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
+                {
+                    tab.show_explain = false;
+                    tab.batch_cancelled = false;
+                    tab.batch_error = Some(format!("Blocked by {}: {reason}", policy.label()));
+                    tab.results.clear();
+                }
+                self.set_notice(reason, true);
+            }
+            SafetyDecision::RequireConfirmation {
+                policy,
+                env,
+                reason,
+                statements: inspected,
+                is_destructive,
+            } => {
+                self.overlay = OverlayState::SafetyConfirm(Box::new(SafetyConfirmModalState {
+                    session_id,
+                    tab_id,
+                    policy,
+                    env,
+                    reason,
+                    statements: inspected,
+                    is_destructive,
+                    destructive_ack: false,
+                    pending: PendingProtectedAction::ExecuteSql {
+                        statements,
+                        executed_sql_text,
+                        row_limit,
+                    },
+                }));
+            }
+        }
+        true
+    }
+
+    pub fn run_active_query_explain(&mut self, analyze: bool) -> bool {
+        let Screen::Workspace(session_id) = self.screen else {
+            return false;
+        };
+        let (tab_id, policy, env, statement) = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return false;
+            };
+            let policy = session.profile.safety;
+            let env = session.profile.env;
+            let is_connected = session.status.as_connected().is_some();
+            let Some(tab_id) = session.active_tab else {
+                return false;
+            };
+            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut) else {
+                return false;
+            };
+            if tab.running || tab.explain_loading {
+                return true;
+            }
+            if !is_connected {
+                tab.explain_error = Some("Database is not connected. Reconnect before running EXPLAIN.".to_owned());
+                tab.show_explain = true;
+                return true;
+            }
+            let Some((stmts, _)) = statements_for_current(&tab.editor) else {
+                self.set_notice("Place cursor inside a SQL statement to explain", false);
+                return true;
+            };
+            let first = stmts.into_iter().next().unwrap_or_default();
+            (tab_id, policy, env, first)
+        };
+
+        if analyze {
+            let wrapped = vec![format!("EXPLAIN ANALYZE {statement}")];
+            match evaluate_sql_safety(policy, env, &wrapped) {
+                SafetyDecision::Allow => {}
+                SafetyDecision::Block { reason, .. } => {
+                    if let Some(session) = self.sessions.get_mut(&session_id)
+                        && let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
+                    {
+                        tab.explain_error = Some(format!("Blocked by {}: {reason}", policy.label()));
+                        tab.show_explain = true;
+                    }
+                    self.set_notice(reason, true);
+                    return true;
+                }
+                SafetyDecision::RequireConfirmation {
+                    policy,
+                    env,
+                    reason,
+                    statements: inspected,
+                    is_destructive,
+                } => {
+                    self.overlay = OverlayState::SafetyConfirm(Box::new(SafetyConfirmModalState {
+                        session_id,
+                        tab_id,
+                        policy,
+                        env,
+                        reason,
+                        statements: inspected,
+                        is_destructive,
+                        destructive_ack: false,
+                        pending: PendingProtectedAction::ExplainAnalyze { statement },
+                    }));
+                    return true;
+                }
+            }
+        }
+
+        self.dispatch_explain_execution(session_id, tab_id, statement, analyze);
+        true
+    }
+
+    pub fn confirm_safety_modal(&mut self) {
+        let OverlayState::SafetyConfirm(ref modal) = self.overlay else {
+            return;
+        };
+        if modal.is_destructive && modal.env == EnvTag::Production && !modal.destructive_ack {
+            self.set_notice("Confirm the Production destructive operation checkbox first", true);
+            return;
+        }
+        let OverlayState::SafetyConfirm(modal) = std::mem::take(&mut self.overlay) else {
+            return;
+        };
+        match modal.pending {
+            PendingProtectedAction::ExecuteSql {
+                statements,
+                executed_sql_text,
+                row_limit,
+            } => {
+                self.dispatch_query_execution(
+                    modal.session_id,
+                    modal.tab_id,
+                    statements,
+                    executed_sql_text,
+                    row_limit,
+                );
+            }
+            PendingProtectedAction::ExplainAnalyze { statement } => {
+                self.dispatch_explain_execution(modal.session_id, modal.tab_id, statement, true);
+            }
+        }
+    }
+
+    fn dispatch_query_execution(
+        &mut self,
+        session_id: SessionId,
+        tab_id: TabId,
+        statements: Vec<String>,
+        executed_sql_text: String,
+        row_limit: Option<usize>,
+    ) {
+        let req_id = self.alloc_req_id();
+        let dispatch = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let connection_id = session.profile.id;
+            let connection_name = session.profile.name.clone();
+            let database = session
+                .status
+                .as_connected()
+                .and_then(|c| c.active_database.clone());
+            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut) else {
+                return;
+            };
             tab.running = true;
             tab.cancelling = false;
             tab.active_req_id = Some(req_id);
             tab.elapsed_ms = 0;
             tab.batch_error = None;
             tab.batch_cancelled = false;
+            tab.show_explain = false;
             tab.limit_dropdown_open = false;
-
-            Some((
-                tab_id,
-                connection_id,
-                connection_name,
-                database,
-                statements,
-                executed_sql_text,
-                tab.row_limit,
-            ))
+            (connection_id, connection_name, database)
         };
 
-        match (&self.worker, dispatch) {
-            (
-                Some(worker),
-                Some((tab_id, connection_id, connection_name, database, statements, executed_sql_text, row_limit)),
-            ) => {
-                worker.send(WorkerCmd::ExecuteSql {
-                    session_id,
-                    tab_id,
-                    req_id,
-                    connection_id,
-                    connection_name,
-                    database,
-                    statements,
-                    executed_sql_text,
-                    row_limit,
-                });
-            }
-            (None, Some(_)) => {
-                // In headless/no-worker scenes, avoid getting stuck in a running spinner.
-                if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) {
-                    tab.running = false;
-                    tab.active_req_id = None;
-                }
-            }
-            _ => {}
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::ExecuteSql {
+                session_id,
+                tab_id,
+                req_id,
+                connection_id: dispatch.0,
+                connection_name: dispatch.1,
+                database: dispatch.2,
+                statements,
+                executed_sql_text,
+                row_limit,
+            });
+        } else if let Some(tab) = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|s| s.tab_mut(tab_id))
+            .and_then(WorkspaceTab::as_query_mut)
+        {
+            tab.running = false;
+            tab.active_req_id = None;
         }
-        true
+    }
+
+    fn dispatch_explain_execution(
+        &mut self,
+        session_id: SessionId,
+        tab_id: TabId,
+        statement: String,
+        analyze: bool,
+    ) {
+        let req_id = self.alloc_req_id();
+        if let Some(tab) = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|s| s.tab_mut(tab_id))
+            .and_then(WorkspaceTab::as_query_mut)
+        {
+            tab.explain_loading = self.worker.is_some();
+            tab.explain_req_id = self.worker.as_ref().map(|_| req_id);
+            tab.explain_error = None;
+            tab.show_explain = true;
+        }
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::ExplainSql {
+                session_id,
+                tab_id,
+                req_id,
+                statement,
+                analyze,
+            });
+        }
     }
 
     pub fn cancel_active_query(&mut self) -> bool {
@@ -2661,13 +3870,25 @@ impl AppState {
                 match result {
                     Ok(page) => {
                         let row_count = page.rows.len();
+                        let auto_select = tab.auto_select_first_row;
+                        tab.auto_select_first_row = false;
                         tab.page = Some(page);
                         tab.page_error = None;
                         tab.filter_error = None;
-                        if let Some(sel) = tab.selected_row
+                        tab.editing_cell = None;
+                        tab.staged.clear();
+                        tab.rebuild_diff_state();
+                        if auto_select && row_count > 0 {
+                            tab.selected_row = Some(0);
+                            tab.selected_row_key = Some(RowKey::Existing(0));
+                            tab.selected_cell = Some((RowKey::Existing(0), 0));
+                            tab.data_table.select("r-0".to_owned());
+                        } else if let Some(sel) = tab.selected_row
                             && sel >= row_count
                         {
                             tab.selected_row = None;
+                            tab.selected_row_key = None;
+                            tab.selected_cell = None;
                             tab.data_table.clear_selection();
                         }
                     }
@@ -2771,8 +3992,16 @@ impl AppState {
                             tab.total_duration_ms = Some(total_duration_ms);
                             tab.batch_cancelled = cancelled;
                             tab.batch_error = error_msg;
+                            let detected_explain = (results.len() == 1)
+                                .then(|| ExplainPlan::try_extract_from_result(&results[0].statement))
+                                .flatten();
                             tab.results = results;
                             tab.active_result = 0;
+                            if let Some(plan) = detected_explain {
+                                tab.explain_plan = Some(plan);
+                                tab.explain_error = None;
+                                tab.show_explain = true;
+                            }
                         }
                         Err(err) => {
                             tab.batch_cancelled = matches!(err, tv_core::DbError::Cancelled);
@@ -2887,6 +4116,148 @@ impl AppState {
                         && let Some(pw) = secret
                     {
                         form.password = TextEdit::new(&pw);
+                    }
+                }
+            }
+
+            WorkerEvent::StagedChangesCommitted {
+                session_id,
+                tab_id,
+                req_id,
+                result,
+                logs,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                append_logs(&mut session.console_entries, logs);
+                let mut reload_target: Option<(TabId, PageRequest, RequestId)> = None;
+                let mut disconnected = false;
+
+                if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut)
+                    && tab.commit_req_id == Some(req_id)
+                {
+                    tab.committing = false;
+                    tab.commit_req_id = None;
+                    match result {
+                        Ok(outcome) => {
+                            let changes = tab.staged.change_count();
+                            tab.staged.clear();
+                            tab.diff_drawer_open = false;
+                            tab.commit_error = None;
+                            tab.editing_cell = None;
+                            tab.rebuild_diff_state();
+                            let next_req = self.alloc_req_id();
+                            if let Some(t) = self
+                                .sessions
+                                .get_mut(&session_id)
+                                .and_then(|s| s.tab_mut(tab_id))
+                                .and_then(WorkspaceTab::as_table_mut)
+                            {
+                                t.page_loading = true;
+                                t.latest_page_req = Some(next_req);
+                                reload_target = Some((tab_id, t.page_request(), next_req));
+                            }
+                            self.set_notice(
+                                format!(
+                                    "Committed {changes} change(s) ({} rows affected · {} ms)",
+                                    outcome.total_rows_affected, outcome.elapsed_ms
+                                ),
+                                false,
+                            );
+                        }
+                        Err(err) => {
+                            if matches!(err, tv_core::DbError::Disconnected) {
+                                disconnected = true;
+                            }
+                            let msg = err.to_string();
+                            tab.commit_error = Some(msg.clone());
+                            tab.diff_drawer_open = true;
+                            self.set_notice(msg, true);
+                        }
+                    }
+                }
+
+                if disconnected && let Some(sess) = self.sessions.get_mut(&session_id) {
+                    sess.status = ConnectionState::Disconnected {
+                        reason: Some("Disconnected from database".to_owned()),
+                    };
+                    if self.screen == Screen::Workspace(session_id) {
+                        self.sync_window_title(tx);
+                    }
+                }
+                if let (Some(worker), Some((tid, request, page_rid))) = (&self.worker, reload_target) {
+                    worker.send(WorkerCmd::FetchTablePage {
+                        session_id,
+                        tab_id: tid,
+                        req_id: page_rid,
+                        request,
+                    });
+                }
+            }
+
+            WorkerEvent::ExplainCompleted {
+                session_id,
+                tab_id,
+                req_id,
+                result,
+                logs,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                append_logs(&mut session.console_entries, logs);
+                let disconnected = matches!(result, Err(tv_core::DbError::Disconnected));
+                if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
+                    && tab.explain_req_id == Some(req_id)
+                {
+                    tab.explain_loading = false;
+                    tab.explain_req_id = None;
+                    tab.show_explain = true;
+                    match result {
+                        Ok(plan) => {
+                            tab.explain_plan = Some(*plan);
+                            tab.explain_error = None;
+                        }
+                        Err(err) => {
+                            tab.explain_error = Some(err.to_string());
+                        }
+                    }
+                }
+                if disconnected {
+                    session.status = ConnectionState::Disconnected {
+                        reason: Some("Disconnected from database".to_owned()),
+                    };
+                    if self.screen == Screen::Workspace(session_id) {
+                        self.sync_window_title(tx);
+                    }
+                }
+            }
+
+            WorkerEvent::FkPeekLoaded {
+                session_id,
+                tab_id,
+                req_id,
+                result,
+                logs,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                append_logs(&mut session.console_entries, logs);
+                if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut)
+                    && let Some(ref mut peek) = tab.fk_peek
+                    && peek.req_id == Some(req_id)
+                {
+                    peek.loading = false;
+                    match result {
+                        Ok(row) => {
+                            peek.result = Some(row);
+                            peek.error = None;
+                        }
+                        Err(err) => {
+                            peek.error = Some(err.to_string());
+                        }
                     }
                 }
             }

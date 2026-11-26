@@ -15,7 +15,7 @@ use crate::state::{
     WorkspaceTab,
 };
 use crate::theme;
-use crate::views::{empty_cta, inspector, pill_badge, query_editor, table_grid};
+use crate::views::{empty_cta, inspector, pill_badge, query_editor, staged_diff, table_grid};
 
 /// Builds the full database workspace screen (`SplitView` + environment strip + console).
 pub fn build(
@@ -704,7 +704,11 @@ fn build_main_pane(
 ) -> El {
     let stage = build_stage(s, session, k, cx, layer);
     let mut main = col().key("workspace-main-inner").w_full().h_full().min_h(0.0).child(stage);
-    if session.console_open {
+    if let Some(table_tab) = session.active_table_tab()
+        && table_tab.diff_drawer_open
+    {
+        main = main.child(staged_diff::build_drawer(s, session, table_tab, k));
+    } else if session.console_open {
         main = main.child(build_console_drawer(session, k));
     }
     main

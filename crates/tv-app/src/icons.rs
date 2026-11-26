@@ -162,3 +162,45 @@ pub static TRASH: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M3 4.5H13M6 4.5V3H10V4.5M5 4.5V12.5C5 13.1 5.4 13.5 6 13.5H10C10.6 13.5 11 13.1 11 12.5V4.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
+
+pub static ARROW_UP_RIGHT: Icon = Icon {
+    name: "tv-arrow-up-right",
+    view: 16.0,
+    body: r#"<path d="M5 11L11.5 4.5M6.5 4.5H11.5V9.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static DOWNLOAD: Icon = Icon {
+    name: "tv-download",
+    view: 16.0,
+    body: r#"<path d="M8 2.8V10.2M5.2 7.6L8 10.5L10.8 7.6M3 12.8H13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static DIFF_CHANGES: Icon = Icon {
+    name: "tv-diff-changes",
+    view: 16.0,
+    body: r#"<rect x="2.2" y="2.5" width="11.6" height="11" rx="1.8" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M8 5.2V8.8M6.2 7H9.8M6.2 10.8H9.8" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>"#,
+};
+
+pub static EXPLAIN_TREE: Icon = Icon {
+    name: "tv-explain-tree",
+    view: 16.0,
+    body: r#"<rect x="5.5" y="2" width="5" height="3" rx="0.9" stroke="currentColor" stroke-width="1.2" fill="none"/><rect x="2" y="10.5" width="4.5" height="3" rx="0.9" stroke="currentColor" stroke-width="1.2" fill="none"/><rect x="9.5" y="10.5" width="4.5" height="3" rx="0.9" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M8 5V7.8M4.25 10.5V7.8H11.75V10.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static CHECK: Icon = Icon {
+    name: "tv-check",
+    view: 16.0,
+    body: r#"<path d="M3.2 8.4L6.4 11.6L12.8 4.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static UNDO: Icon = Icon {
+    name: "tv-undo",
+    view: 16.0,
+    body: r#"<path d="M5.5 5H10C11.9 5 13.5 6.6 13.5 8.5C13.5 10.4 11.9 12 10 12H5.5M5.5 5L3.2 7.3L5.5 9.6" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static EDIT_PENCIL: Icon = Icon {
+    name: "tv-edit-pencil",
+    view: 16.0,
+    body: r#"<path d="M10.8 2.7L13.3 5.2L5.5 13H3V10.5L10.8 2.7Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>"#,
+};

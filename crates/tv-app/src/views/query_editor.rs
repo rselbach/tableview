@@ -11,6 +11,7 @@ use crate::icons;
 use crate::state::{
     AppState, OverlayState, QUERY_LIMIT_OPTIONS, QueryResultTabState, QueryTabState, SaveQueryModalState, SessionState,
 };
+use crate::views::explain_view;
 use crate::views::pill_badge;
 use crate::views::table_grid::{initial_col_width, is_numeric_udt, render_cell_value};
 
@@ -151,6 +152,19 @@ fn build_action_bar(tab: &QueryTabState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .gap(6.0)
                 .center_y()
                 .child(limit_select)
+                .child(
+                    Button::new("Explain")
+                        .variant(ButtonVariant::Ghost)
+                        .control_size(ControlSize::Small)
+                        .icon(&icons::EXPLAIN_TREE)
+                        .shortcut("mod+shift+e")
+                        .disabled(tab.running || tab.explain_loading)
+                        .on_press(|s: &mut AppState| {
+                            s.run_active_query_explain(false);
+                        })
+                        .build(k)
+                        .key("query-explain-btn"),
+                )
                 .child(
                     Button::new("Format")
                         .variant(ButtonVariant::Ghost)
@@ -327,7 +341,9 @@ fn build_results_pane(s: &AppState, tab: &QueryTabState, k: &Kit) -> El {
     let c = &k.c;
     let header = build_results_header(tab, k);
 
-    let body = if let Some(err) = &tab.batch_error
+    let body = if tab.show_explain {
+        explain_view::build_explain_pane(tab, k)
+    } else if let Some(err) = &tab.batch_error
         && tab.results.is_empty()
     {
         build_error_card(
@@ -400,11 +416,13 @@ fn build_results_header(tab: &QueryTabState, k: &Kit) -> El {
     let c = &k.c;
     let mut tabs_row = row().gap(4.0).center_y().shrink();
 
-    if tab.results.is_empty() {
+    let has_explain_tab = tab.explain_plan.is_some() || tab.explain_loading || tab.explain_error.is_some();
+
+    if tab.results.is_empty() && !has_explain_tab {
         tabs_row = tabs_row.child(text("Results").font(k.ty.small_medium).color(c.text_muted));
     } else {
         for (idx, res) in tab.results.iter().enumerate() {
-            let selected = idx == tab.active_result;
+            let selected = !tab.show_explain && idx == tab.active_result;
             let num = idx + 1;
             let label = if res.statement.error.is_some() {
                 format!("Error {num}")
@@ -451,6 +469,45 @@ fn build_results_header(tab: &QueryTabState, k: &Kit) -> El {
                     ),
             );
         }
+        if has_explain_tab {
+            let selected = tab.show_explain;
+            let label = if tab.explain_loading {
+                "Plan…"
+            } else if tab.explain_error.is_some() {
+                "Plan Error"
+            } else {
+                "Plan"
+            };
+            let fg = if tab.explain_error.is_some() {
+                c.danger.fg
+            } else if selected {
+                c.text_accent
+            } else {
+                c.text_muted
+            };
+            tabs_row = tabs_row.child(
+                row()
+                    .key("query-result-tab-explain")
+                    .role("tab")
+                    .label(label)
+                    .focusable(true)
+                    .h(24.0)
+                    .px(9.0)
+                    .gap(5.0)
+                    .center_y()
+                    .radius(k.radius.sm)
+                    .fill(if selected { c.layer_02 } else { rune::Color::TRANSPARENT })
+                    .border(0.5, if selected { c.border_base } else { rune::Color::TRANSPARENT })
+                    .hover(c.hover)
+                    .on_press(|s: &mut AppState| s.show_active_query_explain_tab())
+                    .child(rune::icon(&icons::EXPLAIN_TREE, 12.0).color(fg))
+                    .child(
+                        text(label)
+                            .font(if selected { k.ty.small_medium } else { k.ty.small })
+                            .color(fg),
+                    ),
+            );
+        }
     }
 
     let mut summary_row = row().gap(8.0).center_y();
@@ -464,7 +521,9 @@ fn build_results_header(tab: &QueryTabState, k: &Kit) -> El {
             k,
         ));
     }
-    if let Some(res) = tab.active_result_state() {
+    if !tab.show_explain
+        && let Some(res) = tab.active_result_state()
+    {
         if res.statement.truncated {
             summary_row = summary_row.child(pill_badge(
                 "query/truncated-badge",
@@ -485,7 +544,22 @@ fn build_results_header(tab: &QueryTabState, k: &Kit) -> El {
                     .color(c.text_muted),
             );
         }
-    } else if let Some(total_ms) = tab.total_duration_ms {
+        if res.statement.is_tabular() && res.statement.error.is_none() && !res.statement.rows.is_empty() {
+            summary_row = summary_row.child(
+                Button::new("Export")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Mini)
+                    .icon(&icons::DOWNLOAD)
+                    .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                        s.open_export_modal_for_active_tab(tx);
+                    })
+                    .build(k)
+                    .key("query-export-btn"),
+            );
+        }
+    } else if !tab.show_explain
+        && let Some(total_ms) = tab.total_duration_ms
+    {
         summary_row = summary_row.child(
             text(format!("{total_ms} ms"))
                 .font(k.ty.small)

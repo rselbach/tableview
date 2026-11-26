@@ -4,15 +4,16 @@ use chrono::{Duration, Utc};
 use rune::ColorScheme;
 use tv_core::{
     AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbObject, DbObjectKind,
-    EnvTag, ExecutedSql, ForeignKeyRef, IndexInfo, PasswordMode, QueryHistoryEntry, QueryStatementResult, RequestId,
-    SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo, SessionId, SortSpec, SslMode, StoreData, TablePage,
-    TableStats, TableStructure,
+    EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, IndexInfo, PasswordMode,
+    QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo,
+    SessionId, SortSpec, SslMode, StagedCellValue, StatementRisk, StoreData, TablePage, TableStats, TableStructure,
+    inspect_statement,
 };
 
 use crate::state::{
-    AppState, ColumnLoadState, ConnectedData, ConnectionFormState, ConnectionState, OverlayState, PickerKind,
-    PickerState, QueryResultTabState, QueryTabState, SaveQueryModalState, Screen, SessionState, SidebarTab,
-    TableViewMode, WorkspaceTab,
+    AppState, ColumnLoadState, ConnectedData, ConnectionFormState, ConnectionState, ExportModalState, FkPeekState,
+    OverlayState, PendingProtectedAction, PickerKind, PickerState, QueryResultTabState, QueryTabState, RowKey,
+    SafetyConfirmModalState, SaveQueryModalState, Screen, SessionState, SidebarTab, TableViewMode, WorkspaceTab,
 };
 
 /// Named headless scene entry registered on `AppSpec::scenes`.
@@ -37,6 +38,12 @@ pub const SCENES: &[SceneEntry] = &[
     ("workspace-sql-editor-light", scene_workspace_sql_editor_light),
     ("workspace-sql-saved-queries", scene_workspace_sql_saved_queries),
     ("workspace-save-query-modal", scene_workspace_save_query_modal),
+    ("workspace-staged-edits-dark", scene_workspace_staged_edits_dark),
+    ("workspace-staged-diff-drawer", scene_workspace_staged_diff_drawer),
+    ("workspace-fk-peek", scene_workspace_fk_peek),
+    ("workspace-safety-confirm", scene_workspace_safety_confirm),
+    ("workspace-explain-plan", scene_workspace_explain_plan),
+    ("workspace-export-modal", scene_workspace_export_modal),
 ];
 
 /// Builds deterministic Greendale Community College sample profiles for headless scenes and tests.
@@ -486,6 +493,308 @@ fn scene_workspace_save_query_modal(s: &mut AppState) {
         folder: rune::TextEdit::new("Reporting"),
         scope_all_connections: false,
         error: None,
+    }));
+}
+
+fn populate_sample_staged_changes(t: &mut crate::state::TableTabState) {
+    let Some(cols) = t.columns().map(|c| c.to_vec()) else {
+        return;
+    };
+    let Some(rows) = t.page.as_ref().map(|p| p.rows.clone()) else {
+        return;
+    };
+    if let Some(row0) = rows.first() {
+        t.staged.stage_cell_edit(
+            0,
+            row0,
+            2,
+            StagedCellValue::Literal("Troy 'T-Bone' Barnes".to_owned()),
+        );
+        t.staged
+            .stage_cell_edit(0, row0, 5, StagedCellValue::Literal("3.60".to_owned()));
+    }
+    if let Some(row3) = rows.get(3) {
+        t.staged.toggle_delete_row(3, row3);
+    }
+    let draft = t.staged.stage_insert_row(&cols);
+    t.staged.stage_insert_cell_edit(
+        draft,
+        2,
+        StagedCellValue::Literal("Señor Ben Chang".to_owned()),
+    );
+    t.staged
+        .stage_insert_cell_edit(draft, 3, StagedCellValue::Literal("chang@greendale.edu".to_owned()));
+    t.staged
+        .stage_insert_cell_edit(draft, 5, StagedCellValue::Literal("2.40".to_owned()));
+    t.staged
+        .stage_insert_cell_edit(draft, 8, StagedCellValue::Literal("1".to_owned()));
+    t.rebuild_diff_state();
+}
+
+fn scene_workspace_staged_edits_dark(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, Some(0));
+    if let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+        populate_sample_staged_changes(t);
+        t.selected_row = Some(0);
+        t.selected_row_key = Some(RowKey::Existing(0));
+        t.selected_cell = Some((RowKey::Existing(0), 2));
+        t.data_table.select("r-0");
+    }
+}
+
+fn scene_workspace_staged_diff_drawer(s: &mut AppState) {
+    setup_connected_workspace(s, false, TableViewMode::Data, Some(0));
+    if let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+        populate_sample_staged_changes(t);
+        t.diff_drawer_open = true;
+    }
+}
+
+fn scene_workspace_fk_peek(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, Some(0));
+    if let Some(sess) = s.active_session_mut() {
+        sess.inspector_pane.set_open(false);
+    }
+    if let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+        // Bring group_id into the primary visible viewport for clean screenshot & test visibility.
+        t.data_table.hide_column("id");
+        t.data_table.hide_column("profile");
+        t.data_table.hide_column("created_at");
+        let fk = sample_students_columns()[8]
+            .foreign_key
+            .clone()
+            .unwrap_or_else(|| ForeignKeyRef {
+                constraint_name: "students_group_id_fkey".to_owned(),
+                target_schema: "public".to_owned(),
+                target_table: "study_groups".to_owned(),
+                target_column: "group_id".to_owned(),
+            });
+        let source_col = sample_students_columns()[8].clone();
+        t.fk_peek = Some(FkPeekState {
+            anchor_key: "fk-peek-r-0-8".to_owned(),
+            fk: fk.clone(),
+            value: CellValue::Int(1),
+            source_col,
+            req_id: None,
+            loading: false,
+            result: Some(FkPeekRow {
+                fk,
+                lookup_display: "group_id = 1".to_owned(),
+                columns: vec![
+                    ColumnMeta {
+                        name: "group_id".to_owned(),
+                        data_type: "integer".to_owned(),
+                        udt_name: "int4".to_owned(),
+                        nullable: false,
+                        default_expr: None,
+                        is_primary_key: true,
+                        is_unique: false,
+                        comment: None,
+                        foreign_key: None,
+                    },
+                    ColumnMeta {
+                        name: "room_name".to_owned(),
+                        data_type: "text".to_owned(),
+                        udt_name: "text".to_owned(),
+                        nullable: false,
+                        default_expr: None,
+                        is_primary_key: false,
+                        is_unique: false,
+                        comment: None,
+                        foreign_key: None,
+                    },
+                    ColumnMeta {
+                        name: "topic".to_owned(),
+                        data_type: "text".to_owned(),
+                        udt_name: "text".to_owned(),
+                        nullable: false,
+                        default_expr: None,
+                        is_primary_key: false,
+                        is_unique: false,
+                        comment: None,
+                        foreign_key: None,
+                    },
+                    ColumnMeta {
+                        name: "leader".to_owned(),
+                        data_type: "text".to_owned(),
+                        udt_name: "text".to_owned(),
+                        nullable: true,
+                        default_expr: None,
+                        is_primary_key: false,
+                        is_unique: false,
+                        comment: None,
+                        foreign_key: None,
+                    },
+                ],
+                row: Some(vec![
+                    CellValue::Int(1),
+                    CellValue::Text("Study Room F".to_owned()),
+                    CellValue::Text("Spanish 101".to_owned()),
+                    CellValue::Text("Jeff Winger".to_owned()),
+                ]),
+                elapsed_ms: 2,
+            }),
+            error: None,
+        });
+    }
+}
+
+fn scene_workspace_safety_confirm(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, None);
+    let tid = s.alloc_tab_id();
+    let dangerous_sql = "DELETE FROM public.students;\nUPDATE public.students SET gpa = 0.0;";
+    let qtab = QueryTabState::new(tid, "Cleanup Script".to_owned(), dangerous_sql.to_owned(), None);
+    let sid = if let Some(sess) = s.active_session_mut() {
+        sess.profile.env = EnvTag::Production;
+        sess.profile.color = AccentColor::Red;
+        sess.profile.safety = SafetyPolicy::ConfirmWrites;
+        sess.profile.name = "greendale_prod".to_owned();
+        sess.tabs.push(WorkspaceTab {
+            id: tid,
+            content: crate::state::TabContent::Query(Box::new(qtab)),
+        });
+        sess.active_tab = Some(tid);
+        sess.id
+    } else {
+        SessionId::new(1)
+    };
+
+    let inspected = vec![
+        inspect_statement("DELETE FROM public.students;"),
+        inspect_statement("UPDATE public.students SET gpa = 0.0;"),
+    ];
+    let is_destructive = inspected.iter().any(|st| st.risk == StatementRisk::Destructive);
+    s.overlay = OverlayState::SafetyConfirm(Box::new(SafetyConfirmModalState {
+        session_id: sid,
+        tab_id: tid,
+        policy: SafetyPolicy::ConfirmWrites,
+        env: EnvTag::Production,
+        reason: "Production safeguard: destructive SQL modifies or removes rows without a WHERE filter.".to_owned(),
+        statements: inspected,
+        is_destructive,
+        destructive_ack: false,
+        pending: PendingProtectedAction::ExecuteSql {
+            statements: vec![
+                "DELETE FROM public.students".to_owned(),
+                "UPDATE public.students SET gpa = 0.0".to_owned(),
+            ],
+            executed_sql_text: dangerous_sql.to_owned(),
+            row_limit: Some(1000),
+        },
+    }));
+}
+
+fn scene_workspace_explain_plan(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, None);
+    let sql = "SELECT s.student_id, s.full_name, g.room_name\nFROM public.students s\nJOIN public.study_groups g ON g.group_id = s.group_id\nWHERE s.gpa >= 3.0\nORDER BY s.gpa DESC;";
+    let raw_plan = r#"[
+  {
+    "Plan": {
+      "Node Type": "Sort",
+      "Startup Cost": 22.84,
+      "Total Cost": 23.10,
+      "Plan Rows": 6,
+      "Plan Width": 68,
+      "Actual Startup Time": 0.910,
+      "Actual Total Time": 0.940,
+      "Actual Rows": 6,
+      "Actual Loops": 1,
+      "Sort Key": ["s.gpa DESC"],
+      "Shared Hit Blocks": 18,
+      "Shared Read Blocks": 2,
+      "Plans": [
+        {
+          "Node Type": "Hash Join",
+          "Join Type": "Inner",
+          "Startup Cost": 1.15,
+          "Total Cost": 21.05,
+          "Plan Rows": 6,
+          "Plan Width": 68,
+          "Actual Startup Time": 0.310,
+          "Actual Total Time": 0.780,
+          "Actual Rows": 6,
+          "Actual Loops": 1,
+          "Hash Cond": "(s.group_id = g.group_id)",
+          "Plans": [
+            {
+              "Node Type": "Seq Scan",
+              "Relation Name": "students",
+              "Schema": "public",
+              "Alias": "s",
+              "Startup Cost": 0.00,
+              "Total Cost": 18.40,
+              "Plan Rows": 1,
+              "Plan Width": 44,
+              "Actual Startup Time": 0.045,
+              "Actual Total Time": 0.560,
+              "Actual Rows": 42,
+              "Actual Loops": 1,
+              "Filter": "(gpa >= 3.0)",
+              "Rows Removed by Filter": 2
+            },
+            {
+              "Node Type": "Hash",
+              "Startup Cost": 1.05,
+              "Total Cost": 1.05,
+              "Plan Rows": 4,
+              "Plan Width": 32,
+              "Actual Startup Time": 0.080,
+              "Actual Total Time": 0.095,
+              "Actual Rows": 4,
+              "Actual Loops": 1,
+              "Plans": [
+                {
+                  "Node Type": "Index Scan",
+                  "Relation Name": "study_groups",
+                  "Schema": "public",
+                  "Index Name": "study_groups_pkey",
+                  "Startup Cost": 0.14,
+                  "Total Cost": 1.05,
+                  "Plan Rows": 4,
+                  "Plan Width": 32,
+                  "Actual Startup Time": 0.020,
+                  "Actual Total Time": 0.045,
+                  "Actual Rows": 4,
+                  "Actual Loops": 1
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "Planning Time": 0.285,
+    "Execution Time": 1.042
+  }
+]"#;
+
+    let tid = s.alloc_tab_id();
+    let mut qtab = QueryTabState::new(tid, "Honor Roll Join Plan".to_owned(), sql.to_owned(), None);
+    qtab.split_ratio = 0.28;
+    qtab.show_explain = true;
+    qtab.explain_plan = ExplainPlan::parse_json(sql.to_owned(), true, raw_plan).ok();
+
+    if let Some(sess) = s.active_session_mut() {
+        sess.inspector_pane.set_open(false);
+        sess.tabs.push(WorkspaceTab {
+            id: tid,
+            content: crate::state::TabContent::Query(Box::new(qtab)),
+        });
+        sess.active_tab = Some(tid);
+    }
+}
+
+fn scene_workspace_export_modal(s: &mut AppState) {
+    setup_connected_workspace(s, false, TableViewMode::Data, Some(0));
+    let cols = sample_students_columns();
+    let page = sample_students_page(cols.clone());
+    s.overlay = OverlayState::Export(Box::new(ExportModalState {
+        source_label: "public.students".to_owned(),
+        schema: Some("public".to_owned()),
+        table_name: rune::TextEdit::new("students"),
+        columns: cols,
+        rows: page.rows,
+        format: ExportFormat::SqlInsert,
     }));
 }
 

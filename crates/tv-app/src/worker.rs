@@ -6,9 +6,10 @@ use rune::Waker;
 use rune::credentials::Credentials;
 use tv_core::engine::postgres::{PostgresSession, quote_ident};
 use tv_core::{
-    ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbError, DbObject, DbSession, ExecutedSql,
-    NewHistoryEntry, PageRequest, PasswordMode, QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId,
-    SavedQuery, SavedQueryId, SchemaInfo, ServerInfo, SessionId, TabId, TablePage, TableStructure,
+    CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbError, DbObject,
+    DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, NewHistoryEntry, PageRequest, PasswordMode,
+    QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo,
+    SessionId, TabId, TablePage, TableStructure, TransactionOutcome,
 };
 
 const QUERY_HISTORY_LIMIT: usize = 200;
@@ -117,6 +118,27 @@ pub enum WorkerCmd {
         connection_id: ConnectionId,
         service: String,
     },
+    CommitStagedChanges {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        statements: Vec<String>,
+    },
+    ExplainSql {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        statement: String,
+        analyze: bool,
+    },
+    FetchFkPeek {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        fk: ForeignKeyRef,
+        value: CellValue,
+        source_col: ColumnMeta,
+    },
 }
 
 /// Asynchronous results sent from the database worker back to `AppState`.
@@ -220,6 +242,27 @@ pub enum WorkerEvent {
         req_id: RequestId,
         connection_id: ConnectionId,
         secret: Option<String>,
+    },
+    StagedChangesCommitted {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        result: Result<TransactionOutcome, DbError>,
+        logs: Vec<ExecutedSql>,
+    },
+    ExplainCompleted {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        result: Result<Box<ExplainPlan>, DbError>,
+        logs: Vec<ExecutedSql>,
+    },
+    FkPeekLoaded {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        result: Result<FkPeekRow, DbError>,
+        logs: Vec<ExecutedSql>,
     },
 }
 
@@ -1069,6 +1112,154 @@ async fn handle_cmd(
                     secret,
                 },
             );
+        }
+
+        WorkerCmd::CommitStagedChanges {
+            session_id,
+            tab_id,
+            req_id,
+            statements,
+        } => {
+            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::StagedChangesCommitted {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(DbError::Disconnected),
+                        logs: Vec::new(),
+                    },
+                );
+                return;
+            };
+            match session.execute_transaction(&statements).await {
+                Ok((outcome, logs)) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::StagedChangesCommitted {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Ok(outcome),
+                        logs,
+                    },
+                ),
+                Err(error) => {
+                    let logs = vec![ExecutedSql {
+                        sql: statements.join("\n"),
+                        duration_ms: 0,
+                        error: Some(error.to_string()),
+                    }];
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::StagedChangesCommitted {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(error),
+                            logs,
+                        },
+                    );
+                }
+            }
+        }
+
+        WorkerCmd::ExplainSql {
+            session_id,
+            tab_id,
+            req_id,
+            statement,
+            analyze,
+        } => {
+            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::ExplainCompleted {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(DbError::Disconnected),
+                        logs: Vec::new(),
+                    },
+                );
+                return;
+            };
+            match session.explain_sql(&statement, analyze).await {
+                Ok((plan, log)) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::ExplainCompleted {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Ok(Box::new(plan)),
+                        logs: vec![log],
+                    },
+                ),
+                Err(error) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::ExplainCompleted {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(error),
+                        logs: Vec::new(),
+                    },
+                ),
+            }
+        }
+
+        WorkerCmd::FetchFkPeek {
+            session_id,
+            tab_id,
+            req_id,
+            fk,
+            value,
+            source_col,
+        } => {
+            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::FkPeekLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(DbError::Disconnected),
+                        logs: Vec::new(),
+                    },
+                );
+                return;
+            };
+            match session.fetch_fk_row(&fk, &value, &source_col).await {
+                Ok((peek, log)) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::FkPeekLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Ok(peek),
+                        logs: vec![log],
+                    },
+                ),
+                Err(error) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::FkPeekLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(error),
+                        logs: Vec::new(),
+                    },
+                ),
+            }
         }
     }
 }

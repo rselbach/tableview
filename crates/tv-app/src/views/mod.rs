@@ -1,8 +1,12 @@
 pub mod connection_form;
+pub mod explain_view;
+pub mod export_modal;
 pub mod inspector;
 pub mod launcher;
 pub mod pickers;
 pub mod query_editor;
+pub mod safety_modal;
+pub mod staged_diff;
 pub mod table_grid;
 pub mod workspace;
 
@@ -58,6 +62,12 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         }
         OverlayState::SaveQuery(modal) => {
             query_editor::build_save_query_modal(modal, &k, &mut layer);
+        }
+        OverlayState::SafetyConfirm(modal) => {
+            safety_modal::build_safety_modal(modal, &k, &mut layer);
+        }
+        OverlayState::Export(modal) => {
+            export_modal::build_export_modal(modal, &k, &mut layer);
         }
         OverlayState::DeleteConfirm(id) => {
             connection_form::build_delete_confirm(s, *id, &k, &mut layer);

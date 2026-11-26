@@ -1,4 +1,4 @@
-use rune::{ColorScheme, Key, KeyEvent, MenuItem, Shortcut, Tx};
+use rune::{ColorScheme, Key, KeyEvent, MenuItem, Mods, Shortcut, Tx};
 
 use crate::state::{AppState, OverlayState, PickerKind, Screen};
 
@@ -14,9 +14,11 @@ pub enum Action {
     NewQueryTab,
     RunCurrentQuery,
     RunAllQueries,
+    ExplainQuery,
     CancelQuery,
     FormatSql,
     SaveQuery,
+    ExportData,
     ToggleSidebar,
     ToggleConsole,
     ToggleInspector,
@@ -32,6 +34,15 @@ pub enum Action {
     SetColorScheme(ColorScheme),
     CycleColorScheme,
     DismissOverlay,
+}
+
+/// Returns whether the platform primary shortcut modifier (`Cmd` on macOS, `Ctrl` elsewhere) is pressed.
+pub const fn is_primary_mod(mods: Mods) -> bool {
+    if cfg!(target_os = "macos") {
+        mods.cmd && !mods.ctrl
+    } else {
+        mods.ctrl && !mods.cmd
+    }
 }
 
 /// Platform-aware primary modifier glyph (`⌘` on macOS, `Ctrl+` elsewhere).
@@ -67,6 +78,15 @@ pub fn action_for_key(ev: &KeyEvent) -> Option<Action> {
     }
     if ev.is_command('s') && !ev.mods.shift && !ev.mods.alt {
         return Some(Action::SaveQuery);
+    }
+    if ev.is_command('e') {
+        if ev.mods.shift && !ev.mods.alt {
+            return Some(Action::ExplainQuery);
+        }
+        if !ev.mods.shift && !ev.mods.alt {
+            return Some(Action::ExportData);
+        }
+        return None;
     }
     if ev.is_command('k') {
         return Some(if ev.mods.shift {
@@ -158,12 +178,28 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
                     return true;
                 }
                 if let Some(tab) = session.active_table_tab_mut() {
+                    if tab.editing_cell.is_some() {
+                        tab.editing_cell = None;
+                        return true;
+                    }
+                    if tab.fk_peek.is_some() {
+                        tab.fk_peek = None;
+                        return true;
+                    }
+                    if tab.row_menu.is_some() {
+                        tab.row_menu = None;
+                        return true;
+                    }
                     if tab.header_menu.is_some() {
                         tab.header_menu = None;
                         return true;
                     }
                     if tab.page_size_open {
                         tab.page_size_open = false;
+                        return true;
+                    }
+                    if tab.diff_drawer_open {
+                        tab.diff_drawer_open = false;
                         return true;
                     }
                 }
@@ -226,9 +262,11 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
         }
         Action::RunCurrentQuery => s.run_active_query(false),
         Action::RunAllQueries => s.run_active_query(true),
+        Action::ExplainQuery => s.run_active_query_explain(false),
         Action::CancelQuery => s.cancel_active_query(),
         Action::FormatSql => s.format_active_query_sql(),
-        Action::SaveQuery => s.open_save_query_modal(tx),
+        Action::SaveQuery => s.handle_primary_save(tx),
+        Action::ExportData => s.open_export_modal_for_active_tab(tx),
         Action::ToggleSidebar => {
             if let Some(session) = s.active_session_mut() {
                 session.sidebar_pane.toggle();
@@ -415,8 +453,14 @@ pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
         item_with_shortcut("query-format", "Format SQL", "Connection", "mod+shift+f", |s, tx| {
             dispatch_action(s, Action::FormatSql, tx);
         }),
-        item_with_shortcut("query-save", "Save Query…", "Connection", "mod+s", |s, tx| {
+        item_with_shortcut("query-explain", "Explain Current Query", "Connection", "mod+shift+e", |s, tx| {
+            dispatch_action(s, Action::ExplainQuery, tx);
+        }),
+        item_with_shortcut("query-save", "Save / Review Changes…", "Connection", "mod+s", |s, tx| {
             dispatch_action(s, Action::SaveQuery, tx);
+        }),
+        item_with_shortcut("data-export", "Export Data…", "Connection", "mod+e", |s, tx| {
+            dispatch_action(s, Action::ExportData, tx);
         }),
         MenuItem::new("Connection Launcher", |s, tx| {
             dispatch_action(s, Action::ShowLauncher, tx);

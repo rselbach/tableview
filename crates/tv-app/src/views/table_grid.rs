@@ -1,19 +1,23 @@
 use std::borrow::Cow;
 
-use rune::{Align, Color, Cx, El, ScrollSpec, TextStyle, Tx, col, el, icon, rich, row, spacer, text};
+use rune::{Align, Color, Cx, El, ScrollSpec, TextStyle, Tx, col, el, icon, rich, row, spacer, text, text_input};
 use rune_kit::shell::{TabItem, TabItemStatus, TabOrientation};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{
-    Button, ButtonVariant, Cell, ControlSize, IconButton, IconButtonVariant, Kit, MenuItem, Placement,
+    Button, ButtonVariant, Cell, ControlSize, Divider, IconButton, IconButtonVariant, Kit, MenuItem, Placement,
     SegmentedControl, Select, SelectAppearance, SortDir, Spinner, TabStrip, Table, TableColumn, TextInput,
-    context_menu,
+    context_menu, popover, scrim,
 };
 use tv_core::engine::encode_hex;
-use tv_core::{CellValue, ColumnMeta, DbObjectKind, TablePage, TableStructure};
+use tv_core::{
+    CellValue, ColumnMeta, DbObjectKind, ExportFormat, SafetyPolicy, StagedCellValue, TablePage, TableStructure,
+    build_fk_where_clause, export_rows,
+};
 
 use crate::icons;
+use crate::platform;
 use crate::state::{
-    AppState, SessionState, TableTabState, TableViewMode, parse_tab_id,
+    AppState, FkPeekState, RowKey, SessionState, TabContent, TableTabState, TableViewMode, parse_tab_id,
 };
 use crate::views::{empty_cta, format_bytes, pill_badge};
 
@@ -49,7 +53,10 @@ pub fn build_tab_bar(session: &SessionState, k: &Kit, cx: &Cx<AppState>) -> El {
             _ => &icons::TABLE,
         };
         let dirty_title = match &tab.content {
-            crate::state::TabContent::Query(q) if q.is_dirty() => format!("{display_title} •"),
+            TabContent::Query(q) if q.is_dirty() => format!("{display_title} •"),
+            TabContent::Table(t) if t.staged.has_changes() => {
+                format!("{display_title} • {}", t.staged.change_count())
+            }
             _ => display_title,
         };
         let status = if tab.is_loading() {
@@ -117,7 +124,7 @@ pub fn build_tab_bar(session: &SessionState, k: &Kit, cx: &Cx<AppState>) -> El {
         .child(el().grow(1.0).min_w(0.0).child(strip))
 }
 
-/// Builds the active table/view tab body (`Data | Structure | Indexes`) and its bottom bar.
+/// Builds the active table/view tab body (`Data | Structure | Indexes`), optional staged banner, and bottom bar.
 pub fn build_table_tab(
     s: &AppState,
     session: &SessionState,
@@ -126,22 +133,105 @@ pub fn build_table_tab(
     layer: &mut Vec<El>,
 ) -> El {
     let body = match tab.view_mode {
-        TableViewMode::Data => build_data_view(s, tab, k, layer),
+        TableViewMode::Data => build_data_view(s, session, tab, k, layer),
         TableViewMode::Structure => build_structure_view(s, tab, k),
         TableViewMode::Indexes => build_indexes_view(s, tab, k),
     };
     let footer = build_table_footer(session, tab, k, layer);
 
-    col()
+    let mut root = col()
         .key("table-tab-root")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .child(body)
-        .child(footer)
+        .child(body);
+
+    if tab.view_mode == TableViewMode::Data && tab.staged.has_changes() {
+        root = root.child(build_staged_banner(session, tab, k));
+    }
+
+    root.child(footer)
 }
 
-fn build_data_view(s: &AppState, tab: &TableTabState, k: &Kit, layer: &mut Vec<El>) -> El {
+fn build_staged_banner(session: &SessionState, tab: &TableTabState, k: &Kit) -> El {
+    let c = &k.c;
+    let is_ro = session.profile.safety == SafetyPolicy::ReadOnly;
+    let mut bar = row()
+        .key("table-staged-banner")
+        .w_full()
+        .h(34.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .fill(c.warning.bg)
+        .border_sides([1.0, 0.0, 0.0, 0.0], c.warning.border)
+        .child(icon(&icons::DIFF_CHANGES, 13.0).color(c.warning.fg))
+        .child(
+            text(format!("{} staged row change(s)", tab.staged.change_count()))
+                .font(k.ty.small_medium)
+                .color(c.text_base),
+        );
+
+    if tab.staged.insert_count() > 0 {
+        bar = bar.child(pill_badge(
+            "staged-banner/ins",
+            format!("+{}", tab.staged.insert_count()),
+            c.success.bg,
+            c.success.fg,
+            c.success.border,
+            k,
+        ));
+    }
+    if tab.staged.update_count() > 0 {
+        bar = bar.child(pill_badge(
+            "staged-banner/upd",
+            format!("~{}", tab.staged.update_count()),
+            c.layer_02,
+            c.warning.fg,
+            c.warning.border,
+            k,
+        ));
+    }
+    if tab.staged.delete_count() > 0 {
+        bar = bar.child(pill_badge(
+            "staged-banner/del",
+            format!("-{}", tab.staged.delete_count()),
+            c.danger.bg,
+            c.danger.fg,
+            c.danger.border,
+            k,
+        ));
+    }
+
+    bar.child(spacer())
+        .child(
+            Button::new("Discard")
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Mini)
+                .disabled(tab.committing)
+                .on_press(|s: &mut AppState| s.discard_staged_changes())
+                .build(k)
+                .key("staged-banner-discard-btn"),
+        )
+        .child(
+            Button::new(if tab.diff_drawer_open { "Diff Open" } else { "Review & Commit" })
+                .variant(ButtonVariant::Contrast)
+                .control_size(ControlSize::Mini)
+                .shortcut("mod+s")
+                .disabled(is_ro || tab.committing)
+                .on_press(|s: &mut AppState| s.open_staged_diff_drawer())
+                .build(k)
+                .key("staged-review-btn"),
+        )
+}
+
+fn build_data_view(
+    s: &AppState,
+    session: &SessionState,
+    tab: &TableTabState,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) -> El {
     let c = &k.c;
 
     let filter_input = TextInput::new(&tab.filter_input)
@@ -281,7 +371,7 @@ fn build_data_view(s: &AppState, tab: &TableTabState, k: &Kit, layer: &mut Vec<E
             .child(text(err).font(k.ty.ui_compact).color(c.danger.fg).wrap())
             .child(empty_cta("Retry", k, true, |s, _| s.reload_active_tab()))
     } else if let Some(page) = &tab.page {
-        build_data_grid(s, tab, page, k, layer)
+        build_data_grid(s, session, tab, page, k, layer)
     } else {
         col()
             .key("data-empty-init")
@@ -297,6 +387,7 @@ fn build_data_view(s: &AppState, tab: &TableTabState, k: &Kit, layer: &mut Vec<E
 
 fn build_data_grid(
     s: &AppState,
+    session: &SessionState,
     tab: &TableTabState,
     page: &TablePage,
     k: &Kit,
@@ -316,8 +407,20 @@ fn build_data_grid(
     let null_bg = c.layer_02;
     let null_fg = c.text_faint;
     let null_border = c.border_muted;
+    let hover_bg = c.hover;
     let bool_true_fg = c.success.fg;
     let muted_fg = c.text_muted;
+    let text_base = c.text_base;
+    let text_accent = c.text_accent;
+    let warn_bg = c.warning.bg;
+    let warn_fg = c.warning.fg;
+    let warn_border = c.warning.border;
+    let success_bg = c.success.bg;
+    let success_fg = c.success.fg;
+    let danger_bg = c.danger.bg;
+    let danger_fg = c.danger.fg;
+    let ui_font = k.ty.ui_compact;
+    let mono_font = k.ty.mono;
     let small_font = k.ty.small;
     let radius_xs = k.radius.xs;
 
@@ -327,23 +430,29 @@ fn build_data_grid(
         |s: &AppState| {
             s.active_session()
                 .and_then(SessionState::active_table_tab)
-                .and_then(|t| t.page.as_ref())
-                .map_or(0, |p| p.rows.len())
+                .map_or(0, TableTabState::visual_row_count)
         },
-        |_s: &AppState, i| Cow::Owned(format!("r-{i}")),
+        |s: &AppState, i| {
+            let row_id = s
+                .active_session()
+                .and_then(SessionState::active_table_tab)
+                .map_or_else(|| format!("r-{i}"), |t| t.row_id_string(i));
+            Cow::Owned(row_id)
+        },
     )
     .column(
         TableColumn::new("#", "#")
-            .width(52.0)
+            .width(56.0)
             .min(44.0)
-            .max(84.0)
+            .max(88.0)
             .align(Align::End)
             .resizable(false),
     );
 
     for col_meta in &page.columns {
+        let extra = if col_meta.foreign_key.is_some() { 20.0 } else { 0.0 };
         let mut column = TableColumn::new(&col_meta.name, &col_meta.name)
-            .width(initial_col_width(col_meta))
+            .width(initial_col_width(col_meta) + extra)
             .min(68.0)
             .max(640.0)
             .sortable()
@@ -355,34 +464,230 @@ fn build_data_grid(
     }
 
     let built = table
-        .cell(move |s: &AppState, row_idx, col_id| {
+        .row(move |s: &AppState, visual_idx, r| {
+            let Some(tab) = s.active_session().and_then(SessionState::active_table_tab) else {
+                return r;
+            };
+            let Some(row_key) = tab.visual_row_key(visual_idx) else {
+                return r;
+            };
+            let row_id = tab.row_id_string(visual_idx);
+            let is_sel = tab.data_table.is_selected(&row_id);
+            let mut r = r.on_secondary_press(move |s: &mut AppState, press, _| {
+                if let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+                    if !t.data_table.is_selected(&row_id) {
+                        t.data_table.select(row_id.clone());
+                        t.selected_row_key = Some(row_key);
+                        t.selected_row = match row_key {
+                            RowKey::Existing(idx) => Some(idx),
+                            RowKey::Draft(_) => None,
+                        };
+                    }
+                    t.row_menu = Some((row_key, press));
+                    t.header_menu = None;
+                }
+            });
+            if !is_sel {
+                match row_key {
+                    RowKey::Draft(_) => {
+                        r = r.fill(success_bg);
+                    }
+                    RowKey::Existing(idx) if tab.staged.is_row_deleted(idx) => {
+                        r = r.fill(danger_bg);
+                    }
+                    _ => {}
+                }
+            }
+            r
+        })
+        .cell(move |s: &AppState, visual_idx, col_id| {
             let Some(tab) = s.active_session().and_then(SessionState::active_table_tab) else {
                 return Cell::text("");
             };
             let Some(page) = &tab.page else {
                 return Cell::text("");
             };
+            let Some(row_key) = tab.visual_row_key(visual_idx) else {
+                return Cell::text("");
+            };
             if col_id == "#" {
-                return Cell::text((tab.offset + row_idx as i64 + 1).to_string())
-                    .mono()
-                    .muted();
+                return match row_key {
+                    RowKey::Draft(_) => Cell::text("+").mono().color(success_fg),
+                    RowKey::Existing(idx) if tab.staged.is_row_deleted(idx) => {
+                        Cell::text("−").mono().color(danger_fg)
+                    }
+                    RowKey::Existing(idx) if tab.staged.is_row_updated(idx) => {
+                        Cell::text(format!("• {}", tab.offset + idx as i64 + 1))
+                            .mono()
+                            .color(warn_fg)
+                    }
+                    RowKey::Existing(idx) => Cell::text((tab.offset + idx as i64 + 1).to_string())
+                        .mono()
+                        .muted(),
+                };
             }
             let Some(col_idx) = page.columns.iter().position(|c| c.name == col_id) else {
                 return Cell::text("");
             };
-            let Some(val) = page.rows.get(row_idx).and_then(|r| r.get(col_idx)) else {
-                return Cell::text("");
+            let col_meta = &page.columns[col_idx];
+            let row_id_str = tab.row_id_string(visual_idx);
+
+            if let Some(ref editing) = tab.editing_cell
+                && editing.row_key == row_key
+                && editing.col_idx == col_idx
+            {
+                let mut ed_row = row()
+                    .key("inline-editor-wrap")
+                    .w_full()
+                    .h(24.0)
+                    .px(4.0)
+                    .gap(4.0)
+                    .center_y()
+                    .radius(radius_xs)
+                    .fill(null_bg)
+                    .border(1.0, text_accent)
+                    .child(
+                        text_input(&editing.edit, mono_font)
+                            .key("inline-cell-editor")
+                            .label(format!("Edit {}", col_meta.name))
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .color(text_base)
+                            .caret(text_accent, text_accent.alpha(0.24))
+                            .on_edit(AppState::inline_cell_edit_mut)
+                            .on_submit(|s: &mut AppState, _| s.commit_inline_cell_edit()),
+                    );
+                if col_meta.nullable {
+                    ed_row = ed_row.child(
+                        row()
+                            .key("inline-null-btn")
+                            .role("button")
+                            .label("Set NULL")
+                            .focusable(true)
+                            .h(16.0)
+                            .px(4.0)
+                            .center()
+                            .radius(radius_xs)
+                            .fill(null_bg)
+                            .border(0.5, null_border)
+                            .on_press(move |s: &mut AppState| s.stage_cell_null(row_key, col_idx))
+                            .child(text("NULL").font(small_font).color(null_fg)),
+                    );
+                }
+                return Cell::el(ed_row);
+            }
+
+            let is_draft_default = matches!(row_key, RowKey::Draft(id) if tab
+                .staged
+                .insert_row(id)
+                .and_then(|d| d.values.get(col_idx))
+                .is_some_and(|v| matches!(v, StagedCellValue::DefaultExpr)));
+            let is_cell_edited =
+                matches!(row_key, RowKey::Existing(idx) if tab.staged.effective_existing_cell(idx, col_idx).is_some());
+            let val = tab.effective_cell(row_key, col_idx);
+
+            let display_el = if is_draft_default {
+                cell_pill_el("DEFAULT", null_bg, null_fg, null_border, small_font, radius_xs)
+                    .key(format!("cell-default/{row_id_str}/{col_idx}"))
+            } else {
+                match &val {
+                    CellValue::Null => cell_pill_el("NULL", null_bg, null_fg, null_border, small_font, radius_xs),
+                    CellValue::Bool(b) => text(if *b { "true" } else { "false" })
+                        .font(mono_font)
+                        .color(if *b { bool_true_fg } else { muted_fg })
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                    v if v.is_mono() => text(v.display_compact())
+                        .font(mono_font)
+                        .color(text_base)
+                        .align(if is_numeric_udt(&col_meta.udt_name) {
+                            Align::End
+                        } else {
+                            Align::Start
+                        })
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                    v => text(v.display_compact())
+                        .font(ui_font)
+                        .color(text_base)
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                }
             };
-            render_cell_value(
-                val,
-                null_bg,
-                null_fg,
-                null_border,
-                bool_true_fg,
-                muted_fg,
-                small_font,
-                radius_xs,
-            )
+
+            let right_aligned = is_numeric_udt(&col_meta.udt_name);
+            let mut inner = row().w_full().h(22.0).min_w(0.0).gap(4.0).center_y();
+            if right_aligned {
+                inner = inner.child(spacer()).child(display_el);
+            } else {
+                inner = inner.child(el().grow(1.0).min_w(0.0).child(display_el));
+            }
+            if is_cell_edited {
+                inner = inner
+                    .px(4.0)
+                    .radius(radius_xs)
+                    .fill(warn_bg)
+                    .border(0.5, warn_border);
+            }
+
+            let fk_for_press = col_meta.foreign_key.clone();
+            let val_for_press = val.clone();
+            let col_for_press = col_meta.clone();
+
+            inner = inner
+                .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                    if platform::is_primary_mod(tx.mods())
+                        && !val_for_press.is_null()
+                        && let Some(ref fk) = fk_for_press
+                    {
+                        s.jump_to_foreign_key(fk.clone(), val_for_press.clone(), col_for_press.clone(), tx);
+                    } else {
+                        s.select_table_cell(row_key, col_idx);
+                    }
+                })
+                .on_double_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                    s.begin_cell_edit(row_key, col_idx, tx);
+                });
+
+            if let Some(ref fk) = col_meta.foreign_key
+                && !val.is_null()
+            {
+                let anchor_key = format!("fk-peek-{row_id_str}-{col_idx}");
+                let anchor_for_click = anchor_key.clone();
+                let fk_click = fk.clone();
+                let val_click = val;
+                let col_click = col_meta.clone();
+                let fk_btn = row()
+                    .key(anchor_key)
+                    .role("button")
+                    .label(format!("Inspect {} foreign key", fk.target_table))
+                    .focusable(false)
+                    .size(18.0, 18.0)
+                    .center()
+                    .radius(radius_xs)
+                    .fill(null_bg)
+                    .border(0.5, null_border)
+                    .hover(hover_bg)
+                    .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                        if platform::is_primary_mod(tx.mods()) {
+                            s.jump_to_foreign_key(fk_click.clone(), val_click.clone(), col_click.clone(), tx);
+                        } else {
+                            s.open_fk_peek(
+                                anchor_for_click.clone(),
+                                fk_click.clone(),
+                                val_click.clone(),
+                                col_click.clone(),
+                            );
+                        }
+                    })
+                    .child(icon(&icons::ARROW_UP_RIGHT, 11.0).color(text_accent));
+                inner = inner.child(fk_btn);
+            }
+
+            Cell::el(inner)
         })
         .zebra(true)
         .scroll_wide(true)
@@ -401,6 +706,7 @@ fn build_data_grid(
                 && let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut)
             {
                 t.header_menu = Some((col_id.to_owned(), press));
+                t.row_menu = None;
             }
         })
         .build(s, k)
@@ -408,7 +714,7 @@ fn build_data_grid(
         .grow(1.0)
         .min_h(0.0);
 
-    let grid_host = if page.rows.is_empty() {
+    let grid_host = if tab.visual_row_count() == 0 {
         let filtered = tab.applied_filter.is_some();
         let mut msg = col()
             .key("data-empty-rows")
@@ -445,6 +751,10 @@ fn build_data_grid(
     } else {
         built
     };
+
+    if let Some(ref peek) = tab.fk_peek {
+        mount_fk_peek_popover(peek, k, layer);
+    }
 
     if let Some((col_id, press)) = &tab.header_menu {
         let sort_asc_col = col_id.clone();
@@ -503,9 +813,257 @@ fn build_data_grid(
         .w_full()
         .grow(1.0)
         .min_h(0.0)
+    } else if let Some((row_key, press)) = tab.row_menu {
+        build_row_context_menu(session, tab, page, row_key, press, grid_host, k, layer)
     } else {
         grid_host
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_row_context_menu(
+    session: &SessionState,
+    tab: &TableTabState,
+    page: &TablePage,
+    row_key: RowKey,
+    press: rune::PointerPress,
+    grid_host: El,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) -> El {
+    let editable = tab.can_edit_table(session.profile.safety).is_ok()
+        && (matches!(row_key, RowKey::Draft(_)) || tab.has_primary_key());
+    let target_col_idx = tab
+        .selected_cell
+        .filter(|(rk, _)| *rk == row_key)
+        .map_or(0, |(_, ci)| ci)
+        .min(page.columns.len().saturating_sub(1));
+
+    let delete_label = match row_key {
+        RowKey::Draft(_) => "Remove Draft Row",
+        RowKey::Existing(idx) if tab.staged.is_row_deleted(idx) => "Undo Row Delete",
+        RowKey::Existing(_) => "Delete Row",
+    };
+
+    let mut menu = context_menu("table-row-ctx", grid_host, Some(press))
+        .item(
+            MenuItem::new("Edit Cell")
+                .disabled(!editable)
+                .on_select_tx(move |s: &mut AppState, tx: &mut Tx| {
+                    s.begin_cell_edit(row_key, target_col_idx, tx);
+                }),
+        );
+
+    if page.columns.get(target_col_idx).is_some_and(|c| c.nullable) {
+        menu = menu.item(
+            MenuItem::new("Set Cell to NULL")
+                .disabled(!editable)
+                .on_select(move |s: &mut AppState| s.stage_cell_null(row_key, target_col_idx)),
+        );
+    }
+
+    menu = menu
+        .item(
+            MenuItem::new("Insert New Row")
+                .disabled(tab.can_edit_table(session.profile.safety).is_err())
+                .on_select_tx(|s: &mut AppState, tx: &mut Tx| {
+                    s.insert_staged_row(tx);
+                }),
+        )
+        .item(
+            MenuItem::new(delete_label)
+                .disabled(!editable)
+                .on_select(move |s: &mut AppState| s.toggle_delete_row(row_key)),
+        );
+
+    let eff_row: Vec<CellValue> = (0..page.columns.len())
+        .map(|ci| tab.effective_cell(row_key, ci))
+        .collect();
+    let fk_links: Vec<_> = page
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(ci, col_meta)| {
+            let fk = col_meta.foreign_key.as_ref()?;
+            let val = eff_row.get(ci)?;
+            if val.is_null() {
+                return None;
+            }
+            Some((col_meta.clone(), fk.clone(), val.clone()))
+        })
+        .collect();
+    if !fk_links.is_empty() {
+        menu = menu.separator();
+        for (col_meta, fk, val) in fk_links {
+            let label = format!("Open FK → {}.{} ({})", fk.target_table, fk.target_column, val.display_compact());
+            menu = menu.item(MenuItem::new(label).on_select_tx(move |s: &mut AppState, tx: &mut Tx| {
+                s.jump_to_foreign_key(fk.clone(), val.clone(), col_meta.clone(), tx);
+            }));
+        }
+    }
+
+    let row_slice = vec![eff_row];
+    let json_text = export_rows(
+        ExportFormat::Json,
+        Some(&tab.schema),
+        &tab.object_name,
+        &page.columns,
+        &row_slice,
+    );
+    let insert_text = export_rows(
+        ExportFormat::SqlInsert,
+        Some(&tab.schema),
+        &tab.object_name,
+        &page.columns,
+        &row_slice,
+    );
+
+    menu.separator()
+        .item(MenuItem::new("Copy Row as JSON").on_select_tx(move |s: &mut AppState, tx: &mut Tx| {
+            tx.copy(json_text.clone());
+            s.set_notice("Copied row as JSON", false);
+        }))
+        .item(MenuItem::new("Copy Row as SQL INSERT").on_select_tx(move |s: &mut AppState, tx: &mut Tx| {
+            tx.copy(insert_text.clone());
+            s.set_notice("Copied row as SQL INSERT", false);
+        }))
+        .on_close(|s: &mut AppState| {
+            if let Some(t) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+                t.row_menu = None;
+            }
+        })
+        .build(k, layer)
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+}
+
+fn mount_fk_peek_popover(peek: &FkPeekState, k: &Kit, layer: &mut Vec<El>) {
+    let c = &k.c;
+    let fk_jump = peek.fk.clone();
+    let val_jump = peek.value.clone();
+    let col_jump = peek.source_col.clone();
+
+    let mut card = col()
+        .key("fk-peek-card")
+        .role("dialog")
+        .label(format!("Referenced {}.{} row", peek.fk.target_schema, peek.fk.target_table))
+        .w(320.0)
+        .padding(12.0)
+        .gap(10.0)
+        .child(
+            row()
+                .w_full()
+                .gap(6.0)
+                .center_y()
+                .child(icon(&icons::ARROW_UP_RIGHT, 13.0).color(c.text_accent))
+                .child(
+                    text(format!("{}.{}", peek.fk.target_schema, peek.fk.target_table))
+                        .font(k.ty.ui_medium)
+                        .color(c.text_base)
+                        .shrink()
+                        .truncate(),
+                )
+                .child(spacer())
+                .child(pill_badge(
+                    "fk-peek/cond-badge",
+                    format!("{} = {}", peek.fk.target_column, peek.value.display_compact()),
+                    c.layer_02,
+                    c.text_muted,
+                    c.border_muted,
+                    k,
+                ))
+                .child(
+                    IconButton::new(k.glyph.close)
+                        .variant(IconButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Mini)
+                        .label("Close foreign key peek")
+                        .on_press(|s: &mut AppState| s.close_fk_peek())
+                        .build(k)
+                        .key("fk-peek-close-btn"),
+                ),
+        )
+        .child(Divider::horizontal().build(k));
+
+    if peek.loading {
+        card = card.child(
+            row()
+                .w_full()
+                .py(18.0)
+                .center()
+                .gap(8.0)
+                .child(Spinner::new().size(14.0).color(c.text_accent).build(k))
+                .child(text("Fetching referenced row…").font(k.ty.ui_compact).color(c.text_muted)),
+        );
+    } else if let Some(err) = &peek.error {
+        card = card.child(text(err).font(k.ty.ui_compact).color(c.danger.fg).w_full().wrap());
+    } else if let Some(res) = &peek.result {
+        if let Some(row_vals) = &res.row {
+            let mut fields = col().w_full().gap(6.0);
+            for (idx, (col_meta, cell)) in res.columns.iter().zip(row_vals.iter()).take(8).enumerate() {
+                fields = fields.child(
+                    row()
+                        .key(format!("fk-peek-field-{idx}"))
+                        .w_full()
+                        .gap(8.0)
+                        .center_y()
+                        .child(
+                            text(&col_meta.name)
+                                .font(k.ty.small_medium)
+                                .color(c.text_muted)
+                                .w(104.0)
+                                .truncate(),
+                        )
+                        .child(
+                            text(cell.display_compact())
+                                .font(k.ty.small.mono())
+                                .color(if cell.is_null() { c.text_faint } else { c.text_base })
+                                .grow(1.0)
+                                .shrink()
+                                .truncate(),
+                        ),
+                );
+            }
+            card = card.child(fields);
+        } else {
+            card = card.child(
+                text("Referenced row was not found.")
+                    .font(k.ty.ui_compact)
+                    .color(c.text_muted),
+            );
+        }
+    }
+
+    if let Some(filter_sql) = build_fk_where_clause(&peek.fk.target_column, &peek.value, &peek.source_col) {
+        let _ = filter_sql;
+        card = card.child(
+            row()
+                .w_full()
+                .pt(2.0)
+                .gap(8.0)
+                .child(spacer())
+                .child(
+                    Button::new("Open in Tab →")
+                        .variant(ButtonVariant::Contrast)
+                        .control_size(ControlSize::Small)
+                        .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                            s.jump_to_foreign_key(fk_jump.clone(), val_jump.clone(), col_jump.clone(), tx);
+                        })
+                        .build(k)
+                        .key("fk-peek-open-tab-btn"),
+                ),
+        );
+    }
+
+    layer.push(scrim("fk-peek-scrim", |s: &mut AppState| s.close_fk_peek()));
+    let surface = popover::raised(k, card, k.radius.md);
+    layer.push(popover::anchored(
+        k,
+        surface,
+        &peek.anchor_key,
+        Placement::BottomEnd,
+        6.0,
+    ));
 }
 
 fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
@@ -824,7 +1382,7 @@ fn build_indexes_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
     .min_h(0.0)
 }
 
-fn build_table_footer(_session: &SessionState, tab: &TableTabState, k: &Kit, layer: &mut Vec<El>) -> El {
+fn build_table_footer(session: &SessionState, tab: &TableTabState, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &k.c;
 
     let view_switch = SegmentedControl::new(&["Data", "Structure", "Indexes"], Some(tab.view_mode.index()))
@@ -854,12 +1412,62 @@ fn build_table_footer(_session: &SessionState, tab: &TableTabState, k: &Kit, lay
         .w_full()
         .h(38.0)
         .px(10.0)
-        .gap(10.0)
+        .gap(8.0)
         .center_y()
         .fill(c.layer_01)
         .border_sides([1.0, 0.0, 0.0, 0.0], c.border_muted)
-        .child(view_switch)
-        .child(spacer());
+        .child(view_switch);
+
+    if tab.view_mode == TableViewMode::Data {
+        let can_edit = tab.can_edit_table(session.profile.safety).is_ok() && tab.columns().is_some();
+        let can_delete = can_edit
+            && tab.active_row_key().is_some_and(|rk| match rk {
+                RowKey::Draft(_) => true,
+                RowKey::Existing(_) => tab.has_primary_key(),
+            });
+        let can_export = tab.page.as_ref().is_some_and(|p| !p.columns.is_empty());
+
+        bar = bar
+            .child(
+                Button::new("Row")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Mini)
+                    .icon(&icons::PLUS)
+                    .disabled(!can_edit)
+                    .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                        s.insert_staged_row(tx);
+                    })
+                    .build(k)
+                    .key("table-insert-row-btn"),
+            )
+            .child(
+                IconButton::new(&icons::TRASH)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Mini)
+                    .label("Delete selected row")
+                    .help("Toggle delete on selected row")
+                    .disabled(!can_delete)
+                    .on_press(|s: &mut AppState| s.toggle_delete_selected_row())
+                    .build(k)
+                    .key("table-delete-row-btn"),
+            )
+            .child(
+                IconButton::new(&icons::DOWNLOAD)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .control_size(ControlSize::Mini)
+                    .label("Export data")
+                    .help("Export table page (⌘E)")
+                    .shortcut("mod+e")
+                    .disabled(!can_export)
+                    .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                        s.open_export_modal_for_active_tab(tx);
+                    })
+                    .build(k)
+                    .key("table-export-btn"),
+            );
+    }
+
+    bar = bar.child(spacer());
 
     if (tab.view_mode == TableViewMode::Data && tab.page_loading)
         || (tab.view_mode != TableViewMode::Data && tab.structure_loading)
@@ -993,7 +1601,7 @@ pub(crate) fn render_cell_value(
     radius_xs: f32,
 ) -> Cell {
     match val {
-        CellValue::Null => Cell::el(null_pill_el(null_bg, null_fg, null_border, small_font, radius_xs)),
+        CellValue::Null => Cell::el(cell_pill_el("NULL", null_bg, null_fg, null_border, small_font, radius_xs)),
         CellValue::Bool(b) => Cell::text(if *b { "true" } else { "false" })
             .mono()
             .color(if *b { bool_true_fg } else { muted_fg }),
@@ -1024,7 +1632,7 @@ pub(crate) fn initial_col_width(col: &ColumnMeta) -> f32 {
     base.max(header_fit)
 }
 
-fn null_pill_el(bg: Color, fg: Color, border: Color, font: TextStyle, radius: f32) -> El {
+fn cell_pill_el(label: &'static str, bg: Color, fg: Color, border: Color, font: TextStyle, radius: f32) -> El {
     row()
         .h(18.0)
         .px(6.0)
@@ -1032,7 +1640,7 @@ fn null_pill_el(bg: Color, fg: Color, border: Color, font: TextStyle, radius: f3
         .radius(radius)
         .fill(bg)
         .border(0.5, border)
-        .child(text("NULL").font(font).color(fg))
+        .child(text(label).font(font).color(fg))
 }
 
 /// Formats a byte preview helper cleanly for external views (used in inspector as well).

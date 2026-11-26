@@ -5,15 +5,21 @@ use rune_kit::{Button, ButtonVariant, ControlSize, Divider, IconButton, IconButt
 use tv_core::{CellValue, ColumnMeta};
 
 use crate::icons;
-use crate::state::{AppState, QueryTabState, SessionState, TableTabState, TableViewMode};
+use crate::state::{AppState, QueryTabState, RowKey, SessionState, TableTabState, TableViewMode};
 use crate::views::table_grid::format_bytes_preview;
 use crate::views::{format_bytes, pill_badge};
 
-struct SelectedRowView<'a> {
+struct SelectedRowView {
     row_number: usize,
-    columns: &'a [ColumnMeta],
-    cells: &'a [CellValue],
-    search: &'a TextEdit,
+    row_badge: String,
+    row_key: Option<RowKey>,
+    editable: bool,
+    is_draft: bool,
+    is_deleted: bool,
+    edited_cols: Vec<bool>,
+    columns: Vec<ColumnMeta>,
+    cells: Vec<CellValue>,
+    search: TextEdit,
     json_pretty: bool,
     clear_help: &'static str,
 }
@@ -26,17 +32,59 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
 
     let selected_row_info = if let Some(tab) = active_table {
         if tab.view_mode == TableViewMode::Data {
-            tab.page.as_ref().and_then(|page| {
-                let idx = tab.selected_row?;
-                let cells = page.rows.get(idx)?;
-                Some(SelectedRowView {
-                    row_number: (tab.offset + idx as i64 + 1).max(1) as usize,
-                    columns: &page.columns,
-                    cells,
-                    search: &tab.inspector_search,
-                    json_pretty: tab.inspector_json_pretty,
-                    clear_help: "Back to table details",
-                })
+            tab.active_row_key().and_then(|rk| {
+                let cols = tab.columns()?.to_vec();
+                match rk {
+                    RowKey::Draft(id) => {
+                        tab.staged.insert_row(id)?;
+                        let visual_idx = tab.row_key_to_visual_idx(rk).unwrap_or(0);
+                        let cells: Vec<CellValue> = (0..cols.len())
+                            .map(|c| tab.effective_cell(rk, c))
+                            .collect();
+                        let editable = tab.can_edit_table(session.profile.safety).is_ok();
+                        Some(SelectedRowView {
+                            row_number: visual_idx + 1,
+                            row_badge: format!("New Row #{}", id.get()),
+                            row_key: Some(rk),
+                            editable,
+                            is_draft: true,
+                            is_deleted: false,
+                            edited_cols: vec![true; cols.len()],
+                            columns: cols,
+                            cells,
+                            search: tab.inspector_search.clone(),
+                            json_pretty: tab.inspector_json_pretty,
+                            clear_help: "Back to table details",
+                        })
+                    }
+                    RowKey::Existing(idx) => {
+                        let page = tab.page.as_ref()?;
+                        page.rows.get(idx)?;
+                        let cells: Vec<CellValue> = (0..cols.len())
+                            .map(|c| tab.effective_cell(rk, c))
+                            .collect();
+                        let edited_cols: Vec<bool> = (0..cols.len())
+                            .map(|c| tab.staged.effective_existing_cell(idx, c).is_some())
+                            .collect();
+                        let editable =
+                            tab.can_edit_table(session.profile.safety).is_ok() && tab.has_primary_key();
+                        let row_num = (tab.offset + idx as i64 + 1).max(1) as usize;
+                        Some(SelectedRowView {
+                            row_number: row_num,
+                            row_badge: format!("Row #{row_num}"),
+                            row_key: Some(rk),
+                            editable,
+                            is_draft: false,
+                            is_deleted: tab.staged.is_row_deleted(idx),
+                            edited_cols,
+                            columns: cols,
+                            cells,
+                            search: tab.inspector_search.clone(),
+                            json_pretty: tab.inspector_json_pretty,
+                            clear_help: "Back to table details",
+                        })
+                    }
+                }
             })
         } else {
             None
@@ -47,9 +95,15 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
             let cells = res.statement.rows.get(idx)?;
             Some(SelectedRowView {
                 row_number: idx + 1,
-                columns: &res.statement.columns,
-                cells,
-                search: &q.inspector_search,
+                row_badge: format!("Row #{}", idx + 1),
+                row_key: None,
+                editable: false,
+                is_draft: false,
+                is_deleted: false,
+                edited_cols: vec![false; res.statement.columns.len()],
+                columns: res.statement.columns.clone(),
+                cells: cells.clone(),
+                search: q.inspector_search.clone(),
                 json_pretty: q.inspector_json_pretty,
                 clear_help: "Back to query summary",
             })
@@ -63,17 +117,37 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
         .w_full()
         .h(40.0)
         .px(12.0)
-        .gap(8.0)
+        .gap(6.0)
         .center_y()
         .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
         .child(text("Details").font(k.ty.ui_medium).color(c.text_base));
 
     if let Some(ref sel) = selected_row_info {
+        let _ = sel.row_number;
+        header = header.child(spacer());
+        if sel.is_deleted {
+            header = header.child(pill_badge(
+                "inspector/row-status",
+                "Deleted",
+                c.danger.bg,
+                c.danger.fg,
+                c.danger.border,
+                k,
+            ));
+        } else if sel.is_draft {
+            header = header.child(pill_badge(
+                "inspector/row-status",
+                "Staged",
+                c.success.bg,
+                c.success.fg,
+                c.success.border,
+                k,
+            ));
+        }
         header = header
-            .child(spacer())
             .child(pill_badge(
                 "inspector/row-badge",
-                format!("Row #{}", sel.row_number),
+                &sel.row_badge,
                 c.layer_02,
                 c.text_accent,
                 c.border_base,
@@ -144,7 +218,7 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
     root.child(body)
 }
 
-fn build_row_fields_body(sel: &SelectedRowView<'_>, k: &Kit) -> El {
+fn build_row_fields_body(sel: &SelectedRowView, k: &Kit) -> El {
     let c = &k.c;
     let query = sel.search.text.trim().to_ascii_lowercase();
     let mut fields_col = col().key("inspector-row-fields").w_full().padding(12.0).gap(12.0);
@@ -158,7 +232,8 @@ fn build_row_fields_body(sel: &SelectedRowView<'_>, k: &Kit) -> El {
             continue;
         }
         shown += 1;
-        fields_col = fields_col.child(build_typed_field(idx, col_meta, val, sel.json_pretty, k));
+        let is_edited = sel.edited_cols.get(idx).copied().unwrap_or(false);
+        fields_col = fields_col.child(build_typed_field(idx, col_meta, val, sel, is_edited, k));
     }
 
     if shown == 0 {
@@ -187,7 +262,8 @@ fn build_typed_field(
     idx: usize,
     col_meta: &ColumnMeta,
     val: &CellValue,
-    json_pretty: bool,
+    sel: &SelectedRowView,
+    is_edited: bool,
     k: &Kit,
 ) -> El {
     let c = &k.c;
@@ -196,7 +272,7 @@ fn build_typed_field(
 
     let mut label_row = row()
         .w_full()
-        .gap(6.0)
+        .gap(5.0)
         .center_y()
         .child(
             text(&col_meta.name)
@@ -215,6 +291,23 @@ fn build_typed_field(
             k,
         ));
     }
+    if let Some(ref fk) = col_meta.foreign_key
+        && !val.is_null()
+    {
+        let fk_jump = fk.clone();
+        let val_jump = val.clone();
+        let col_jump = col_meta.clone();
+        label_row = label_row.child(
+            Button::new(format!("→ {}", fk.target_table))
+                .variant(ButtonVariant::Ghost)
+                .control_size(ControlSize::Mini)
+                .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                    s.jump_to_foreign_key(fk_jump.clone(), val_jump.clone(), col_jump.clone(), tx);
+                })
+                .build(k)
+                .key(format!("inspector/fk/{idx}")),
+        );
+    }
     label_row = label_row
         .child(spacer())
         .child(
@@ -226,11 +319,26 @@ fn build_typed_field(
 
     if matches!(val, CellValue::Json(_)) {
         label_row = label_row.child(
-            Button::new(if json_pretty { "Raw" } else { "Pretty" })
+            Button::new(if sel.json_pretty { "Raw" } else { "Pretty" })
                 .variant(ButtonVariant::GhostMuted)
                 .control_size(ControlSize::Mini)
                 .on_press(|s: &mut AppState| s.toggle_active_inspector_json_pretty())
                 .build(k),
+        );
+    }
+
+    if sel.editable && !sel.is_deleted && let Some(row_key) = sel.row_key {
+        label_row = label_row.child(
+            IconButton::new(&icons::EDIT_PENCIL)
+                .variant(IconButtonVariant::GhostMuted)
+                .control_size(ControlSize::Mini)
+                .label(format!("Edit {}", col_meta.name))
+                .help("Edit value in grid")
+                .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+                    s.begin_cell_edit(row_key, idx, tx);
+                })
+                .build(k)
+                .key(format!("inspector/edit/{idx}")),
         );
     }
 
@@ -247,6 +355,25 @@ fn build_typed_field(
             .build(k),
     );
 
+    let box_fill = if sel.is_deleted {
+        c.danger.bg
+    } else if sel.is_draft {
+        c.success.bg
+    } else if is_edited {
+        c.warning.bg
+    } else {
+        c.layer_01
+    };
+    let box_border = if sel.is_deleted {
+        c.danger.border
+    } else if sel.is_draft {
+        c.success.border
+    } else if is_edited {
+        c.warning.border
+    } else {
+        c.border_muted
+    };
+
     let value_box = col()
         .key(format!("inspector/field/{idx}"))
         .w_full()
@@ -254,8 +381,8 @@ fn build_typed_field(
         .py(7.0)
         .gap(4.0)
         .radius(k.radius.sm)
-        .fill(c.layer_01)
-        .border(0.5, c.border_muted);
+        .fill(box_fill)
+        .border(0.5, box_border);
 
     let populated = match val {
         CellValue::Null => value_box.child(row().child(pill_badge(
@@ -267,7 +394,7 @@ fn build_typed_field(
             k,
         ))),
         CellValue::Json(raw) => {
-            let text_to_show = if json_pretty {
+            let text_to_show = if sel.json_pretty {
                 val.pretty_json().unwrap_or_else(|| raw.clone())
             } else {
                 raw.clone()

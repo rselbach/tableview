@@ -1,9 +1,11 @@
 #![allow(clippy::expect_used)]
 
 use rune::{Env, Key, KeyEvent, Mods, Runtime};
+use rune_kit::diff::DiffMode;
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
-use tv_app::state::{AppState, OverlayState, PickerKind, Screen, TableViewMode};
+use tv_app::state::{AppState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
 use tv_app::views;
+use tv_core::{EnvTag, ExportFormat, SafetyPolicy};
 
 fn sample_runtime(dark: bool) -> Runtime<AppState> {
     let mut state = AppState::init_in_memory(sample_store_data());
@@ -536,4 +538,264 @@ fn sidebar_queries_and_history_open_without_duplicating_saved_tabs() {
     rt.pointer_up(hx, hy);
     rt.frame(0.1);
     assert_eq!(rt.state.active_session().expect("session").tabs.len(), 5);
+}
+
+#[test]
+fn milestone4_inline_editing_insert_delete_and_staged_diff_drawer() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    rt.frame(0.5);
+
+    // Click "+ Row" -> inserts draft row and focuses inline-cell-editor.
+    let (ix, iy) = rt.find("table-insert-row-btn").expect("insert row btn");
+    rt.pointer_down(ix, iy);
+    rt.pointer_up(ix, iy);
+    rt.frame(0.5);
+    assert!(rt.find("inline-cell-editor").is_some());
+
+    // Clear auto-selected text by typing and submit via Enter.
+    rt.key(KeyEvent::from(Key::Text("Señor Chang".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    let tab = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert_eq!(tab.staged.insert_count(), 1);
+
+    // Programmatically begin edit on existing row 0 full_name (col 2), enter new value & commit.
+    rt.update(|s, tx| {
+        s.begin_cell_edit(RowKey::Existing(0), 2, tx);
+    });
+    rt.frame(0.2);
+    rt.key(KeyEvent::from(Key::Text("Troy Updated".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    // Mark Jeff Winger (existing row 3) for deletion.
+    rt.update(|s, _| {
+        s.toggle_delete_row(RowKey::Existing(3));
+    });
+    rt.frame(0.1);
+
+    let tab = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert_eq!(tab.staged.update_count(), 1);
+    assert_eq!(tab.staged.delete_count(), 1);
+    assert!(rt.find("table-staged-banner").is_some());
+
+    // Press Cmd+S on a table tab with staged changes -> opens staged diff drawer.
+    rt.key(KeyEvent {
+        key: Key::Command('s'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.5);
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .diff_drawer_open
+    );
+    assert!(rt.find("staged-diff-drawer").is_some());
+
+    // Switch Unified -> Split diff mode.
+    let (sx, sy) = rt
+        .find("staged-diff-mode-switch/segment1")
+        .expect("Split segment");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.1);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .diff_state
+            .mode(),
+        DiffMode::Split
+    );
+
+    // Discard staged changes via drawer button.
+    let (dx, dy) = rt.find("staged-discard-btn").expect("discard btn");
+    rt.pointer_down(dx, dy);
+    rt.pointer_up(dx, dy);
+    rt.frame(0.1);
+    let tab_after = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert!(!tab_after.diff_drawer_open);
+    assert!(tab_after.staged.is_empty());
+}
+
+#[test]
+fn milestone4_safety_policies_block_and_gate_production_destructive_writes() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sql-editor-dark");
+    rt.frame(0.5);
+
+    // Set ReadOnly and replace SQL with a DELETE statement -> blocked immediately without modal.
+    rt.update(|s, _| {
+        let sess = s.active_session_mut().expect("session");
+        sess.profile.safety = SafetyPolicy::ReadOnly;
+        let q = sess.active_query_tab_mut().expect("query tab");
+        q.editor = rune::TextEdit::new("DELETE FROM public.students WHERE student_id = 4;");
+        s.run_active_query(true);
+    });
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+    let err = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_query_tab()
+        .expect("query tab")
+        .batch_error
+        .as_deref()
+        .expect("blocked error");
+    assert!(err.contains("Read-Only"), "unexpected block msg: {err}");
+
+    // Production + ConfirmWrites on DELETE without WHERE -> opens SafetyConfirm with destructive gate.
+    rt.update(|s, _| {
+        let sess = s.active_session_mut().expect("session");
+        sess.profile.env = EnvTag::Production;
+        sess.profile.safety = SafetyPolicy::ConfirmWrites;
+        let q = sess.active_query_tab_mut().expect("query tab");
+        q.batch_error = None;
+        q.editor = rune::TextEdit::new("DELETE FROM public.students;");
+        s.run_active_query(true);
+    });
+    rt.frame(0.5);
+    assert!(matches!(
+        rt.state.overlay,
+        OverlayState::SafetyConfirm(ref m) if m.is_destructive && !m.destructive_ack
+    ));
+    assert!(rt.find("safety-confirm-modal-dialog").is_some());
+    assert!(rt.find("safety-prod-ack").is_some());
+
+    // Toggle Production destructive acknowledgement checkbox and cancel cleanly.
+    let (ax, ay) = rt.find("safety-prod-ack").expect("prod ack checkbox");
+    rt.pointer_down(ax, ay);
+    rt.pointer_up(ax, ay);
+    rt.frame(0.1);
+    assert!(matches!(
+        rt.state.overlay,
+        OverlayState::SafetyConfirm(ref m) if m.destructive_ack
+    ));
+
+    let (cx, cy) = rt.find("safety-cancel-btn").expect("safety cancel");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+}
+
+#[test]
+fn milestone4_fk_peek_opens_and_jumps_to_referenced_table_tab() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-fk-peek");
+    rt.frame(0.5);
+
+    assert!(rt.find("fk-peek-card").is_some());
+    assert!(rt.find("fk-peek-open-tab-btn").is_some());
+
+    let (jx, jy) = rt.find("fk-peek-open-tab-btn").expect("Open in Tab button");
+    rt.pointer_down(jx, jy);
+    rt.pointer_up(jx, jy);
+    rt.frame(0.2);
+
+    let tab = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("jumped table tab");
+    assert_eq!(tab.schema, "public");
+    assert_eq!(tab.object_name, "study_groups");
+    assert_eq!(tab.applied_filter.as_deref(), Some("\"group_id\" = 1"));
+    assert!(tab.fk_peek.is_none());
+}
+
+#[test]
+fn milestone4_visual_explain_renders_and_toggles_json() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-explain-plan");
+    rt.frame(0.5);
+
+    assert!(rt.find("explain-pane-root").is_some());
+    assert!(rt.find("explain/node/0").is_some());
+    assert!(rt.find("explain-json-scroll").is_none());
+
+    let (jx, jy) = rt.find("explain-mode-switch/segment1").expect("JSON segment");
+    rt.pointer_down(jx, jy);
+    rt.pointer_up(jx, jy);
+    rt.frame(0.1);
+
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_query_tab()
+            .expect("query tab")
+            .explain_raw_json
+    );
+    assert!(rt.find("explain-json-scroll").is_some());
+}
+
+#[test]
+fn milestone4_export_modal_switches_formats_and_copies() {
+    let mut rt = sample_runtime(false);
+    apply_scene(&mut rt, "workspace-export-modal");
+    rt.frame(0.5);
+
+    assert!(rt.find("export-modal-dialog").is_some());
+    assert!(rt.find("export-table-name").is_some());
+
+    // Switch to JSON then back to CSV, then SQL INSERT and Copy.
+    let (jx, jy) = rt.find("export-format-switch/segment1").expect("JSON segment");
+    rt.pointer_down(jx, jy);
+    rt.pointer_up(jx, jy);
+    rt.frame(0.1);
+    assert!(matches!(
+        rt.state.overlay,
+        OverlayState::Export(ref m) if m.format == ExportFormat::Json
+    ));
+
+    let (sx, sy) = rt.find("export-format-switch/segment2").expect("SQL INSERT segment");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.1);
+    assert!(matches!(
+        rt.state.overlay,
+        OverlayState::Export(ref m) if m.format == ExportFormat::SqlInsert
+    ));
+
+    let (cx, cy) = rt.find("export-copy-btn").expect("Copy to Clipboard button");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+    assert!(
+        rt.state
+            .status_notice
+            .as_ref()
+            .is_some_and(|(msg, is_err)| !is_err && msg.contains("Copied 8 rows as SQL INSERT"))
+    );
 }
