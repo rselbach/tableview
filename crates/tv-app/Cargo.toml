@@ -1,0 +1,17 @@
+[package]
+name = "tv-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+rune.workspace = true
+rune-kit.workspace = true
+tokio.workspace = true
+tv-core.workspace = true
+url.workspace = true
+uuid.workspace = true
