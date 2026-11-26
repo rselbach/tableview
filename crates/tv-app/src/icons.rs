@@ -96,3 +96,33 @@ pub static FILTER: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M2.5 4H13.5M4.8 8H11.2M6.8 12H9.2" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>"#,
 };
+
+pub static COPY: Icon = Icon {
+    name: "tv-copy",
+    view: 16.0,
+    body: r#"<rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4V9A1.5 1.5 0 0 0 4 10.5H5.5" stroke="currentColor" stroke-width="1.2" fill="none"/>"#,
+};
+
+pub static CODE_DDL: Icon = Icon {
+    name: "tv-code-ddl",
+    view: 16.0,
+    body: r#"<path d="M5.5 4.5L2 8L5.5 11.5M10.5 4.5L14 8L10.5 11.5M9 3.5L7 12.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static INDEX_BOLT: Icon = Icon {
+    name: "tv-index-bolt",
+    view: 16.0,
+    body: r#"<path d="M9 2L4.5 8.5H8L7 14L11.5 7.5H8L9 2Z" stroke="currentColor" stroke-width="1.15" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static CHEVRON_LEFT: Icon = Icon {
+    name: "tv-chevron-left",
+    view: 16.0,
+    body: r#"<path d="M10 3.5L5.5 8L10 12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+pub static CHEVRON_RIGHT: Icon = Icon {
+    name: "tv-chevron-right",
+    view: 16.0,
+    body: r#"<path d="M6 3.5L10.5 8L6 12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};

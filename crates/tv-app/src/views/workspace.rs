@@ -2,7 +2,7 @@ use rune::{Cx, El, ScrollSpec, Tx, col, el, icon, rich, row, spacer, text};
 use rune_kit::shell::SidebarToggle;
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, Divider, IconButton, IconButtonVariant, Kit, SegmentedControl, Select,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, SegmentedControl, Select,
     SelectAppearance, Sidebar, Spinner, SplitView, TextInput, Toolbar,
 };
 use tv_core::{DbObject, DbObjectKind, SafetyPolicy};
@@ -10,10 +10,11 @@ use tv_core::{DbObject, DbObjectKind, SafetyPolicy};
 use crate::icons;
 use crate::platform::{self, Action};
 use crate::state::{
-    AppState, ColumnLoadState, ConnectedData, ConnectionState, PickerKind, SessionState, SidebarTab,
+    AppState, ColumnLoadState, ConnectedData, ConnectionState, PickerKind, SessionState, SidebarTab, TabContent,
+    WorkspaceTab,
 };
 use crate::theme;
-use crate::views::{empty_cta, format_bytes, pill_badge};
+use crate::views::{empty_cta, inspector, pill_badge, table_grid};
 
 /// Builds the full database workspace screen (`SplitView` + environment strip + console).
 pub fn build(
@@ -31,8 +32,8 @@ pub fn build(
     let sid = session.id;
     let toolbar = build_toolbar(s, session, k);
     let sidebar = build_sidebar(session, k, layer);
-    let inspector = build_inspector(session, k);
-    let main = build_main_pane(session, k);
+    let inspector_pane = inspector::build(session, k);
+    let main = build_main_pane(s, session, k, cx, layer);
 
     let split = SplitView::new(main)
         .sidebar(
@@ -43,7 +44,7 @@ pub fn build(
         .inspector(
             &session.inspector_pane,
             move |s: &mut AppState| s.inspector_pane_mut(sid),
-            inspector,
+            inspector_pane,
         )
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
@@ -237,7 +238,11 @@ fn build_status_pill(session: &SessionState, k: &Kit) -> El {
             if let Some(db) = &data.active_database {
                 summary.push_str(&format!(" : {db}"));
             }
-            if let Some((schema, obj)) = &data.selected_object {
+            let active_obj = session
+                .active_tab()
+                .and_then(WorkspaceTab::schema_and_name)
+                .or_else(|| data.selected_object.as_ref().map(|(s, o)| (s.as_str(), o.as_str())));
+            if let Some((schema, obj)) = active_obj {
                 summary.push_str(&format!(" : {schema}.{obj}"));
             }
             row()
@@ -572,8 +577,14 @@ fn build_object_item(data: &ConnectedData, obj: &DbObject, k: &Kit) -> El {
     wrapper
 }
 
-fn build_main_pane(session: &SessionState, k: &Kit) -> El {
-    let stage = build_stage(session, k);
+fn build_main_pane(
+    s: &AppState,
+    session: &SessionState,
+    k: &Kit,
+    cx: &Cx<AppState>,
+    layer: &mut Vec<El>,
+) -> El {
+    let stage = build_stage(s, session, k, cx, layer);
     let mut main = col().key("workspace-main-inner").w_full().h_full().min_h(0.0).child(stage);
     if session.console_open {
         main = main.child(build_console_drawer(session, k));
@@ -581,7 +592,13 @@ fn build_main_pane(session: &SessionState, k: &Kit) -> El {
     main
 }
 
-fn build_stage(session: &SessionState, k: &Kit) -> El {
+fn build_stage(
+    s: &AppState,
+    session: &SessionState,
+    k: &Kit,
+    cx: &Cx<AppState>,
+    layer: &mut Vec<El>,
+) -> El {
     let c = &k.c;
     match &session.status {
         ConnectionState::Disconnected { reason } => col()
@@ -647,35 +664,45 @@ fn build_stage(session: &SessionState, k: &Kit) -> El {
             let Some(active_db) = &data.active_database else {
                 return build_no_db_stage(data, k);
             };
-            let Some((schema, name)) = &data.selected_object else {
+            if let Some(active_tab) = session.active_tab() {
+                let tab_bar = table_grid::build_tab_bar(session, k, cx);
+                let body = match &active_tab.content {
+                    TabContent::Table(table_tab) => table_grid::build_table_tab(s, session, table_tab, k, layer),
+                };
                 return col()
-                    .key("stage-ready")
+                    .key("stage-tabs-shell")
                     .w_full()
                     .grow(1.0)
                     .min_h(0.0)
-                    .center()
-                    .gap(10.0)
-                    .padding(32.0)
-                    .child(icon(&icons::LOGO, 38.0).color(c.icon_faint))
-                    .child(text(format!("{active_db} ready")).font(k.ty.body_medium).color(c.text_base))
-                    .child(
-                        text("Select a table or view in the sidebar, or press ⌘P to jump directly.")
-                            .font(k.ty.ui)
-                            .color(c.text_muted),
-                    )
-                    .child(
-                        row()
-                            .gap(8.0)
-                            .pt(4.0)
-                            .child(empty_cta("Jump to Object (⌘P)", k, true, |s, tx| {
-                                s.open_picker(PickerKind::QuickJump, tx);
-                            }))
-                            .child(empty_cta("Switch Database (⌘K)", k, false, |s, tx| {
-                                s.open_picker(PickerKind::Database, tx);
-                            })),
-                    );
-            };
-            build_object_summary(data, schema, name, k)
+                    .child(tab_bar)
+                    .child(body);
+            }
+            col()
+                .key("stage-ready")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .center()
+                .gap(10.0)
+                .padding(32.0)
+                .child(icon(&icons::LOGO, 38.0).color(c.icon_faint))
+                .child(text(format!("{active_db} ready")).font(k.ty.body_medium).color(c.text_base))
+                .child(
+                    text("Select a table or view in the sidebar, or press ⌘P to jump directly.")
+                        .font(k.ty.ui)
+                        .color(c.text_muted),
+                )
+                .child(
+                    row()
+                        .gap(8.0)
+                        .pt(4.0)
+                        .child(empty_cta("Jump to Object (⌘P)", k, true, |s, tx| {
+                            s.open_picker(PickerKind::QuickJump, tx);
+                        }))
+                        .child(empty_cta("Switch Database (⌘K)", k, false, |s, tx| {
+                            s.open_picker(PickerKind::Database, tx);
+                        })),
+                )
         }
     }
 }
@@ -718,150 +745,6 @@ fn build_no_db_stage(data: &ConnectedData, k: &Kit) -> El {
             s.open_picker(PickerKind::Database, tx);
         }))
         .child(quick_dbs)
-}
-
-fn build_object_summary(data: &ConnectedData, schema: &str, name: &str, k: &Kit) -> El {
-    let c = &k.c;
-    let obj = data
-        .objects
-        .iter()
-        .find(|o| o.schema == schema && o.name == name);
-    let kind_label = obj.map_or("Object", |o| o.kind.label());
-    let rows_label = obj
-        .and_then(|o| o.estimated_rows)
-        .map_or_else(|| "—".to_owned(), |r| format!("~{r}"));
-    let size_label = obj
-        .and_then(|o| o.total_bytes)
-        .map_or_else(|| "—".to_owned(), format_bytes);
-
-    let header = row()
-        .w_full()
-        .px(20.0)
-        .py(14.0)
-        .gap(12.0)
-        .center_y()
-        .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
-        .child(pill_badge(
-            "stage/obj-kind",
-            kind_label,
-            c.layer_02,
-            c.text_accent,
-            c.border_base,
-            k,
-        ))
-        .child(
-            text(format!("{schema}.{name}"))
-                .font(k.ty.body_medium)
-                .color(c.text_base)
-                .grow(1.0)
-                .shrink()
-                .truncate(),
-        )
-        .child(text(format!("Rows: {rows_label}")).font(k.ty.small).color(c.text_muted))
-        .child(text(format!("Size: {size_label}")).font(k.ty.small).color(c.text_muted))
-        .child(pill_badge(
-            "stage/m2-pill",
-            "Data grid in Milestone 2",
-            c.layer_02,
-            c.text_faint,
-            c.border_muted,
-            k,
-        ));
-
-    let cols_panel = match data.expanded_columns.get(&(schema.to_owned(), name.to_owned())) {
-        Some(ColumnLoadState::Loaded(cols)) => {
-            let mut list = col().w_full().padding(20.0).gap(4.0).child(
-                row()
-                    .w_full()
-                    .h(28.0)
-                    .px(10.0)
-                    .gap(12.0)
-                    .center_y()
-                    .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
-                    .child(text("#").font(k.ty.small_medium).color(c.text_faint).w(28.0))
-                    .child(text("Column").font(k.ty.small_medium).color(c.text_faint).grow(1.5))
-                    .child(text("Type").font(k.ty.small_medium).color(c.text_faint).grow(1.5))
-                    .child(text("Nullable").font(k.ty.small_medium).color(c.text_faint).w(72.0))
-                    .child(text("Key").font(k.ty.small_medium).color(c.text_faint).w(48.0)),
-            );
-            for (idx, col_info) in cols.iter().enumerate() {
-                list = list.child(
-                    row()
-                        .key(format!("stage/col/{}", col_info.name))
-                        .w_full()
-                        .h(30.0)
-                        .px(10.0)
-                        .gap(12.0)
-                        .center_y()
-                        .radius(k.radius.sm)
-                        .fill(if idx % 2 == 1 { c.layer_01 } else { rune::Color::TRANSPARENT })
-                        .child(text((idx + 1).to_string()).font(k.ty.mono).color(c.text_faint).w(28.0))
-                        .child(
-                            text(&col_info.name)
-                                .font(k.ty.ui_medium)
-                                .color(c.text_base)
-                                .grow(1.5)
-                                .shrink()
-                                .truncate(),
-                        )
-                        .child(
-                            text(&col_info.data_type)
-                                .font(k.ty.mono)
-                                .color(c.text_accent)
-                                .grow(1.5)
-                                .shrink()
-                                .truncate(),
-                        )
-                        .child(
-                            text(if col_info.nullable { "NULL" } else { "NOT NULL" })
-                                .font(k.ty.small)
-                                .color(c.text_muted)
-                                .w(72.0),
-                        )
-                        .child(
-                            text(if col_info.is_primary_key { "PK" } else { "" })
-                                .font(k.ty.small_medium)
-                                .color(c.warning.fg)
-                                .w(48.0),
-                        ),
-                );
-            }
-            k.scroll_bar(
-                col()
-                    .key("stage-cols-scroll")
-                    .w_full()
-                    .grow(1.0)
-                    .min_h(0.0)
-                    .scroll(ScrollSpec { stick_bottom: false })
-                    .child(list),
-            )
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-        }
-        Some(ColumnLoadState::Error(err)) => col()
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .center()
-            .child(text(err).font(k.ty.ui).color(c.danger.fg)),
-        _ => col()
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .center()
-            .gap(8.0)
-            .child(Spinner::new().size(16.0).color(c.icon_muted).build(k))
-            .child(text("Loading table schema…").font(k.ty.ui).color(c.text_muted)),
-    };
-
-    col()
-        .key("stage-object-summary")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .child(header)
-        .child(cols_panel)
 }
 
 fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
@@ -966,128 +849,4 @@ fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
         .fill(c.bg_base)
         .child(header)
         .child(body)
-}
-
-fn build_inspector(session: &SessionState, k: &Kit) -> El {
-    let c = &k.c;
-    let header = row()
-        .key("inspector-header")
-        .w_full()
-        .h(40.0)
-        .px(14.0)
-        .center_y()
-        .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
-        .child(text("Details").font(k.ty.ui_medium).color(c.text_base));
-
-    let body = match session.status.as_connected() {
-        Some(data) if data.selected_object.is_some() => {
-            let Some((schema, name)) = &data.selected_object else {
-                return col();
-            };
-            let obj = data
-                .objects
-                .iter()
-                .find(|o| &o.schema == schema && &o.name == name);
-            let mut details = col().w_full().padding(14.0).gap(10.0);
-            details = details
-                .child(inspector_kv("schema", schema, k))
-                .child(inspector_kv("object", name, k))
-                .child(inspector_kv("kind", obj.map_or("Object", |o| o.kind.label()), k))
-                .child(inspector_kv(
-                    "estimated_rows",
-                    &obj.and_then(|o| o.estimated_rows)
-                        .map_or_else(|| "NULL".to_owned(), |r| r.to_string()),
-                    k,
-                ))
-                .child(inspector_kv(
-                    "total_size",
-                    &obj.and_then(|o| o.total_bytes)
-                        .map_or_else(|| "NULL".to_owned(), format_bytes),
-                    k,
-                ))
-                .child(Divider::horizontal().build(k));
-
-            if let Some(ColumnLoadState::Loaded(cols)) =
-                data.expanded_columns.get(&(schema.clone(), name.clone()))
-            {
-                details = details.child(
-                    text(format!("COLUMNS ({})", cols.len()))
-                        .font(k.ty.small_medium)
-                        .color(c.text_faint),
-                );
-                for col_info in cols {
-                    details = details.child(
-                        row()
-                            .w_full()
-                            .gap(6.0)
-                            .center_y()
-                            .child(
-                                text(&col_info.name)
-                                    .font(k.ty.ui_compact)
-                                    .color(c.text_base)
-                                    .grow(1.0)
-                                    .shrink()
-                                    .truncate(),
-                            )
-                            .child(
-                                text(&col_info.data_type)
-                                    .font(k.ty.small)
-                                    .color(c.text_muted)
-                                    .truncate(),
-                            ),
-                    );
-                }
-            }
-
-            k.scroll_bar(
-                col()
-                    .key("inspector-scroll")
-                    .w_full()
-                    .grow(1.0)
-                    .min_h(0.0)
-                    .scroll(ScrollSpec { stick_bottom: false })
-                    .child(details),
-            )
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-        }
-        _ => col()
-            .key("inspector-empty")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .center()
-            .padding(20.0)
-            .child(text("No object selected").font(k.ty.ui).color(c.text_muted)),
-    };
-
-    col()
-        .key("inspector-pane-inner")
-        .w_full()
-        .h_full()
-        .min_h(0.0)
-        .fill(c.bg_base)
-        .border_sides([0.0, 0.0, 0.0, 1.0], c.border_muted)
-        .child(header)
-        .child(body)
-}
-
-fn inspector_kv(key: &str, value: &str, k: &Kit) -> El {
-    let c = &k.c;
-    col()
-        .w_full()
-        .gap(4.0)
-        .child(text(key).font(k.ty.small).color(c.text_muted))
-        .child(
-            row()
-                .w_full()
-                .h(28.0)
-                .px(8.0)
-                .center_y()
-                .radius(k.radius.sm)
-                .fill(c.layer_01)
-                .border(0.5, c.border_muted)
-                .child(text(value).font(k.ty.ui_compact).color(c.text_base).truncate()),
-        )
 }

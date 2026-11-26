@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 use chrono::Local;
 use rune::{ColorScheme, PointerPress, TextEdit, Tx};
-use rune_kit::PaneState;
+use rune_kit::shell::TabDragState;
+use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
-    AccentColor, ColumnSummary, ConnectionId, ConnectionProfile, ConnectionStore, DatabaseInfo, DbObject, EnvTag,
-    ExecutedSql, PasswordMode, RequestId, SafetyPolicy, SchemaInfo, SessionId, SortOrder, SslMode, StoreData,
+    AccentColor, ColumnSummary, ConnectionId, ConnectionProfile, ConnectionStore, DatabaseInfo, DbObject, DbObjectKind,
+    EnvTag, ExecutedSql, PageRequest, PasswordMode, RequestId, SafetyPolicy, SchemaInfo, SessionId, SortOrder,
+    SortSpec, SslMode, StoreData, TabId, TablePage, TableStructure,
 };
 
 use crate::worker::{WorkerBridge, WorkerCmd, WorkerEvent};
@@ -334,8 +336,201 @@ impl ConsoleLogEntry {
     }
 }
 
+/// Active sub-view within a table or view workspace tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableViewMode {
+    #[default]
+    Data,
+    Structure,
+    Indexes,
+}
+
+impl TableViewMode {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Data => 0,
+            Self::Structure => 1,
+            Self::Indexes => 2,
+        }
+    }
+
+    pub const fn from_index(idx: usize) -> Self {
+        match idx {
+            1 => Self::Structure,
+            2 => Self::Indexes,
+            _ => Self::Data,
+        }
+    }
+}
+
+/// Interactive state for one open table or view tab (`Data | Structure | Indexes` + inspector state).
+pub struct TableTabState {
+    pub schema: String,
+    pub object_name: String,
+    pub object_kind: DbObjectKind,
+    pub view_mode: TableViewMode,
+    pub filter_input: TextEdit,
+    pub applied_filter: Option<String>,
+    pub filter_error: Option<String>,
+    pub sort: Option<SortSpec>,
+    pub page_size: i64,
+    pub page_size_open: bool,
+    pub offset: i64,
+    pub page_loading: bool,
+    pub structure_loading: bool,
+    pub latest_page_req: Option<RequestId>,
+    pub latest_structure_req: Option<RequestId>,
+    pub page: Option<TablePage>,
+    pub page_error: Option<String>,
+    pub structure: Option<TableStructure>,
+    pub structure_error: Option<String>,
+    pub data_table: TableState,
+    pub structure_table: TableState,
+    pub indexes_table: TableState,
+    pub selected_row: Option<usize>,
+    pub inspector_search: TextEdit,
+    pub inspector_json_pretty: bool,
+    pub header_menu: Option<(String, PointerPress)>,
+    pub ddl_expanded: bool,
+}
+
+impl TableTabState {
+    pub fn new(
+        tab_id: TabId,
+        schema: String,
+        object_name: String,
+        object_kind: DbObjectKind,
+        page_req: Option<RequestId>,
+        structure_req: Option<RequestId>,
+    ) -> Self {
+        let tid = tab_id.get();
+        Self {
+            schema,
+            object_name,
+            object_kind,
+            view_mode: TableViewMode::Data,
+            filter_input: TextEdit::new(""),
+            applied_filter: None,
+            filter_error: None,
+            sort: None,
+            page_size: 300,
+            page_size_open: false,
+            offset: 0,
+            page_loading: page_req.is_some(),
+            structure_loading: structure_req.is_some(),
+            latest_page_req: page_req,
+            latest_structure_req: structure_req,
+            page: None,
+            page_error: None,
+            structure: None,
+            structure_error: None,
+            data_table: TableState::new().key(format!("tv-data-{tid}")),
+            structure_table: TableState::new().key(format!("tv-struct-{tid}")),
+            indexes_table: TableState::new().key(format!("tv-idx-{tid}")),
+            selected_row: None,
+            inspector_search: TextEdit::new(""),
+            inspector_json_pretty: true,
+            header_menu: None,
+            ddl_expanded: true,
+        }
+    }
+
+    pub fn page_request(&self) -> PageRequest {
+        PageRequest {
+            schema: self.schema.clone(),
+            table: self.object_name.clone(),
+            filter_where: self.applied_filter.clone(),
+            sort: self.sort.clone(),
+            limit: self.page_size,
+            offset: self.offset,
+        }
+    }
+}
+
+/// Content variants hosted inside a workspace tab.
+pub enum TabContent {
+    Table(Box<TableTabState>),
+}
+
+/// A tab open inside a [`SessionState`].
+pub struct WorkspaceTab {
+    pub id: TabId,
+    pub content: TabContent,
+}
+
+impl WorkspaceTab {
+    pub fn new_table(
+        id: TabId,
+        schema: String,
+        object_name: String,
+        object_kind: DbObjectKind,
+        page_req: Option<RequestId>,
+        structure_req: Option<RequestId>,
+    ) -> Self {
+        Self {
+            id,
+            content: TabContent::Table(Box::new(TableTabState::new(
+                id,
+                schema,
+                object_name,
+                object_kind,
+                page_req,
+                structure_req,
+            ))),
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        match &self.content {
+            TabContent::Table(t) => &t.object_name,
+        }
+    }
+
+    pub fn schema_and_name(&self) -> Option<(&str, &str)> {
+        match &self.content {
+            TabContent::Table(t) => Some((&t.schema, &t.object_name)),
+        }
+    }
+
+    pub fn object_kind(&self) -> Option<DbObjectKind> {
+        match &self.content {
+            TabContent::Table(t) => Some(t.object_kind),
+        }
+    }
+
+    pub fn is_loading(&self) -> bool {
+        match &self.content {
+            TabContent::Table(t) => t.page_loading || t.structure_loading,
+        }
+    }
+
+    pub fn has_error(&self) -> bool {
+        match &self.content {
+            TabContent::Table(t) => t.page_error.is_some() || t.filter_error.is_some() || t.structure_error.is_some(),
+        }
+    }
+
+    pub fn as_table(&self) -> Option<&TableTabState> {
+        match &self.content {
+            TabContent::Table(t) => Some(t),
+        }
+    }
+
+    pub fn as_table_mut(&mut self) -> Option<&mut TableTabState> {
+        match &mut self.content {
+            TabContent::Table(t) => Some(t),
+        }
+    }
+}
+
+/// Parses a `TabId::to_string()` formatted key (`"tab-12"`) back into [`TabId`].
+pub fn parse_tab_id(raw: &str) -> Option<TabId> {
+    raw.strip_prefix("tab-")
+        .and_then(|num| num.parse::<u64>().ok())
+        .map(TabId::new)
+}
+
 /// Self-contained state for a single database workspace session.
-#[derive(Clone, Debug)]
 pub struct SessionState {
     pub id: SessionId,
     pub profile: ConnectionProfile,
@@ -350,6 +545,9 @@ pub struct SessionState {
     pub schema_dropdown_open: bool,
     pub sidebar_pane: PaneState,
     pub inspector_pane: PaneState,
+    pub tabs: Vec<WorkspaceTab>,
+    pub active_tab: Option<TabId>,
+    pub tab_drag: TabDragState,
 }
 
 impl SessionState {
@@ -367,8 +565,33 @@ impl SessionState {
             console_entries: Vec::new(),
             schema_dropdown_open: false,
             sidebar_pane: PaneState::new(260.0).range(180.0, 440.0),
-            inspector_pane: PaneState::new(280.0).range(200.0, 460.0),
+            inspector_pane: PaneState::new(292.0).range(220.0, 480.0),
+            tabs: Vec::new(),
+            active_tab: None,
+            tab_drag: TabDragState::new(),
         }
+    }
+
+    pub fn active_tab(&self) -> Option<&WorkspaceTab> {
+        let active = self.active_tab?;
+        self.tabs.iter().find(|t| t.id == active)
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut WorkspaceTab> {
+        let active = self.active_tab?;
+        self.tabs.iter_mut().find(|t| t.id == active)
+    }
+
+    pub fn active_table_tab(&self) -> Option<&TableTabState> {
+        self.active_tab().and_then(WorkspaceTab::as_table)
+    }
+
+    pub fn active_table_tab_mut(&mut self) -> Option<&mut TableTabState> {
+        self.active_tab_mut().and_then(WorkspaceTab::as_table_mut)
+    }
+
+    pub fn tab_mut(&mut self, tab_id: TabId) -> Option<&mut WorkspaceTab> {
+        self.tabs.iter_mut().find(|t| t.id == tab_id)
     }
 
     pub fn filtered_objects(&self) -> Vec<&DbObject> {
@@ -414,11 +637,14 @@ pub struct AppState {
     pub status_notice: Option<(String, bool)>,
     pub worker: Option<WorkerBridge>,
     next_session_id: u64,
+    next_tab_id: u64,
     next_req_id: u64,
     pub active_test_req_id: Option<RequestId>,
     pub active_cred_req_id: Option<RequestId>,
     pub fallback_pane: PaneState,
     pub fallback_edit: TextEdit,
+    pub fallback_table: TableState,
+    pub fallback_tab_drag: TabDragState,
 }
 
 impl AppState {
@@ -463,11 +689,14 @@ impl AppState {
             status_notice: None,
             worker: None,
             next_session_id: 1,
+            next_tab_id: 1,
             next_req_id: 1,
             active_test_req_id: None,
             active_cred_req_id: None,
             fallback_pane: PaneState::new(260.0),
             fallback_edit: TextEdit::new(""),
+            fallback_table: TableState::new().key("tv-fallback-table"),
+            fallback_tab_drag: TabDragState::new(),
         }
     }
 
@@ -479,6 +708,71 @@ impl AppState {
             },
             Screen::Launcher => &mut self.fallback_edit,
         }
+    }
+
+    fn active_table_edit_mut(&mut self, pick: fn(&mut TableTabState) -> &mut TextEdit) -> &mut TextEdit {
+        if let Screen::Workspace(sid) = self.screen
+            && self.sessions.get(&sid).and_then(SessionState::active_table_tab).is_some()
+            && let Some(tab) = self.sessions.get_mut(&sid).and_then(SessionState::active_table_tab_mut)
+        {
+            return pick(tab);
+        }
+        &mut self.fallback_edit
+    }
+
+    fn active_table_state_mut(&mut self, pick: fn(&mut TableTabState) -> &mut TableState) -> &mut TableState {
+        if let Screen::Workspace(sid) = self.screen
+            && self.sessions.get(&sid).and_then(SessionState::active_table_tab).is_some()
+            && let Some(tab) = self.sessions.get_mut(&sid).and_then(SessionState::active_table_tab_mut)
+        {
+            return pick(tab);
+        }
+        &mut self.fallback_table
+    }
+
+    pub fn active_filter_input_mut(&mut self) -> &mut TextEdit {
+        self.active_table_edit_mut(|tab| &mut tab.filter_input)
+    }
+
+    pub fn active_inspector_search_mut(&mut self) -> &mut TextEdit {
+        self.active_table_edit_mut(|tab| &mut tab.inspector_search)
+    }
+
+    pub fn tab_drag_mut(&mut self, sid: SessionId) -> &mut TabDragState {
+        match self.sessions.get_mut(&sid) {
+            Some(session) => &mut session.tab_drag,
+            None => &mut self.fallback_tab_drag,
+        }
+    }
+
+    pub fn active_data_table(&self) -> &TableState {
+        self.active_session()
+            .and_then(SessionState::active_table_tab)
+            .map_or(&self.fallback_table, |t| &t.data_table)
+    }
+
+    pub fn active_data_table_mut(&mut self) -> &mut TableState {
+        self.active_table_state_mut(|tab| &mut tab.data_table)
+    }
+
+    pub fn active_structure_table(&self) -> &TableState {
+        self.active_session()
+            .and_then(SessionState::active_table_tab)
+            .map_or(&self.fallback_table, |t| &t.structure_table)
+    }
+
+    pub fn active_structure_table_mut(&mut self) -> &mut TableState {
+        self.active_table_state_mut(|tab| &mut tab.structure_table)
+    }
+
+    pub fn active_indexes_table(&self) -> &TableState {
+        self.active_session()
+            .and_then(SessionState::active_table_tab)
+            .map_or(&self.fallback_table, |t| &t.indexes_table)
+    }
+
+    pub fn active_indexes_table_mut(&mut self) -> &mut TableState {
+        self.active_table_state_mut(|tab| &mut tab.indexes_table)
     }
 
     pub fn form_field_mut(&mut self, pick: fn(&mut ConnectionFormState) -> &mut TextEdit) -> &mut TextEdit {
@@ -528,6 +822,12 @@ impl AppState {
     pub fn alloc_session_id(&mut self) -> SessionId {
         let id = SessionId::new(self.next_session_id);
         self.next_session_id += 1;
+        id
+    }
+
+    pub fn alloc_tab_id(&mut self) -> TabId {
+        let id = TabId::new(self.next_tab_id);
+        self.next_tab_id += 1;
         id
     }
 
@@ -895,6 +1195,9 @@ impl AppState {
         } else {
             session.status = ConnectionState::Connecting;
         }
+        session.tabs.clear();
+        session.active_tab = None;
+        session.tab_drag = TabDragState::new();
         self.overlay = OverlayState::None;
         self.sync_window_title(tx);
 
@@ -974,33 +1277,401 @@ impl AppState {
             return;
         };
         let key = (schema.clone(), object.clone());
-        let need_load = {
+        let has_worker = self.worker.is_some();
+
+        let existing_tab_id = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
             let Some(connected) = session.status.as_connected_mut() else {
                 return;
             };
-            connected.selected_object = Some(key.clone());
-            match connected.expanded_columns.entry(key) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(ColumnLoadState::Loading);
-                    true
-                }
-                std::collections::hash_map::Entry::Occupied(_) => false,
-            }
+            connected.selected_object = Some(key);
+            session
+                .tabs
+                .iter()
+                .find(|t| t.schema_and_name() == Some((schema.as_str(), object.as_str())))
+                .map(|t| t.id)
         };
+
+        if let Some(tab_id) = existing_tab_id {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.active_tab = Some(tab_id);
+            }
+            self.sync_window_title(tx);
+            return;
+        }
+
+        let tab_id = self.alloc_tab_id();
+        let page_req = has_worker.then(|| self.alloc_req_id());
+        let struct_req = has_worker.then(|| self.alloc_req_id());
+
+        let page_request = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let kind = session
+                .status
+                .as_connected()
+                .and_then(|c| {
+                    c.objects
+                        .iter()
+                        .find(|o| o.schema == schema && o.name == object)
+                        .map(|o| o.kind)
+                })
+                .unwrap_or(DbObjectKind::Table);
+            let tab = WorkspaceTab::new_table(
+                tab_id,
+                schema.clone(),
+                object.clone(),
+                kind,
+                page_req,
+                struct_req,
+            );
+            let req = tab.as_table().map(TableTabState::page_request);
+            session.tabs.push(tab);
+            session.active_tab = Some(tab_id);
+            req
+        };
+
         self.sync_window_title(tx);
-        if need_load && self.worker.is_some() {
-            let req_id = self.alloc_req_id();
-            if let Some(worker) = &self.worker {
-                worker.send(WorkerCmd::LoadColumns {
+        if let Some(worker) = &self.worker {
+            if let (Some(req_id), Some(request)) = (page_req, page_request) {
+                worker.send(WorkerCmd::FetchTablePage {
                     session_id,
+                    tab_id,
                     req_id,
-                    schema,
-                    object,
+                    request,
                 });
             }
+            if let Some(req_id) = struct_req {
+                worker.send(WorkerCmd::DescribeTable {
+                    session_id,
+                    tab_id,
+                    req_id,
+                    schema,
+                    table: object,
+                });
+            }
+        }
+    }
+
+    pub fn activate_tab(&mut self, tab_id: TabId, tx: &mut Tx) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(target) = session
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.schema_and_name().map(|(s, n)| (s.to_owned(), n.to_owned())))
+        else {
+            return;
+        };
+        session.active_tab = Some(tab_id);
+        if let ConnectionState::Connected(ref mut data) = session.status {
+            data.selected_object = Some(target);
+        }
+        self.sync_window_title(tx);
+    }
+
+    pub fn close_tab(&mut self, tab_id: TabId, tx: &mut Tx) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(pos) = session.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        session.tabs.remove(pos);
+        if session.active_tab == Some(tab_id) {
+            let next_id = if pos < session.tabs.len() {
+                Some(session.tabs[pos].id)
+            } else {
+                session.tabs.last().map(|t| t.id)
+            };
+            session.active_tab = next_id;
+        }
+        let next_obj = session
+            .active_tab()
+            .and_then(|t| t.schema_and_name().map(|(s, n)| (s.to_owned(), n.to_owned())));
+        if let ConnectionState::Connected(ref mut data) = session.status {
+            data.selected_object = next_obj;
+        }
+        self.sync_window_title(tx);
+    }
+
+    pub fn close_active_tab(&mut self, tx: &mut Tx) -> bool {
+        let Some(tab_id) = self.active_session().and_then(|s| s.active_tab) else {
+            return false;
+        };
+        self.close_tab(tab_id, tx);
+        true
+    }
+
+    pub fn cycle_tab(&mut self, delta: isize, tx: &mut Tx) -> bool {
+        let Some(session) = self.active_session() else {
+            return false;
+        };
+        let len = session.tabs.len();
+        if len < 2 {
+            return false;
+        }
+        let cur = session
+            .active_tab
+            .and_then(|id| session.tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        let next_idx = (cur as isize + delta).rem_euclid(len as isize) as usize;
+        let next_id = session.tabs[next_idx].id;
+        self.activate_tab(next_id, tx);
+        true
+    }
+
+    pub fn reorder_tabs(&mut self, from: usize, to: usize) {
+        let Some(session) = self.active_session_mut() else {
+            return;
+        };
+        if from >= session.tabs.len() {
+            return;
+        }
+        let tab = session.tabs.remove(from);
+        let dest = to.min(session.tabs.len());
+        session.tabs.insert(dest, tab);
+    }
+
+    pub fn set_active_tab_view_mode(&mut self, mode: TableViewMode) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let has_worker = self.worker.is_some();
+        let req_id = has_worker.then(|| self.alloc_req_id());
+        let desc_target = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let Some(tab_id) = session.active_tab else {
+                return;
+            };
+            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+                return;
+            };
+            tab.view_mode = mode;
+            tab.header_menu = None;
+            tab.page_size_open = false;
+            if has_worker
+                && matches!(mode, TableViewMode::Structure | TableViewMode::Indexes)
+                && tab.structure.is_none()
+                && !tab.structure_loading
+                && let Some(rid) = req_id
+            {
+                tab.structure_loading = true;
+                tab.latest_structure_req = Some(rid);
+                Some((tab_id, rid, tab.schema.clone(), tab.object_name.clone()))
+            } else {
+                None
+            }
+        };
+        if let (Some(worker), Some((tab_id, rid, schema, table))) = (&self.worker, desc_target) {
+            worker.send(WorkerCmd::DescribeTable {
+                session_id,
+                tab_id,
+                req_id: rid,
+                schema,
+                table,
+            });
+        }
+    }
+
+    fn dispatch_active_tab_page(&mut self) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let has_worker = self.worker.is_some();
+        let req_id = has_worker.then(|| self.alloc_req_id());
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(tab_id) = session.active_tab else {
+            return;
+        };
+        let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+            return;
+        };
+        tab.header_menu = None;
+        tab.page_size_open = false;
+        let Some(rid) = req_id else {
+            return;
+        };
+        tab.page_loading = true;
+        tab.latest_page_req = Some(rid);
+        let request = tab.page_request();
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::FetchTablePage {
+                session_id,
+                tab_id,
+                req_id: rid,
+                request,
+            });
+        }
+    }
+
+    pub fn apply_active_tab_filter(&mut self) {
+        {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return;
+            };
+            let trimmed = tab.filter_input.text.trim();
+            tab.applied_filter = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+            tab.filter_error = None;
+            tab.offset = 0;
+            tab.selected_row = None;
+            tab.data_table.clear_selection();
+        }
+        self.dispatch_active_tab_page();
+    }
+
+    pub fn clear_active_tab_filter(&mut self) {
+        {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return;
+            };
+            tab.filter_input = TextEdit::new("");
+            tab.applied_filter = None;
+            tab.filter_error = None;
+            tab.offset = 0;
+            tab.selected_row = None;
+            tab.data_table.clear_selection();
+        }
+        self.dispatch_active_tab_page();
+    }
+
+    pub fn sort_active_tab(&mut self, column: String, ascending: bool) {
+        {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return;
+            };
+            let dir = if ascending {
+                SortDir::Ascending
+            } else {
+                SortDir::Descending
+            };
+            tab.data_table.set_sort(column.clone(), dir);
+            tab.sort = Some(SortSpec { column, ascending });
+            tab.offset = 0;
+            tab.selected_row = None;
+            tab.data_table.clear_selection();
+        }
+        self.dispatch_active_tab_page();
+    }
+
+    pub fn clear_active_tab_sort(&mut self) {
+        {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return;
+            };
+            tab.sort = None;
+            tab.data_table.clear_sort();
+            tab.offset = 0;
+            tab.selected_row = None;
+            tab.data_table.clear_selection();
+        }
+        self.dispatch_active_tab_page();
+    }
+
+    pub fn set_active_tab_page_size(&mut self, page_size: i64) {
+        {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return;
+            };
+            tab.page_size = page_size.clamp(10, 5000);
+            tab.page_size_open = false;
+            tab.offset = 0;
+            tab.selected_row = None;
+            tab.data_table.clear_selection();
+        }
+        self.dispatch_active_tab_page();
+    }
+
+    pub fn paginate_active_tab(&mut self, next: bool) {
+        let changed = {
+            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+                return;
+            };
+            if next {
+                let has_more = tab.page.as_ref().is_some_and(|p| p.has_more);
+                if !has_more {
+                    false
+                } else {
+                    tab.offset += tab.page_size;
+                    tab.selected_row = None;
+                    tab.data_table.clear_selection();
+                    true
+                }
+            } else if tab.offset > 0 {
+                tab.offset = (tab.offset - tab.page_size).max(0);
+                tab.selected_row = None;
+                tab.data_table.clear_selection();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.dispatch_active_tab_page();
+        }
+    }
+
+    pub fn reload_active_tab(&mut self) {
+        self.dispatch_active_tab_page();
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        if self.worker.is_none() {
+            return;
+        }
+        let req_id = self.alloc_req_id();
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(tab_id) = session.active_tab else {
+            return;
+        };
+        let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+            return;
+        };
+        tab.structure_loading = true;
+        tab.latest_structure_req = Some(req_id);
+        let schema = tab.schema.clone();
+        let table = tab.object_name.clone();
+        if let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::DescribeTable {
+                session_id,
+                tab_id,
+                req_id,
+                schema,
+                table,
+            });
+        }
+    }
+
+    pub fn select_active_tab_row(&mut self, row_id: &str) {
+        let Some(idx) = row_id.strip_prefix("r-").and_then(|s| s.parse::<usize>().ok()) else {
+            return;
+        };
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.selected_row = Some(idx);
+        }
+    }
+
+    pub fn clear_active_tab_row_selection(&mut self) {
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.selected_row = None;
+            tab.data_table.clear_selection();
         }
     }
 
@@ -1220,6 +1891,9 @@ impl AppState {
                     data.expanded_columns.clear();
                     data.selected_object = None;
                 }
+                session.tabs.clear();
+                session.active_tab = None;
+                session.tab_drag = TabDragState::new();
                 if self.screen == Screen::Workspace(session_id) {
                     self.sync_window_title(tx);
                 }
@@ -1266,6 +1940,83 @@ impl AppState {
                             Err(err) => ColumnLoadState::Error(err.to_string()),
                         };
                         data.expanded_columns.insert(key, next);
+                    }
+                }
+            }
+
+            WorkerEvent::TablePageLoaded {
+                session_id,
+                tab_id,
+                req_id,
+                result,
+                logs,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                append_logs(&mut session.console_entries, logs);
+                let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+                    return;
+                };
+                if tab.latest_page_req != Some(req_id) {
+                    return;
+                }
+                tab.page_loading = false;
+                match result {
+                    Ok(page) => {
+                        let row_count = page.rows.len();
+                        tab.page = Some(page);
+                        tab.page_error = None;
+                        tab.filter_error = None;
+                        if let Some(sel) = tab.selected_row
+                            && sel >= row_count
+                        {
+                            tab.selected_row = None;
+                            tab.data_table.clear_selection();
+                        }
+                    }
+                    Err(err) => {
+                        if matches!(err, tv_core::DbError::Disconnected) {
+                            session.status = ConnectionState::Disconnected {
+                                reason: Some(err.to_string()),
+                            };
+                            if self.screen == Screen::Workspace(session_id) {
+                                self.sync_window_title(tx);
+                            }
+                        } else if tab.applied_filter.is_some() && tab.page.is_some() {
+                            tab.filter_error = Some(err.to_string());
+                        } else {
+                            tab.page_error = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+
+            WorkerEvent::TableStructureLoaded {
+                session_id,
+                tab_id,
+                req_id,
+                result,
+                logs,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                append_logs(&mut session.console_entries, logs);
+                let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+                    return;
+                };
+                if tab.latest_structure_req != Some(req_id) {
+                    return;
+                }
+                tab.structure_loading = false;
+                match result {
+                    Ok(structure) => {
+                        tab.structure = Some(structure);
+                        tab.structure_error = None;
+                    }
+                    Err(err) => {
+                        tab.structure_error = Some(err.to_string());
                     }
                 }
             }
@@ -1336,13 +2087,19 @@ impl AppState {
         let title = match self.active_session() {
             None => "TableView".to_owned(),
             Some(session) => match &session.status {
-                ConnectionState::Connected(data) => match (&data.active_database, &data.selected_object) {
-                    (Some(db), Some((schema, obj))) => {
-                        format!("{} — {} — {}.{}", session.profile.name, db, schema, obj)
+                ConnectionState::Connected(data) => {
+                    let active_obj = session
+                        .active_tab()
+                        .and_then(WorkspaceTab::schema_and_name)
+                        .or_else(|| data.selected_object.as_ref().map(|(s, o)| (s.as_str(), o.as_str())));
+                    match (&data.active_database, active_obj) {
+                        (Some(db), Some((schema, obj))) => {
+                            format!("{} — {} — {}.{}", session.profile.name, db, schema, obj)
+                        }
+                        (Some(db), None) => format!("{} — {}", session.profile.name, db),
+                        (None, _) => format!("{} — TableView", session.profile.name),
                     }
-                    (Some(db), None) => format!("{} — {}", session.profile.name, db),
-                    (None, _) => format!("{} — TableView", session.profile.name),
-                },
+                }
                 _ => format!("{} (Disconnected) — TableView", session.profile.name),
             },
         };

@@ -15,6 +15,11 @@ pub enum Action {
     ToggleConsole,
     ToggleInspector,
     ReloadWorkspace,
+    ReloadActiveTab,
+    CloseActiveTab,
+    PrevTab,
+    NextTab,
+    FocusFilter,
     Reconnect,
     Disconnect,
     ShowLauncher,
@@ -45,12 +50,29 @@ pub fn action_for_key(ev: &KeyEvent) -> Option<Action> {
     if ev.is_command('p') && !ev.mods.shift && !ev.mods.alt {
         return Some(Action::QuickJumpObject);
     }
-    if ev.is_command('r') && !ev.mods.alt {
-        return Some(if ev.mods.shift {
-            Action::Reconnect
-        } else {
-            Action::ReloadWorkspace
-        });
+    if ev.is_command('r') {
+        if ev.mods.shift && !ev.mods.alt {
+            return Some(Action::Reconnect);
+        }
+        if ev.mods.alt && !ev.mods.shift {
+            return Some(Action::ReloadActiveTab);
+        }
+        if !ev.mods.shift && !ev.mods.alt {
+            return Some(Action::ReloadWorkspace);
+        }
+        return None;
+    }
+    if ev.is_command('w') && !ev.mods.shift && !ev.mods.alt {
+        return Some(Action::CloseActiveTab);
+    }
+    if (ev.is_command('[') || ev.is_command('{')) && ev.mods.shift && !ev.mods.alt {
+        return Some(Action::PrevTab);
+    }
+    if (ev.is_command(']') || ev.is_command('}')) && ev.mods.shift && !ev.mods.alt {
+        return Some(Action::NextTab);
+    }
+    if ev.is_command('f') && !ev.mods.shift && !ev.mods.alt {
+        return Some(Action::FocusFilter);
     }
     if ev.is_command('.') && ev.mods.alt {
         return Some(Action::Disconnect);
@@ -88,11 +110,21 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
                 s.launcher_context_menu = None;
                 return true;
             }
-            if let Some(session) = s.active_session_mut()
-                && session.schema_dropdown_open
-            {
-                session.schema_dropdown_open = false;
-                return true;
+            if let Some(session) = s.active_session_mut() {
+                if session.schema_dropdown_open {
+                    session.schema_dropdown_open = false;
+                    return true;
+                }
+                if let Some(tab) = session.active_table_tab_mut() {
+                    if tab.header_menu.is_some() {
+                        tab.header_menu = None;
+                        return true;
+                    }
+                    if tab.page_size_open {
+                        tab.page_size_open = false;
+                        return true;
+                    }
+                }
             }
             false
         }
@@ -163,6 +195,28 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
         Action::ReloadWorkspace => {
             if matches!(s.screen, Screen::Workspace(_)) {
                 s.reload_workspace();
+                true
+            } else {
+                false
+            }
+        }
+        Action::ReloadActiveTab => {
+            if s.active_session().and_then(|sess| sess.active_tab).is_some() {
+                s.reload_active_tab();
+                true
+            } else {
+                false
+            }
+        }
+        Action::CloseActiveTab => s.close_active_tab(tx),
+        Action::PrevTab => s.cycle_tab(-1, tx),
+        Action::NextTab => s.cycle_tab(1, tx),
+        Action::FocusFilter => {
+            if matches!(
+                s.active_session().and_then(|sess| sess.active_table_tab()),
+                Some(t) if t.view_mode == crate::state::TableViewMode::Data
+            ) {
+                tx.focus("table-filter-input", true);
                 true
             } else {
                 false
@@ -281,12 +335,31 @@ pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
         item_with_shortcut("conn-reload", "Reload Workspace", "Connection", "mod+r", |s, tx| {
             dispatch_action(s, Action::ReloadWorkspace, tx);
         }),
+        item_with_shortcut("conn-reload-tab", "Reload Current Tab", "Connection", "mod+alt+r", |s, tx| {
+            dispatch_action(s, Action::ReloadActiveTab, tx);
+        }),
+        item_with_shortcut("conn-close-tab", "Close Tab", "Connection", "mod+w", |s, tx| {
+            dispatch_action(s, Action::CloseActiveTab, tx);
+        }),
         item_with_shortcut("conn-reconnect", "Reconnect", "Connection", "mod+shift+r", |s, tx| {
             dispatch_action(s, Action::Reconnect, tx);
         }),
         item_with_shortcut("conn-disconnect", "Disconnect", "Connection", "mod+alt+period", |s, tx| {
             dispatch_action(s, Action::Disconnect, tx);
         }),
+        item_with_shortcut("nav-filter", "Filter Table…", "Navigate", "mod+f", |s, tx| {
+            dispatch_action(s, Action::FocusFilter, tx);
+        }),
+        MenuItem::new("Previous Tab", |s, tx| {
+            dispatch_action(s, Action::PrevTab, tx);
+        })
+        .id("nav-prev-tab")
+        .menu("Navigate"),
+        MenuItem::new("Next Tab", |s, tx| {
+            dispatch_action(s, Action::NextTab, tx);
+        })
+        .id("nav-next-tab")
+        .menu("Navigate"),
         item_with_shortcut("view-sidebar", "Toggle Sidebar", "View", "mod+1", |s, tx| {
             dispatch_action(s, Action::ToggleSidebar, tx);
         }),

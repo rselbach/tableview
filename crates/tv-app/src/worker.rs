@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use rune::Waker;
 use rune::credentials::Credentials;
-use tv_core::engine::postgres::PostgresSession;
+use tv_core::engine::postgres::{PostgresSession, quote_ident};
 use tv_core::{
     ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbError, DbObject, DbSession, ExecutedSql,
-    PasswordMode, RequestId, SchemaInfo, ServerInfo, SessionId,
+    PageRequest, PasswordMode, RequestId, SchemaInfo, ServerInfo, SessionId, TabId, TablePage, TableStructure,
 };
 
 /// Commands dispatched from the UI thread to the background database worker.
@@ -41,6 +41,19 @@ pub enum WorkerCmd {
         session_id: SessionId,
         req_id: RequestId,
         active_schema: Option<String>,
+    },
+    FetchTablePage {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        request: PageRequest,
+    },
+    DescribeTable {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        schema: String,
+        table: String,
     },
     Disconnect {
         session_id: SessionId,
@@ -107,6 +120,20 @@ pub enum WorkerEvent {
         schema: String,
         object: String,
         columns: Result<Vec<ColumnSummary>, DbError>,
+        logs: Vec<ExecutedSql>,
+    },
+    TablePageLoaded {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        result: Result<TablePage, DbError>,
+        logs: Vec<ExecutedSql>,
+    },
+    TableStructureLoaded {
+        session_id: SessionId,
+        tab_id: TabId,
+        req_id: RequestId,
+        result: Result<TableStructure, DbError>,
         logs: Vec<ExecutedSql>,
     },
     OperationFailed {
@@ -551,6 +578,107 @@ async fn handle_cmd(
             );
         }
 
+        WorkerCmd::FetchTablePage {
+            session_id,
+            tab_id,
+            req_id,
+            request,
+        } => {
+            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::TablePageLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(DbError::Disconnected),
+                        logs: Vec::new(),
+                    },
+                );
+                return;
+            };
+            match session.fetch_table_page(&request).await {
+                Ok((page, logs)) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::TablePageLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Ok(page),
+                        logs,
+                    },
+                ),
+                Err(error) => {
+                    let failed_sql = format_failed_page_sql(&request);
+                    let logs = vec![ExecutedSql {
+                        sql: failed_sql,
+                        duration_ms: 0,
+                        error: Some(error.to_string()),
+                    }];
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::TablePageLoaded {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(error),
+                            logs,
+                        },
+                    );
+                }
+            }
+        }
+
+        WorkerCmd::DescribeTable {
+            session_id,
+            tab_id,
+            req_id,
+            schema,
+            table,
+        } => {
+            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::TableStructureLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(DbError::Disconnected),
+                        logs: Vec::new(),
+                    },
+                );
+                return;
+            };
+            match session.describe_table(&schema, &table).await {
+                Ok((structure, logs)) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::TableStructureLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Ok(structure),
+                        logs,
+                    },
+                ),
+                Err(error) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::TableStructureLoaded {
+                        session_id,
+                        tab_id,
+                        req_id,
+                        result: Err(error),
+                        logs: Vec::new(),
+                    },
+                ),
+            }
+        }
+
         WorkerCmd::Disconnect { session_id } => {
             sessions.lock().await.remove(&session_id);
         }
@@ -617,4 +745,24 @@ async fn handle_cmd(
             );
         }
     }
+}
+
+fn format_failed_page_sql(req: &PageRequest) -> String {
+    let mut sql = format!(
+        "SELECT * FROM {}.{}",
+        quote_ident(&req.schema),
+        quote_ident(&req.table)
+    );
+    if let Some(where_clause) = &req.filter_where {
+        let trimmed = where_clause.trim();
+        if !trimmed.is_empty() {
+            sql.push_str(&format!(" WHERE ({trimmed})"));
+        }
+    }
+    if let Some(sort) = &req.sort {
+        let dir = if sort.ascending { "ASC" } else { "DESC" };
+        sql.push_str(&format!(" ORDER BY {} {dir} NULLS LAST", quote_ident(&sort.column)));
+    }
+    sql.push_str(&format!(" LIMIT {} OFFSET {}", req.limit, req.offset));
+    sql
 }

@@ -1,6 +1,8 @@
 pub mod connection_form;
+pub mod inspector;
 pub mod launcher;
 pub mod pickers;
+pub mod table_grid;
 pub mod workspace;
 
 use rune::{Cx, El, ColorScheme, col, el, row, text};

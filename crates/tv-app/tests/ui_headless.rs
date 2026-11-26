@@ -2,7 +2,7 @@
 
 use rune::{Env, Key, KeyEvent, Mods, Runtime};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
-use tv_app::state::{AppState, OverlayState, PickerKind, Screen};
+use tv_app::state::{AppState, OverlayState, PickerKind, Screen, TableViewMode};
 use tv_app::views;
 
 fn sample_runtime(dark: bool) -> Runtime<AppState> {
@@ -144,4 +144,171 @@ fn all_scenes_render_cleanly_in_dark_and_light_modes() {
         rt.frame(0.0);
         assert!(rt.find("kit-root").is_some(), "scene {name} failed to mount root");
     }
+}
+
+fn apply_scene(rt: &mut Runtime<AppState>, scene_name: &str) {
+    rt.update(|s, _| {
+        let (_, apply) = tv_app::scenes::SCENES
+            .iter()
+            .find(|(name, _)| *name == scene_name)
+            .expect("registered scene");
+        apply(s);
+    });
+    rt.frame(0.0);
+}
+
+#[test]
+fn workspace_tabs_open_switch_and_close_via_cmd_w() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 2);
+
+    // Clicking enrollments in the sidebar opens a 3rd tab without duplicating existing ones.
+    let (ex, ey) = rt.find("sidebar/obj/public.enrollments").expect("enrollments item");
+    rt.pointer_down(ex, ey);
+    rt.pointer_up(ex, ey);
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 3);
+
+    // Clicking enrollments again focuses it rather than opening a 4th tab.
+    rt.pointer_down(ex, ey);
+    rt.pointer_up(ex, ey);
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 3);
+
+    // Cmd+W closes the active tab and returns focus to neighbor tab.
+    rt.key(KeyEvent {
+        key: Key::Command('w'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").tabs.len(), 2);
+}
+
+#[test]
+fn workspace_data_grid_row_selection_populates_typed_inspector() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+
+    // Row 0 is pre-selected in scene: row fields card should be mounted with JSONB & UTC/Local info.
+    assert!(rt.find("inspector-row-fields").is_some());
+    assert!(rt.find("inspector/row-badge").is_some());
+
+    let tree = rt.accessibility_tree();
+    assert!(tree.nodes.iter().any(|(_, n)| n.label() == Some("Copy profile")));
+
+    // Selecting row 1 (Abed Nadir) updates inspector and renders NULL badge for nullable email.
+    // `r-1` spans the full horizontal scroll width, so click inside its visible left cell band.
+    let r1 = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("r-1"))
+        .expect("second row r-1");
+    let (rx, ry) = (r1.rect[0] + 100.0, r1.rect[1] + r1.rect[3] / 2.0);
+    rt.pointer_down(rx, ry);
+    rt.pointer_up(rx, ry);
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .selected_row,
+        Some(1)
+    );
+    assert!(rt.find("inspector/null/3").is_some(), "email column NULL badge rendered");
+
+    // Clearing row selection returns inspector to table stats.
+    rt.update(|s, _| s.clear_active_tab_row_selection());
+    rt.frame(0.0);
+    assert!(rt.find("inspector-table-stats").is_some());
+}
+
+#[test]
+fn workspace_view_modes_switch_between_data_structure_and_indexes() {
+    let mut rt = sample_runtime(false);
+    apply_scene(&mut rt, "workspace-data-grid-light");
+
+    assert!(rt.find("table-filter-bar").is_some());
+
+    let (sx, sy) = rt
+        .find("table-view-switch/segment1")
+        .expect("Structure segment button");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .view_mode,
+        TableViewMode::Structure
+    );
+    assert!(rt.find("structure-view-root").is_some());
+    assert!(rt.find("structure-ddl-section").is_some());
+
+    let (ix, iy) = rt
+        .find("table-view-switch/segment2")
+        .expect("Indexes segment button");
+    rt.pointer_down(ix, iy);
+    rt.pointer_up(ix, iy);
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .view_mode,
+        TableViewMode::Indexes
+    );
+    assert!(rt.find("tv-idx-1").is_some());
+}
+
+#[test]
+fn workspace_filter_bar_applies_and_clears_where_clause() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+
+    let (fx, fy) = rt.find("table-filter-input").expect("filter input");
+    rt.pointer_down(fx, fy);
+    rt.pointer_up(fx, fy);
+    rt.frame(0.0);
+
+    rt.key(KeyEvent::from(Key::Text("enrolled = true".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.0);
+
+    let applied = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab")
+        .applied_filter
+        .as_deref();
+    assert_eq!(applied, Some("enrolled = true"));
+
+    let (cx, cy) = rt.find("filter-clear-btn").expect("filter clear button");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    rt.frame(0.0);
+
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .applied_filter,
+        None
+    );
 }
