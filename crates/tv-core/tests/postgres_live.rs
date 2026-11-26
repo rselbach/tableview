@@ -4,7 +4,9 @@ use std::env;
 
 use tokio::runtime::Runtime;
 use tv_core::engine::postgres::PostgresSession;
-use tv_core::{ConnectionProfile, DbObjectKind, DbSession, PasswordMode, SslMode};
+use tv_core::{
+    CellValue, ConnectionProfile, DbError, DbObjectKind, DbSession, PageRequest, PasswordMode, SortSpec, SslMode,
+};
 
 fn local_pg_user() -> String {
     env::var("PGUSER")
@@ -45,7 +47,7 @@ impl Drop for TempDatabaseGuard {
 }
 
 #[test]
-fn live_postgres_introspection_roundtrip() {
+fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
     let rt = Runtime::new().expect("create tokio runtime");
     let user = local_pg_user();
     let mut admin = ConnectionProfile::new_postgres("greendale_local", "127.0.0.1", &user);
@@ -54,7 +56,7 @@ fn live_postgres_introspection_roundtrip() {
     admin.ssl.mode = SslMode::Disable;
     admin.database = Some("postgres".to_owned());
 
-    let db_name = format!("tableview_m1_test_{}", std::process::id());
+    let db_name = format!("tableview_m2_test_{}", std::process::id());
 
     rt.block_on(async {
         let mut cfg = tokio_postgres::Config::new();
@@ -103,17 +105,39 @@ fn live_postgres_introspection_roundtrip() {
         client
             .batch_execute(
                 "CREATE SCHEMA study_room;
-                 CREATE TABLE public.students (
-                     student_id INTEGER PRIMARY KEY,
-                     full_name TEXT NOT NULL,
-                     email TEXT
-                 );
+                 CREATE TYPE public.greendale_major AS ENUM ('Spanish', 'Film', 'Law', 'AirConditioning');
                  CREATE TABLE public.study_groups (
-                     group_id SERIAL PRIMARY KEY,
+                     group_id INTEGER PRIMARY KEY,
                      room_name TEXT NOT NULL
                  );
+                 INSERT INTO public.study_groups VALUES (1, 'Study Room F');
+                 CREATE TABLE public.students (
+                     student_id INTEGER PRIMARY KEY,
+                     id UUID NOT NULL,
+                     full_name TEXT NOT NULL,
+                     email TEXT,
+                     enrolled BOOLEAN NOT NULL DEFAULT true,
+                     gpa NUMERIC(4,2),
+                     major public.greendale_major NOT NULL,
+                     tags TEXT[] NOT NULL DEFAULT '{}',
+                     profile JSONB,
+                     badge BYTEA,
+                     group_id INTEGER REFERENCES public.study_groups(group_id),
+                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                 );
+                 CREATE UNIQUE INDEX students_id_uidx ON public.students (id);
+                 CREATE INDEX students_profile_gin ON public.students USING gin (profile);
+                 COMMENT ON TABLE public.students IS 'Greendale Community College active roster';
+                 COMMENT ON COLUMN public.students.full_name IS 'Preferred display name';
+                 INSERT INTO public.students
+                     (student_id, id, full_name, email, enrolled, gpa, major, tags, profile, badge, group_id, created_at)
+                 VALUES
+                     (1, '210b3d6b-da52-4259-ac05-b58d3d0a6d5b', 'Troy Barnes', 'troy@greendale.edu', true, 3.45, 'AirConditioning', ARRAY['football','plumbing'], '{\"best_friend\":\"Abed\",\"handshake\":true}'::jsonb, '\\xdeadbeef'::bytea, 1, '2026-11-19T18:09:11.432Z'),
+                     (2, '8c5b8676-0203-44ba-9198-90125b690e81', 'Abed Nadir', NULL, true, 3.92, 'Film', ARRAY['meta','inspector'], '{\"bedtime\":\"strict\"}'::jsonb, '\\x00ff'::bytea, 1, '2026-11-19T18:24:56.558Z'),
+                     (3, '11111111-2222-3333-4444-555555555555', 'Annie Edison', '', true, 4.00, 'Law', ARRAY['notes'], '{\"pens\":12}'::jsonb, NULL, 1, '2026-11-19T19:00:00.000Z'),
+                     (4, '99999999-8888-7777-6666-555555555555', 'Jeff Winger', 'jeff@greendale.edu', false, 2.75, 'Law', ARRAY['speech'], NULL, '\\x'::bytea, 1, '2026-11-20T09:15:00.000Z');
                  CREATE VIEW public.active_students_view AS
-                     SELECT student_id, full_name FROM public.students;",
+                     SELECT student_id, full_name FROM public.students WHERE enrolled = true;",
             )
             .await
             .expect("seed Community test schema");
@@ -153,13 +177,146 @@ fn live_postgres_introspection_roundtrip() {
             .list_columns("public", "students")
             .await
             .expect("list_columns");
-        assert_eq!(cols.len(), 3);
+        assert_eq!(cols.len(), 12);
         assert_eq!(cols[0].name, "student_id");
         assert!(cols[0].is_primary_key);
-        assert!(!cols[0].nullable);
-        assert_eq!(cols[2].name, "email");
-        assert!(cols[2].nullable);
-        assert!(!cols[2].is_primary_key);
+
+        // Fetch sorted page 1 (limit 2, offset 0)
+        let (page1, page1_logs) = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "student_id".to_owned(),
+                    ascending: true,
+                }),
+                limit: 2,
+                offset: 0,
+            })
+            .await
+            .expect("fetch page 1");
+        assert!(!page1_logs.is_empty());
+        assert_eq!(page1.rows.len(), 2);
+        assert!(page1.has_more);
+        assert!(!page1.total_is_exact);
+
+        assert_eq!(page1.rows[0][0], CellValue::Int(1));
+        assert!(matches!(page1.rows[0][1], CellValue::Uuid(_)));
+        assert_eq!(page1.rows[0][2], CellValue::Text("Troy Barnes".to_owned()));
+        assert_eq!(page1.rows[0][3], CellValue::Text("troy@greendale.edu".to_owned()));
+        assert_eq!(page1.rows[0][4], CellValue::Bool(true));
+        assert_eq!(page1.rows[0][5], CellValue::Numeric("3.45".to_owned()));
+        assert_eq!(page1.rows[0][6], CellValue::Text("AirConditioning".to_owned()));
+        assert_eq!(page1.rows[0][7], CellValue::Array("{football,plumbing}".to_owned()));
+        assert!(matches!(page1.rows[0][8], CellValue::Json(_)));
+        assert_eq!(page1.rows[0][9], CellValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert!(matches!(page1.rows[0][11], CellValue::Timestamp { utc: Some(_), .. }));
+
+        // Row 2 has SQL NULL email
+        assert_eq!(page1.rows[1][3], CellValue::Null);
+
+        // Fetch page 2 (limit 2, offset 2) -> exact total 4
+        let (page2, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "student_id".to_owned(),
+                    ascending: true,
+                }),
+                limit: 2,
+                offset: 2,
+            })
+            .await
+            .expect("fetch page 2");
+        assert_eq!(page2.rows.len(), 2);
+        assert!(!page2.has_more);
+        assert!(page2.total_is_exact);
+        assert_eq!(page2.total_rows_estimate, Some(4));
+        // Annie has empty string "" email vs Abed's SQL NULL
+        assert_eq!(page2.rows[0][3], CellValue::Text(String::new()));
+        // Jeff has NULL profile and empty bytea
+        assert_eq!(page2.rows[1][8], CellValue::Null);
+        assert_eq!(page2.rows[1][9], CellValue::Bytes(Vec::new()));
+
+        // WHERE filter + DESC sort
+        let (filtered, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("enrolled = true".to_owned()),
+                sort: Some(SortSpec {
+                    column: "student_id".to_owned(),
+                    ascending: false,
+                }),
+                limit: 50,
+                offset: 0,
+            })
+            .await
+            .expect("filtered desc");
+        assert_eq!(filtered.rows.len(), 3);
+        assert_eq!(filtered.rows[0][0], CellValue::Int(3));
+
+        // Unknown sort column is rejected at boundary
+        let bad_sort = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "not_a_real_column".to_owned(),
+                    ascending: true,
+                }),
+                limit: 10,
+                offset: 0,
+            })
+            .await;
+        assert!(matches!(bad_sort, Err(DbError::InvalidInput(_))));
+
+        // Syntax-broken WHERE filter returns DbError::QueryFailed
+        let bad_where = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("student_id == 'nope'".to_owned()),
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await;
+        assert!(matches!(bad_where, Err(DbError::QueryFailed { .. })));
+
+        // Structure & Indexes introspection
+        let (structure, _) = session
+            .describe_table("public", "students")
+            .await
+            .expect("describe_table students");
+        assert_eq!(structure.columns.len(), 12);
+        assert!(structure.columns[0].is_primary_key);
+        assert!(structure.columns[1].is_unique);
+        assert_eq!(structure.columns[2].comment.as_deref(), Some("Preferred display name"));
+        let fk = structure.columns[10].foreign_key.as_ref().expect("group_id FK");
+        assert_eq!(fk.target_table, "study_groups");
+        assert_eq!(fk.target_column, "group_id");
+
+        assert_eq!(structure.indexes.len(), 3);
+        assert!(structure.indexes.iter().any(|i| i.is_primary && i.columns == ["student_id"]));
+        assert!(structure.indexes.iter().any(|i| i.name == "students_profile_gin" && i.method == "gin"));
+        assert!(structure.stats.total_bytes.is_some());
+        assert_eq!(
+            structure.stats.comment.as_deref(),
+            Some("Greendale Community College active roster")
+        );
+        assert!(structure.stats.ddl.contains("CREATE TABLE \"public\".\"students\""));
+
+        // View DDL introspection
+        let (view_struct, _) = session
+            .describe_table("public", "active_students_view")
+            .await
+            .expect("describe_table view");
+        assert!(view_struct.stats.ddl.contains("CREATE OR REPLACE VIEW \"public\".\"active_students_view\""));
 
         session.ping().await.expect("ping succeeds");
     });

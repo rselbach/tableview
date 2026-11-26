@@ -17,8 +17,10 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::connection::{ConnectionProfile, PasswordMode, SslConfig, SslMode};
 use crate::engine::{
-    ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql, SchemaInfo, ServerInfo,
+    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
+    ForeignKeyRef, IndexInfo, PageRequest, SchemaInfo, ServerInfo, TablePage, TableStats, TableStructure,
 };
+use std::collections::HashMap;
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -129,6 +131,91 @@ impl PostgresSession {
             return Err(DbError::Disconnected);
         }
         Ok(())
+    }
+
+    async fn fetch_column_metas(&self, schema: &str, table: &str) -> Result<(Vec<ColumnMeta>, ExecutedSql), DbError> {
+        let col_sql = "SELECT \
+                       a.attname, \
+                       pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                       t.typname, \
+                       NOT a.attnotnull, \
+                       pg_catalog.pg_get_expr(ad.adbin, ad.adrelid), \
+                       BOOL_OR(COALESCE(i.indisprimary, false)), \
+                       BOOL_OR(COALESCE(i.indisunique AND NOT i.indisprimary AND i.indnkeyatts = 1 AND a.attnum = i.indkey[0], false)), \
+                       pg_catalog.col_description(c.oid, a.attnum) \
+                       FROM pg_catalog.pg_attribute a \
+                       JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                       JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
+                       LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
+                       LEFT JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND a.attnum = ANY(i.indkey) \
+                       WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
+                       GROUP BY c.oid, a.attnum, a.attname, a.atttypid, a.atttypmod, t.typname, a.attnotnull, ad.adbin, ad.adrelid \
+                       ORDER BY a.attnum ASC";
+        let start = Instant::now();
+        let col_rows = self
+            .client
+            .query(col_sql, &[&schema, &table])
+            .await
+            .map_err(map_pg_err)?;
+
+        let fk_sql = "SELECT a_src.attname, con.conname, nf.nspname, cf.relname, a_dst.attname \
+                      FROM pg_catalog.pg_constraint con \
+                      JOIN pg_catalog.pg_class cs ON cs.oid = con.conrelid \
+                      JOIN pg_catalog.pg_namespace ns ON ns.oid = cs.relnamespace \
+                      JOIN pg_catalog.pg_class cf ON cf.oid = con.confrelid \
+                      JOIN pg_catalog.pg_namespace nf ON nf.oid = cf.relnamespace \
+                      JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS u(src_att, dst_att, ord) ON true \
+                      JOIN pg_catalog.pg_attribute a_src ON a_src.attrelid = con.conrelid AND a_src.attnum = u.src_att \
+                      JOIN pg_catalog.pg_attribute a_dst ON a_dst.attrelid = con.confrelid AND a_dst.attnum = u.dst_att \
+                      WHERE con.contype = 'f' AND ns.nspname = $1 AND cs.relname = $2 \
+                      ORDER BY con.conname ASC, u.ord ASC";
+        let fk_rows = self
+            .client
+            .query(fk_sql, &[&schema, &table])
+            .await
+            .map_err(map_pg_err)?;
+
+        let mut fks: HashMap<String, ForeignKeyRef> = HashMap::new();
+        for row in fk_rows {
+            let col_name: String = row.get(0);
+            fks.entry(col_name).or_insert_with(|| ForeignKeyRef {
+                constraint_name: row.get(1),
+                target_schema: row.get(2),
+                target_table: row.get(3),
+                target_column: row.get(4),
+            });
+        }
+
+        let columns = col_rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(0);
+                let foreign_key = fks.remove(&name);
+                ColumnMeta {
+                    name,
+                    data_type: row.get(1),
+                    udt_name: row.get(2),
+                    nullable: row.get(3),
+                    default_expr: row.get(4),
+                    is_primary_key: row.get(5),
+                    is_unique: row.get(6),
+                    comment: row.get(7),
+                    foreign_key,
+                }
+            })
+            .collect();
+
+        let log = ExecutedSql {
+            sql: format!(
+                "{col_sql} -- $1 = '{}', $2 = '{}'",
+                schema.replace('\'', "''"),
+                table.replace('\'', "''")
+            ),
+            duration_ms: start.elapsed().as_millis() as u64,
+            error: None,
+        };
+        Ok((columns, log))
     }
 }
 
@@ -302,6 +389,348 @@ impl DbSession for PostgresSession {
         self.client.simple_query("SELECT 1").await.map_err(map_pg_err)?;
         Ok(())
     }
+
+    async fn fetch_table_page(&self, req: &PageRequest) -> Result<(TablePage, Vec<ExecutedSql>), DbError> {
+        self.ensure_alive()?;
+        let limit = req.limit.clamp(1, 5000);
+        let offset = req.offset.max(0);
+        let (columns, _) = self.fetch_column_metas(&req.schema, &req.table).await?;
+
+        if columns.is_empty() {
+            return Ok((
+                TablePage {
+                    columns,
+                    rows: Vec::new(),
+                    offset,
+                    limit,
+                    total_rows_estimate: Some(0),
+                    total_is_exact: true,
+                    has_more: false,
+                    elapsed_ms: 0,
+                },
+                Vec::new(),
+            ));
+        }
+
+        if let Some(sort) = &req.sort
+            && !columns.iter().any(|c| c.name == sort.column)
+        {
+            return Err(DbError::InvalidInput(format!(
+                "unknown sort column: {}",
+                sort.column
+            )));
+        }
+
+        let sql = build_table_page_sql(&req.schema, &req.table, &columns, req, limit, offset);
+        let start = Instant::now();
+        let pg_rows = self.client.query(&sql, &[]).await.map_err(map_pg_err)?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let mut logs = vec![ExecutedSql {
+            sql,
+            duration_ms: elapsed_ms,
+            error: None,
+        }];
+
+        let has_more = pg_rows.len() > limit as usize;
+        let row_count = pg_rows.len().min(limit as usize);
+        let mut decoded_rows = Vec::with_capacity(row_count);
+        for row in pg_rows.into_iter().take(limit as usize) {
+            let mut cells = Vec::with_capacity(columns.len());
+            for (idx, col) in columns.iter().enumerate() {
+                let raw = row.try_get::<usize, Option<String>>(idx).map_err(map_pg_err)?;
+                cells.push(CellValue::parse_from_pg_text(&col.udt_name, raw));
+            }
+            decoded_rows.push(cells);
+        }
+
+        let filter_active = req
+            .filter_where
+            .as_deref()
+            .is_some_and(|w| !w.trim().is_empty());
+
+        let (total_rows_estimate, total_is_exact) = if !has_more {
+            (Some(offset + decoded_rows.len() as i64), true)
+        } else if !filter_active {
+            let est_sql = "SELECT CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint ELSE NULL END \
+                           FROM pg_catalog.pg_class c \
+                           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                           WHERE n.nspname = $1 AND c.relname = $2";
+            let est_start = Instant::now();
+            let est = match self.client.query_opt(est_sql, &[&req.schema, &req.table]).await {
+                Ok(Some(r)) => r.get::<usize, Option<i64>>(0),
+                _ => None,
+            };
+            logs.push(ExecutedSql {
+                sql: format!(
+                    "{est_sql} -- $1 = '{}', $2 = '{}'",
+                    req.schema.replace('\'', "''"),
+                    req.table.replace('\'', "''")
+                ),
+                duration_ms: est_start.elapsed().as_millis() as u64,
+                error: None,
+            });
+            (est, false)
+        } else {
+            (None, false)
+        };
+
+        Ok((
+            TablePage {
+                columns,
+                rows: decoded_rows,
+                offset,
+                limit,
+                total_rows_estimate,
+                total_is_exact,
+                has_more,
+                elapsed_ms,
+            },
+            logs,
+        ))
+    }
+
+    async fn describe_table(&self, schema: &str, table: &str) -> Result<(TableStructure, Vec<ExecutedSql>), DbError> {
+        self.ensure_alive()?;
+        let mut logs = Vec::new();
+        let (columns, col_log) = self.fetch_column_metas(schema, table).await?;
+        logs.push(col_log);
+
+        let idx_sql = "SELECT \
+                       ic.relname, \
+                       i.indisunique, \
+                       i.indisprimary, \
+                       am.amname, \
+                       CASE WHEN tc.relkind IN ('r', 'p', 'm') THEN pg_catalog.pg_relation_size(ic.oid) ELSE NULL END, \
+                       pg_catalog.pg_get_indexdef(ic.oid), \
+                       ARRAY( \
+                           SELECT COALESCE(a.attname::text, '<expr>') \
+                           FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
+                           LEFT JOIN pg_catalog.pg_attribute a \
+                               ON a.attrelid = tc.oid AND a.attnum = k.attnum AND k.attnum > 0 \
+                           ORDER BY k.ord \
+                       ) \
+                       FROM pg_catalog.pg_index i \
+                       JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
+                       JOIN pg_catalog.pg_class tc ON tc.oid = i.indrelid \
+                       JOIN pg_catalog.pg_namespace n ON n.oid = tc.relnamespace \
+                       JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                       WHERE n.nspname = $1 AND tc.relname = $2 \
+                       ORDER BY i.indisprimary DESC, i.indisunique DESC, ic.relname ASC";
+        let idx_start = Instant::now();
+        let idx_rows = self
+            .client
+            .query(idx_sql, &[&schema, &table])
+            .await
+            .map_err(map_pg_err)?;
+        logs.push(ExecutedSql {
+            sql: format!(
+                "{idx_sql} -- $1 = '{}', $2 = '{}'",
+                schema.replace('\'', "''"),
+                table.replace('\'', "''")
+            ),
+            duration_ms: idx_start.elapsed().as_millis() as u64,
+            error: None,
+        });
+
+        let indexes: Vec<IndexInfo> = idx_rows
+            .into_iter()
+            .map(|row| IndexInfo {
+                name: row.get(0),
+                is_unique: row.get(1),
+                is_primary: row.get(2),
+                method: row.get(3),
+                size_bytes: row.get(4),
+                definition: row.get(5),
+                columns: row.get(6),
+            })
+            .collect();
+
+        let stats_sql = "SELECT \
+                         c.relkind::text, \
+                         CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_catalog.pg_total_relation_size(c.oid) ELSE NULL END, \
+                         CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_catalog.pg_table_size(c.oid) ELSE NULL END, \
+                         CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_catalog.pg_indexes_size(c.oid) ELSE NULL END, \
+                         CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint ELSE NULL END, \
+                         pg_catalog.obj_description(c.oid, 'pg_class'), \
+                         CASE WHEN c.relkind IN ('v', 'm') THEN pg_catalog.pg_get_viewdef(c.oid, true) ELSE NULL END \
+                         FROM pg_catalog.pg_class c \
+                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND c.relname = $2";
+        let stats_start = Instant::now();
+        let stats_row = self
+            .client
+            .query_opt(stats_sql, &[&schema, &table])
+            .await
+            .map_err(map_pg_err)?;
+        logs.push(ExecutedSql {
+            sql: format!(
+                "{stats_sql} -- $1 = '{}', $2 = '{}'",
+                schema.replace('\'', "''"),
+                table.replace('\'', "''")
+            ),
+            duration_ms: stats_start.elapsed().as_millis() as u64,
+            error: None,
+        });
+
+        let stats = if let Some(row) = stats_row {
+            let relkind: String = row.get(0);
+            let total_bytes: Option<i64> = row.get(1);
+            let data_bytes: Option<i64> = row.get(2);
+            let index_bytes: Option<i64> = row.get(3);
+            let estimated_rows: Option<i64> = row.get(4);
+            let comment: Option<String> = row.get(5);
+            let view_def: Option<String> = row.get(6);
+
+            let ddl = match relkind.as_str() {
+                "v" => format!(
+                    "CREATE OR REPLACE VIEW {}.{} AS\n{};",
+                    quote_ident(schema),
+                    quote_ident(table),
+                    view_def.as_deref().unwrap_or("").trim()
+                ),
+                "m" => format!(
+                    "CREATE MATERIALIZED VIEW {}.{} AS\n{};",
+                    quote_ident(schema),
+                    quote_ident(table),
+                    view_def.as_deref().unwrap_or("").trim()
+                ),
+                _ => synthesize_table_ddl(schema, table, &columns, &indexes),
+            };
+            TableStats {
+                total_bytes,
+                data_bytes,
+                index_bytes,
+                estimated_rows,
+                comment,
+                ddl,
+            }
+        } else {
+            TableStats {
+                total_bytes: None,
+                data_bytes: None,
+                index_bytes: None,
+                estimated_rows: None,
+                comment: None,
+                ddl: synthesize_table_ddl(schema, table, &columns, &indexes),
+            }
+        };
+
+        Ok((
+            TableStructure {
+                columns,
+                indexes,
+                stats,
+            },
+            logs,
+        ))
+    }
+}
+
+/// Quotes a PostgreSQL SQL identifier safely by doubling embedded double quotes.
+pub fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Builds the paginated `SELECT` query with safe identifier quoting and text/hex projection.
+pub fn build_table_page_sql(
+    schema: &str,
+    table: &str,
+    columns: &[ColumnMeta],
+    req: &PageRequest,
+    limit: i64,
+    offset: i64,
+) -> String {
+    let mut projections = String::new();
+    for (idx, col) in columns.iter().enumerate() {
+        if idx > 0 {
+            projections.push_str(", ");
+        }
+        let quoted = quote_ident(&col.name);
+        if col.udt_name == "bytea" {
+            projections.push_str(&format!("pg_catalog.encode({quoted}, 'hex')"));
+        } else {
+            projections.push_str(&format!("{quoted}::text"));
+        }
+    }
+
+    let mut sql = format!(
+        "SELECT {projections} FROM {}.{}",
+        quote_ident(schema),
+        quote_ident(table)
+    );
+    if let Some(where_clause) = &req.filter_where {
+        let trimmed = where_clause.trim();
+        if !trimmed.is_empty() {
+            sql.push_str(&format!(" WHERE ({trimmed})"));
+        }
+    }
+    if let Some(sort) = &req.sort {
+        let dir = if sort.ascending { "ASC" } else { "DESC" };
+        sql.push_str(&format!(" ORDER BY {} {dir} NULLS LAST", quote_ident(&sort.column)));
+    }
+    sql.push_str(&format!(" LIMIT {} OFFSET {}", limit + 1, offset));
+    sql
+}
+
+/// Synthesizes a readable PostgreSQL `CREATE TABLE` DDL statement from columns, constraints, and indexes.
+pub fn synthesize_table_ddl(
+    schema: &str,
+    table: &str,
+    columns: &[ColumnMeta],
+    indexes: &[IndexInfo],
+) -> String {
+    let mut out = format!("CREATE TABLE {}.{} (\n", quote_ident(schema), quote_ident(table));
+    let mut clauses: Vec<String> = Vec::with_capacity(columns.len() + 4);
+
+    for col in columns {
+        let mut line = format!("    {} {}", quote_ident(&col.name), col.data_type);
+        if !col.nullable {
+            line.push_str(" NOT NULL");
+        }
+        if let Some(def) = &col.default_expr {
+            line.push_str(&format!(" DEFAULT {def}"));
+        }
+        clauses.push(line);
+    }
+
+    let pk_cols: Vec<String> = columns
+        .iter()
+        .filter(|c| c.is_primary_key)
+        .map(|c| quote_ident(&c.name))
+        .collect();
+    if !pk_cols.is_empty() {
+        clauses.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
+    }
+
+    for col in columns {
+        if let Some(fk) = &col.foreign_key {
+            clauses.push(format!(
+                "    CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({})",
+                quote_ident(&fk.constraint_name),
+                quote_ident(&col.name),
+                quote_ident(&fk.target_schema),
+                quote_ident(&fk.target_table),
+                quote_ident(&fk.target_column),
+            ));
+        }
+    }
+
+    out.push_str(&clauses.join(",\n"));
+    out.push_str("\n);");
+
+    let extra_indexes: Vec<&IndexInfo> = indexes.iter().filter(|idx| !idx.is_primary).collect();
+    if !extra_indexes.is_empty() {
+        out.push('\n');
+        for idx in extra_indexes {
+            out.push('\n');
+            out.push_str(idx.definition.trim());
+            if !idx.definition.trim_end().ends_with(';') {
+                out.push(';');
+            }
+        }
+    }
+    out
 }
 
 async fn connect_raw(

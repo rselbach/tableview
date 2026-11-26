@@ -1,9 +1,11 @@
 #![allow(clippy::expect_used)]
 
+use chrono::Datelike;
 use tempfile::tempdir;
+use tv_core::engine::postgres::{quote_ident, synthesize_table_ddl};
 use tv_core::{
-    AccentColor, ConnectionProfile, ConnectionStore, EnvTag, PasswordMode, SafetyPolicy, SortOrder, SslMode,
-    StoreData, UrlParseError, ValidationError,
+    AccentColor, CellValue, ColumnMeta, ConnectionProfile, ConnectionStore, EnvTag, ForeignKeyRef, IndexInfo,
+    PasswordMode, SafetyPolicy, SortOrder, SslMode, StoreData, UrlParseError, ValidationError,
 };
 
 #[test]
@@ -94,4 +96,108 @@ fn connection_store_roundtrip_duplicate_sort_delete_and_import() {
     assert_eq!(count, 3);
     assert!(other.delete(copy.id));
     assert_eq!(other.connections.len(), 2);
+}
+
+#[test]
+fn cell_value_parses_pg_types_and_preserves_null_vs_empty_string() {
+    assert_eq!(CellValue::parse_from_pg_text("text", None), CellValue::Null);
+    assert!(CellValue::parse_from_pg_text("text", None).is_null());
+
+    let empty = CellValue::parse_from_pg_text("text", Some(String::new()));
+    assert_eq!(empty, CellValue::Text(String::new()));
+    assert!(!empty.is_null());
+
+    assert_eq!(CellValue::parse_from_pg_text("bool", Some("t".to_owned())), CellValue::Bool(true));
+    assert_eq!(CellValue::parse_from_pg_text("bool", Some("f".to_owned())), CellValue::Bool(false));
+    assert_eq!(CellValue::parse_from_pg_text("int4", Some("42".to_owned())), CellValue::Int(42));
+    assert_eq!(
+        CellValue::parse_from_pg_text("float8", Some("3.75".to_owned())),
+        CellValue::Float(3.75)
+    );
+    assert_eq!(
+        CellValue::parse_from_pg_text("numeric", Some("3.9500".to_owned())),
+        CellValue::Numeric("3.9500".to_owned())
+    );
+
+    let uid = "210b3d6b-da52-4259-ac05-b58d3d0a6d5b";
+    let parsed_uid = CellValue::parse_from_pg_text("uuid", Some(uid.to_owned()));
+    assert!(matches!(parsed_uid, CellValue::Uuid(u) if u.to_string() == uid));
+
+    // PostgreSQL wire format includes +00, -05, or +05:30 offsets for timestamptz
+    let ts_utc = CellValue::parse_from_pg_text("timestamptz", Some("2026-11-19 18:09:11.432+00".to_owned()));
+    assert!(matches!(ts_utc, CellValue::Timestamp { utc: Some(dt), .. } if dt.year() == 2026));
+
+    let ts_short_tz = CellValue::parse_from_pg_text("timestamptz", Some("2026-11-19 13:09:11.432-05".to_owned()));
+    assert!(matches!(ts_short_tz, CellValue::Timestamp { utc: Some(_), .. }));
+
+    // Naive timestamp preserves `utc: None` instead of fabricating a timezone
+    let ts_naive = CellValue::parse_from_pg_text("timestamp", Some("2026-11-19 18:09:11.432".to_owned()));
+    assert!(matches!(ts_naive, CellValue::Timestamp { utc: None, .. }));
+
+    let json = CellValue::parse_from_pg_text("jsonb", Some(r#"{"campus":"Greendale","seat":1}"#.to_owned()));
+    let pretty = json.pretty_json().expect("pretty json");
+    assert!(pretty.contains('\n'));
+    assert!(pretty.contains("\"campus\": \"Greendale\""));
+
+    let bytes = CellValue::parse_from_pg_text("bytea", Some("cafebabe".to_owned()));
+    assert_eq!(bytes, CellValue::Bytes(vec![0xca, 0xfe, 0xba, 0xbe]));
+    assert_eq!(bytes.copy_text(), "\\xcafebabe");
+
+    let empty_bytes = CellValue::parse_from_pg_text("bytea", Some(String::new()));
+    assert_eq!(empty_bytes, CellValue::Bytes(Vec::new()));
+    assert_eq!(empty_bytes.display_compact(), "\\x (0 B)");
+
+    let arr = CellValue::parse_from_pg_text("_text", Some("{Spanish,Study}".to_owned()));
+    assert_eq!(arr, CellValue::Array("{Spanish,Study}".to_owned()));
+}
+
+#[test]
+fn quote_ident_and_ddl_synthesis_escape_correctly() {
+    assert_eq!(quote_ident("students"), "\"students\"");
+    assert_eq!(quote_ident("weird\"col"), "\"weird\"\"col\"");
+
+    let cols = vec![
+        ColumnMeta {
+            name: "student_id".to_owned(),
+            data_type: "integer".to_owned(),
+            udt_name: "int4".to_owned(),
+            nullable: false,
+            default_expr: Some("nextval('students_student_id_seq'::regclass)".to_owned()),
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "group_id".to_owned(),
+            data_type: "integer".to_owned(),
+            udt_name: "int4".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(ForeignKeyRef {
+                constraint_name: "students_group_fk".to_owned(),
+                target_schema: "public".to_owned(),
+                target_table: "study_groups".to_owned(),
+                target_column: "group_id".to_owned(),
+            }),
+        },
+    ];
+    let indexes = vec![IndexInfo {
+        name: "students_group_idx".to_owned(),
+        columns: vec!["group_id".to_owned()],
+        is_unique: false,
+        is_primary: false,
+        method: "btree".to_owned(),
+        size_bytes: Some(8192),
+        definition: "CREATE INDEX students_group_idx ON public.students USING btree (group_id)".to_owned(),
+    }];
+
+    let ddl = synthesize_table_ddl("public", "students", &cols, &indexes);
+    assert!(ddl.contains("CREATE TABLE \"public\".\"students\""));
+    assert!(ddl.contains("PRIMARY KEY (\"student_id\")"));
+    assert!(ddl.contains("CONSTRAINT \"students_group_fk\" FOREIGN KEY (\"group_id\") REFERENCES \"public\".\"study_groups\" (\"group_id\")"));
+    assert!(ddl.contains("CREATE INDEX students_group_idx ON public.students USING btree (group_id);"));
 }

@@ -10,7 +10,8 @@ pub use connection::{
     ValidationError,
 };
 pub use engine::{
-    ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql, SchemaInfo, ServerInfo,
+    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
+    ForeignKeyRef, IndexInfo, PageRequest, SchemaInfo, ServerInfo, SortSpec, TablePage, TableStats, TableStructure,
 };
 pub use ids::{ConnectionId, RequestId, SessionId, TabId};
 pub use storage::{ConnectionStore, SortOrder, StorageError, StoreData};
