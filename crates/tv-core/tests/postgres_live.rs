@@ -318,6 +318,81 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
             .expect("describe_table view");
         assert!(view_struct.stats.ddl.contains("CREATE OR REPLACE VIEW \"public\".\"active_students_view\""));
 
-        session.ping().await.expect("ping succeeds");
+        // Multi-statement SQL execution with typed column decoding
+        let stmts = vec![
+            "SELECT student_id, id, full_name, email, enrolled, gpa, profile, badge, created_at FROM public.students ORDER BY student_id".to_owned(),
+            "SELECT COUNT(*) AS student_total FROM public.students".to_owned(),
+        ];
+        let (batch, exec_logs) = session
+            .execute_sql(&stmts, None)
+            .await
+            .expect("execute multi-statement batch");
+        assert!(!batch.cancelled);
+        assert_eq!(exec_logs.len(), 2);
+        assert_eq!(batch.results.len(), 2);
+        assert_eq!(batch.results[0].rows.len(), 4);
+        assert_eq!(batch.results[0].rows[0][0], CellValue::Int(1));
+        assert!(matches!(batch.results[0].rows[0][1], CellValue::Uuid(_)));
+        assert_eq!(batch.results[0].rows[1][3], CellValue::Null);
+        assert_eq!(batch.results[0].rows[2][3], CellValue::Text(String::new()));
+        assert_eq!(batch.results[0].rows[0][5], CellValue::Numeric("3.45".to_owned()));
+        assert!(matches!(batch.results[0].rows[0][6], CellValue::Json(_)));
+        assert_eq!(batch.results[0].rows[0][7], CellValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert!(matches!(batch.results[0].rows[0][8], CellValue::Timestamp { utc: Some(_), .. }));
+        assert_eq!(batch.results[1].rows[0][0], CellValue::Int(4));
+
+        // Row limit enforcement preserves total_rows_seen & truncated flag
+        let (limited, _) = session
+            .execute_sql(&[stmts[0].clone()], Some(2))
+            .await
+            .expect("execute with row limit");
+        assert_eq!(limited.results[0].rows.len(), 2);
+        assert!(limited.results[0].truncated);
+        assert_eq!(limited.results[0].total_rows_seen, 4);
+
+        // DML statement reports rows_affected
+        let (dml, _) = session
+            .execute_sql(
+                &["UPDATE public.students SET enrolled = true WHERE student_id = 4".to_owned()],
+                None,
+            )
+            .await
+            .expect("execute DML update");
+        assert!(!dml.results[0].is_tabular());
+        assert_eq!(dml.results[0].rows_affected, Some(1));
+
+        // Syntax error stops subsequent statements cleanly
+        let (bad_batch, _) = session
+            .execute_sql(
+                &[
+                    "SELECT * FROM table_does_not_exist".to_owned(),
+                    "SELECT 42".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("returns batch with error result");
+        assert_eq!(bad_batch.results.len(), 1);
+        assert!(bad_batch.results[0].error.is_some());
+
+        // Live out-of-band cancellation via CancelToken
+        let shared = std::sync::Arc::new(session);
+        let runner = std::sync::Arc::clone(&shared);
+        let canceller = std::sync::Arc::clone(&shared);
+        let cancel_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            canceller.cancel_running_query().await
+        });
+        let cancel_start = std::time::Instant::now();
+        let (sleep_batch, _) = runner
+            .execute_sql(&["SELECT pg_sleep(5)".to_owned()], None)
+            .await
+            .expect("cancelled query returns cleanly");
+        let cancel_res = cancel_handle.await.expect("join cancel task");
+        assert!(cancel_res.is_ok(), "cancel call failed: {cancel_res:?}");
+        assert!(sleep_batch.cancelled);
+        assert!(cancel_start.elapsed() < std::time::Duration::from_secs(3));
+
+        shared.ping().await.expect("ping succeeds");
     });
 }

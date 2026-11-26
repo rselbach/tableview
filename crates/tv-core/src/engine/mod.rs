@@ -397,6 +397,8 @@ pub enum DbError {
     },
     #[error("database session is disconnected")]
     Disconnected,
+    #[error("query cancelled by user")]
+    Cancelled,
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -406,6 +408,55 @@ impl DbError {
     pub fn is_auth_failure(&self) -> bool {
         matches!(self, Self::AuthFailed(_))
     }
+}
+
+/// Result of executing one individual SQL statement in the SQL query editor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryStatementResult {
+    pub sql: String,
+    pub columns: Vec<ColumnMeta>,
+    pub rows: Vec<Vec<CellValue>>,
+    pub rows_affected: Option<u64>,
+    pub truncated: bool,
+    pub total_rows_seen: usize,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+impl QueryStatementResult {
+    pub fn is_tabular(&self) -> bool {
+        !self.columns.is_empty()
+    }
+
+    pub fn summary_label(&self) -> String {
+        if let Some(err) = &self.error {
+            return format!("Error: {err}");
+        }
+        if self.is_tabular() {
+            if self.truncated {
+                format!(
+                    "{} of {} rows (limited) · {} ms",
+                    self.rows.len(),
+                    self.total_rows_seen,
+                    self.elapsed_ms
+                )
+            } else {
+                format!("{} rows · {} ms", self.rows.len(), self.elapsed_ms)
+            }
+        } else if let Some(n) = self.rows_affected {
+            format!("{n} rows affected · {} ms", self.elapsed_ms)
+        } else {
+            format!("Completed · {} ms", self.elapsed_ms)
+        }
+    }
+}
+
+/// Complete outcome of executing one or more statements from the SQL query editor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueryBatchResult {
+    pub results: Vec<QueryStatementResult>,
+    pub total_elapsed_ms: u64,
+    pub cancelled: bool,
 }
 
 /// Record of an introspection or user query sent to the database, surfaced in the console log.
@@ -426,5 +477,11 @@ pub trait DbSession: Send + Sync {
     async fn list_columns(&self, schema: &str, object: &str) -> Result<(Vec<ColumnSummary>, ExecutedSql), DbError>;
     async fn fetch_table_page(&self, req: &PageRequest) -> Result<(TablePage, Vec<ExecutedSql>), DbError>;
     async fn describe_table(&self, schema: &str, table: &str) -> Result<(TableStructure, Vec<ExecutedSql>), DbError>;
+    async fn execute_sql(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError>;
+    async fn cancel_running_query(&self) -> Result<(), DbError>;
     async fn ping(&self) -> Result<(), DbError>;
 }

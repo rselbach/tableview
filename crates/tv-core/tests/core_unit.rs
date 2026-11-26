@@ -1,11 +1,13 @@
 #![allow(clippy::expect_used)]
 
-use chrono::Datelike;
+use chrono::{Datelike, Utc};
 use tempfile::tempdir;
 use tv_core::engine::postgres::{quote_ident, synthesize_table_ddl};
 use tv_core::{
-    AccentColor, CellValue, ColumnMeta, ConnectionProfile, ConnectionStore, EnvTag, ForeignKeyRef, IndexInfo,
-    PasswordMode, SafetyPolicy, SortOrder, SslMode, StoreData, UrlParseError, ValidationError,
+    AccentColor, CellValue, ColumnMeta, ConnectionId, ConnectionProfile, ConnectionStore, EnvTag, ForeignKeyRef,
+    IndexInfo, NewHistoryEntry, PasswordMode, QueryStore, SafetyPolicy, SavedQuery, SavedQueryId, SortOrder,
+    SslMode, StoreData, UrlParseError, ValidationError, cursor_line_col, format_sql, split_statements,
+    statement_at_cursor,
 };
 
 #[test]
@@ -200,4 +202,125 @@ fn quote_ident_and_ddl_synthesis_escape_correctly() {
     assert!(ddl.contains("PRIMARY KEY (\"student_id\")"));
     assert!(ddl.contains("CONSTRAINT \"students_group_fk\" FOREIGN KEY (\"group_id\") REFERENCES \"public\".\"study_groups\" (\"group_id\")"));
     assert!(ddl.contains("CREATE INDEX students_group_idx ON public.students USING btree (group_id);"));
+}
+
+#[test]
+fn sql_splitter_handles_quotes_comments_and_dollar_blocks() {
+    let sql = r#"
+        -- Ignore ; in line comments
+        /* Nested /* ; */ still ignored */
+        SELECT 'hello ; world', "weird;ident" FROM students;
+        CREATE FUNCTION greendale_noop() RETURNS void AS $fn$
+        BEGIN
+            PERFORM 1;
+            PERFORM 2;
+        END;
+        $fn$ LANGUAGE plpgsql;
+        ; -- trailing empty comment statement
+    "#;
+
+    let stmts = split_statements(sql);
+    assert_eq!(stmts.len(), 2);
+    assert!(stmts[0].sql.ends_with("FROM students"));
+    assert!(stmts[1].sql.starts_with("CREATE FUNCTION greendale_noop()"));
+    assert!(stmts[1].sql.ends_with("$fn$ LANGUAGE plpgsql"));
+}
+
+#[test]
+fn statement_at_cursor_respects_selection_and_caret_position() {
+    let sql = "SELECT 1;\nSELECT full_name FROM students;\nSELECT 3;";
+    // Caret inside second statement
+    let second_pos = sql.find("full_name").expect("find full_name");
+    let stmt = statement_at_cursor(sql, second_pos, second_pos).expect("second statement");
+    assert_eq!(stmt.sql, "SELECT full_name FROM students");
+
+    // Non-empty explicit selection wins over statement boundary
+    let sel_start = sql.find("full_name").expect("start");
+    let sel_end = sel_start + "full_name".len();
+    let selected = statement_at_cursor(sql, sel_start, sel_end).expect("selected slice");
+    assert_eq!(selected.sql, "full_name");
+
+    // Caret right after semicolon on line 1 selects statement 1
+    let after_semi = "SELECT 1;".len();
+    let first = statement_at_cursor(sql, after_semi, after_semi).expect("first statement");
+    assert_eq!(first.sql, "SELECT 1");
+
+    assert_eq!(cursor_line_col(sql, 0), (1, 1));
+    assert_eq!(cursor_line_col(sql, second_pos), (2, 8));
+}
+
+#[test]
+fn format_sql_uppercases_keywords_and_preserves_literals_and_comments() {
+    let raw = "select student_id, full_name from public.students where email = 'troy;and;abed' and gpa >= 3.5 order by student_id desc; -- keep 'lower'";
+    let formatted = format_sql(raw);
+    assert!(formatted.starts_with("SELECT student_id, full_name\nFROM public.students\nWHERE email = 'troy;and;abed' AND gpa >= 3.5\nORDER BY student_id DESC;"));
+    assert!(formatted.contains("'troy;and;abed'"));
+    assert!(formatted.contains("-- keep 'lower'"));
+}
+
+#[test]
+fn query_store_persists_history_and_saved_queries_roundtrip() {
+    let store = QueryStore::open_in_memory().expect("open memory query store");
+    let cid_a = ConnectionId::new();
+    let cid_b = ConnectionId::new();
+
+    let h1 = store
+        .record_history(&NewHistoryEntry {
+            connection_id: Some(cid_a),
+            connection_name: "greendale_local".to_owned(),
+            database_name: Some("greendale_idp_dev".to_owned()),
+            sql: "SELECT * FROM students ORDER BY gpa DESC".to_owned(),
+            duration_ms: 12,
+            rows_count: Some(8),
+            error: None,
+        })
+        .expect("record h1");
+    assert_eq!(h1.rows_count, Some(8));
+
+    store
+        .record_history(&NewHistoryEntry {
+            connection_id: Some(cid_b),
+            connection_name: "study_room_dev".to_owned(),
+            database_name: Some("study_groups_dev".to_owned()),
+            sql: "SELECT COUNT(*) FROM study_groups".to_owned(),
+            duration_ms: 4,
+            rows_count: Some(1),
+            error: None,
+        })
+        .expect("record h2");
+
+    let all_hist = store.list_history(None, None, 50).expect("list all");
+    assert_eq!(all_hist.len(), 2);
+    assert_eq!(store.list_history(Some(cid_a), None, 50).expect("filter conn").len(), 1);
+    assert_eq!(store.list_history(None, Some("gpa"), 50).expect("filter search").len(), 1);
+
+    store.clear_history(Some(cid_a)).expect("clear conn a");
+    assert_eq!(store.list_history(None, None, 50).expect("remaining").len(), 1);
+
+    let qid = SavedQueryId::new();
+    let saved = SavedQuery {
+        id: qid,
+        connection_id: Some(cid_a),
+        folder: Some("Study Room".to_owned()),
+        name: "Honor Roll".to_owned(),
+        sql: "SELECT full_name, gpa FROM students WHERE gpa >= 3.8".to_owned(),
+        updated_at: Utc::now(),
+    };
+    store.upsert_saved_query(&saved).expect("insert saved");
+
+    let list_a = store.list_saved_queries(Some(cid_a), None).expect("list saved a");
+    assert_eq!(list_a.len(), 1);
+    assert_eq!(list_a[0].name, "Honor Roll");
+
+    let list_b = store.list_saved_queries(Some(cid_b), None).expect("list saved b");
+    assert!(list_b.is_empty());
+
+    let mut updated = saved.clone();
+    updated.sql = "SELECT full_name FROM students".to_owned();
+    store.upsert_saved_query(&updated).expect("update saved");
+    let loaded = store.get_saved_query(qid).expect("get saved").expect("exists");
+    assert_eq!(loaded.sql, "SELECT full_name FROM students");
+
+    store.delete_saved_query(qid).expect("delete saved");
+    assert!(store.get_saved_query(qid).expect("get deleted").is_none());
 }

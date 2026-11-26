@@ -12,13 +12,14 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, TrustAnchor, 
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme};
 use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
 use tokio::task::JoinHandle;
-use tokio_postgres::{Config, NoTls};
+use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::connection::{ConnectionProfile, PasswordMode, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    ForeignKeyRef, IndexInfo, PageRequest, SchemaInfo, ServerInfo, TablePage, TableStats, TableStructure,
+    ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
+    TablePage, TableStats, TableStructure,
 };
 use std::collections::HashMap;
 
@@ -35,6 +36,8 @@ fn ensure_crypto_provider() {
 pub struct PostgresSession {
     client: Arc<tokio_postgres::Client>,
     server_info: ServerInfo,
+    ssl: SslConfig,
+    use_tls_for_cancel: bool,
     disconnected: Arc<AtomicBool>,
     conn_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -66,7 +69,7 @@ impl PostgresSession {
             .or_else(|| profile.database.as_deref().map(str::trim).filter(|s| !s.is_empty()));
 
         let effective_db = target_db.unwrap_or("postgres");
-        let (client, conn_task, disconnected) =
+        let (client, conn_task, disconnected, used_tls) =
             match connect_raw(profile, password, effective_db).await {
                 Ok(ok) => ok,
                 Err(err) if target_db.is_none() && is_missing_database_error(&err) && profile.user.trim() != "postgres" => {
@@ -82,6 +85,8 @@ impl PostgresSession {
                 current_database: effective_db.to_owned(),
                 current_user: profile.user.trim().to_owned(),
             },
+            ssl: profile.ssl.clone(),
+            use_tls_for_cancel: used_tls,
             disconnected,
             conn_task: Mutex::new(Some(conn_task)),
         };
@@ -625,6 +630,180 @@ impl DbSession for PostgresSession {
             logs,
         ))
     }
+
+    async fn execute_sql(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        self.ensure_alive()?;
+        let batch_start = Instant::now();
+        let mut results = Vec::new();
+        let mut logs = Vec::new();
+        let mut cancelled = false;
+
+        for raw_stmt in statements {
+            let stmt = raw_stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            let start = Instant::now();
+            let prepared_cols: Option<Vec<(String, String)>> = self
+                .client
+                .prepare(stmt)
+                .await
+                .ok()
+                .map(|s| {
+                    s.columns()
+                        .iter()
+                        .map(|c| (c.name().to_owned(), c.type_().name().to_owned()))
+                        .collect()
+                });
+
+            match self.client.simple_query(stmt).await {
+                Ok(messages) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    let mut columns: Vec<ColumnMeta> = Vec::new();
+                    let mut rows: Vec<Vec<CellValue>> = Vec::new();
+                    let mut rows_affected: Option<u64> = None;
+                    let mut truncated = false;
+                    let mut total_rows_seen = 0usize;
+
+                    for msg in messages {
+                        match msg {
+                            SimpleQueryMessage::RowDescription(desc) => {
+                                columns = desc
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, col)| {
+                                        let udt_name = prepared_cols
+                                            .as_ref()
+                                            .and_then(|pc| pc.get(idx))
+                                            .filter(|(_, _)| prepared_cols.as_ref().is_some_and(|p| p.len() == desc.len()))
+                                            .map_or_else(|| "text".to_owned(), |(_, ty)| ty.clone());
+                                        ColumnMeta {
+                                            name: col.name().to_owned(),
+                                            data_type: human_pg_type(&udt_name).to_owned(),
+                                            udt_name,
+                                            nullable: true,
+                                            default_expr: None,
+                                            is_primary_key: false,
+                                            is_unique: false,
+                                            comment: None,
+                                            foreign_key: None,
+                                        }
+                                    })
+                                    .collect();
+                            }
+                            SimpleQueryMessage::Row(row) => {
+                                total_rows_seen += 1;
+                                if row_limit.is_none_or(|lim| rows.len() < lim) {
+                                    let mut decoded = Vec::with_capacity(columns.len());
+                                    for (idx, col) in columns.iter().enumerate() {
+                                        let val = row.get(idx).map(str::to_owned);
+                                        decoded.push(CellValue::parse_from_pg_text(&col.udt_name, val));
+                                    }
+                                    rows.push(decoded);
+                                } else {
+                                    truncated = true;
+                                }
+                            }
+                            SimpleQueryMessage::CommandComplete(affected) => {
+                                rows_affected = Some(affected);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    logs.push(ExecutedSql {
+                        sql: stmt.to_owned(),
+                        duration_ms: elapsed_ms,
+                        error: None,
+                    });
+                    results.push(QueryStatementResult {
+                        sql: stmt.to_owned(),
+                        columns,
+                        rows,
+                        rows_affected,
+                        truncated,
+                        total_rows_seen,
+                        elapsed_ms,
+                        error: None,
+                    });
+                }
+                Err(pg_err) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    let mapped = map_pg_err(pg_err);
+                    if matches!(mapped, DbError::Cancelled) {
+                        cancelled = true;
+                    }
+                    let err_msg = mapped.to_string();
+                    logs.push(ExecutedSql {
+                        sql: stmt.to_owned(),
+                        duration_ms: elapsed_ms,
+                        error: Some(err_msg.clone()),
+                    });
+                    results.push(QueryStatementResult {
+                        sql: stmt.to_owned(),
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        rows_affected: None,
+                        truncated: false,
+                        total_rows_seen: 0,
+                        elapsed_ms,
+                        error: Some(err_msg),
+                    });
+                    break;
+                }
+            }
+        }
+
+        Ok((
+            QueryBatchResult {
+                results,
+                total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                cancelled,
+            },
+            logs,
+        ))
+    }
+
+    async fn cancel_running_query(&self) -> Result<(), DbError> {
+        self.ensure_alive()?;
+        let token = self.client.cancel_token();
+        if !self.use_tls_for_cancel {
+            token.cancel_query(NoTls).await.map_err(map_pg_err)?;
+            return Ok(());
+        }
+        let tls_cfg = build_rustls_config(&self.ssl)?;
+        let connector = MakeRustlsConnect::new(tls_cfg);
+        match token.cancel_query(connector).await {
+            Ok(()) => Ok(()),
+            Err(err) if self.ssl.mode == SslMode::Prefer && err.as_db_error().is_none() => {
+                token.cancel_query(NoTls).await.map_err(map_pg_err)
+            }
+            Err(err) => Err(map_pg_err(err)),
+        }
+    }
+}
+
+fn human_pg_type(udt_name: &str) -> &str {
+    match udt_name {
+        "int2" => "smallint",
+        "int4" => "integer",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "bool" => "boolean",
+        "timestamptz" => "timestamp with time zone",
+        "timestamp" => "timestamp without time zone",
+        "timetz" => "time with time zone",
+        "_text" => "text[]",
+        "_int4" => "integer[]",
+        "_int8" => "bigint[]",
+        "_uuid" => "uuid[]",
+        other => other,
+    }
 }
 
 /// Quotes a PostgreSQL SQL identifier safely by doubling embedded double quotes.
@@ -737,7 +916,7 @@ async fn connect_raw(
     profile: &ConnectionProfile,
     password: Option<&str>,
     database: &str,
-) -> Result<(tokio_postgres::Client, JoinHandle<()>, Arc<AtomicBool>), DbError> {
+) -> Result<(tokio_postgres::Client, JoinHandle<()>, Arc<AtomicBool>, bool), DbError> {
     let mut cfg = Config::new();
     let host = profile.host.trim();
     cfg.host(host);
@@ -762,7 +941,8 @@ async fn connect_raw(
     };
 
     if !use_tls {
-        return connect_no_tls(&cfg).await;
+        let (c, h, d) = connect_no_tls(&cfg).await?;
+        return Ok((c, h, d, false));
     }
 
     let tls_cfg = build_rustls_config(&profile.ssl)?;
@@ -770,11 +950,12 @@ async fn connect_raw(
     match tokio::time::timeout(CONNECT_TIMEOUT, cfg.connect(connector)).await {
         Ok(Ok((client, connection))) => {
             let (handle, disconnected) = spawn_connection_driver(connection);
-            Ok((client, handle, disconnected))
+            Ok((client, handle, disconnected, true))
         }
         Ok(Err(err)) => {
             if profile.ssl.mode == SslMode::Prefer && err.as_db_error().is_none() {
-                connect_no_tls(&cfg).await
+                let (c, h, d) = connect_no_tls(&cfg).await?;
+                Ok((c, h, d, false))
             } else {
                 Err(map_pg_err(err))
             }
@@ -1017,6 +1198,9 @@ fn map_pg_err(err: tokio_postgres::Error) -> DbError {
         let code = db.code().code().to_owned();
         if code == "28P01" || code == "28000" {
             return DbError::AuthFailed(db.message().to_owned());
+        }
+        if code == "57014" {
+            return DbError::Cancelled;
         }
         return DbError::QueryFailed {
             message: db.message().to_owned(),

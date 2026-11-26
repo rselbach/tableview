@@ -46,6 +46,48 @@ impl FromStr for ConnectionId {
     }
 }
 
+/// Stable unique identifier for a saved SQL query in local storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SavedQueryId(Uuid);
+
+impl SavedQueryId {
+    /// Generates a new random v4 saved query identifier.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Creates a saved query identifier from an existing UUID.
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    /// Returns the underlying UUID.
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl Default for SavedQueryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for SavedQueryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for SavedQueryId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(s).map(Self)
+    }
+}
+
 /// Unique identifier for an open connection session in the workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(u64);
