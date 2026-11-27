@@ -9,6 +9,7 @@ pub mod safety_modal;
 pub mod settings_modal;
 pub mod staged_diff;
 pub mod table_grid;
+pub mod table_scroll;
 pub mod update_card;
 pub mod workspace;
 

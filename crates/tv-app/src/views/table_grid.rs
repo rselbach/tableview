@@ -20,6 +20,7 @@ use crate::state::{
     ActiveCellEdit, AppState, FkPeekState, RowKey, SessionState, TabContent, TableTabState, TableViewMode,
     parse_tab_id,
 };
+use crate::views::table_scroll::wrap_table_hscroll;
 use crate::views::{empty_cta, format_bytes, pill_badge};
 
 /// Builds the draggable horizontal tab strip across the top of the active session's main pane.
@@ -131,12 +132,13 @@ pub fn build_table_tab(
     session: &SessionState,
     tab: &TableTabState,
     k: &Kit,
+    cx: &Cx<AppState>,
     layer: &mut Vec<El>,
 ) -> El {
     let body = match tab.view_mode {
-        TableViewMode::Data => build_data_view(s, session, tab, k, layer),
-        TableViewMode::Structure => build_structure_view(s, tab, k),
-        TableViewMode::Indexes => build_indexes_view(s, tab, k),
+        TableViewMode::Data => build_data_view(s, session, tab, k, cx, layer),
+        TableViewMode::Structure => build_structure_view(s, tab, k, cx),
+        TableViewMode::Indexes => build_indexes_view(s, tab, k, cx),
     };
     let footer = build_table_footer(session, tab, k, layer);
 
@@ -231,6 +233,7 @@ fn build_data_view(
     session: &SessionState,
     tab: &TableTabState,
     k: &Kit,
+    cx: &Cx<AppState>,
     layer: &mut Vec<El>,
 ) -> El {
     let c = &k.c;
@@ -372,7 +375,7 @@ fn build_data_view(
             .child(text(err).font(k.ty.ui_compact).color(c.danger.fg).wrap())
             .child(empty_cta("Retry", k, true, |s, _| s.reload_active_tab()))
     } else if let Some(page) = &tab.page {
-        build_data_grid(s, session, tab, page, k, layer)
+        build_data_grid(s, session, tab, page, k, cx, layer)
     } else {
         col()
             .key("data-empty-init")
@@ -392,6 +395,7 @@ fn build_data_grid(
     tab: &TableTabState,
     page: &TablePage,
     k: &Kit,
+    cx: &Cx<AppState>,
     layer: &mut Vec<El>,
 ) -> El {
     let c = &k.c;
@@ -482,8 +486,10 @@ fn build_data_grid(
         table = table.column(column);
     }
 
+    let data_hscroll = tab.data_hscroll.clone();
     let built = table
         .row(move |s: &AppState, visual_idx, r| {
+            let r = data_hscroll.attach_row(r);
             let Some(tab) = s.active_session().and_then(SessionState::active_table_tab) else {
                 return r;
             };
@@ -741,6 +747,14 @@ fn build_data_grid(
     } else {
         built
     };
+    let grid_host = wrap_table_hscroll(
+        &format!("tv-data-{}", tab.tab_id.get()),
+        &tab.data_hscroll,
+        grid_host,
+        tab.visual_row_count() > 0,
+        cx,
+        k,
+    );
 
     let visible_anchor = anchor_rect.filter(|&[ax, ay, aw, ah]| {
         grid_rect.is_none_or(|[gx, gy, gw, gh]| {
@@ -1243,7 +1257,7 @@ fn mount_inline_cell_editor(
     layer.push(card);
 }
 
-fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
+fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit, cx: &Cx<AppState>) -> El {
     let c = &k.c;
     if tab.structure.is_none() && tab.structure_loading {
         return col()
@@ -1282,6 +1296,7 @@ fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
     let muted = c.text_muted;
     let faint = c.text_faint;
 
+    let struct_hscroll = tab.structure_hscroll.clone();
     let columns_table = Table::new(
         |s: &AppState| s.active_structure_table(),
         |s: &mut AppState| s.active_structure_table_mut(),
@@ -1307,6 +1322,7 @@ fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
     .column(TableColumn::new("default", "Default").width(148.0).min(96.0).max(320.0))
     .column(TableColumn::new("keys", "Constraints / FK").width(172.0).min(100.0).max(360.0))
     .column(TableColumn::new("comment", "Comment").flex(1.0).min(140.0))
+    .row(move |_, _, r| struct_hscroll.attach_row(r))
     .cell(move |s: &AppState, row_idx, col_id| {
         let Some(col_meta) = s
             .active_session()
@@ -1342,6 +1358,14 @@ fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
     .w_full()
     .grow(1.0)
     .min_h(0.0);
+    let columns_table = wrap_table_hscroll(
+        &format!("tv-struct-{}", tab.tab_id.get()),
+        &tab.structure_hscroll,
+        columns_table,
+        !structure.columns.is_empty(),
+        cx,
+        k,
+    );
 
     let ddl_section = build_ddl_section(tab, structure, k);
 
@@ -1448,7 +1472,7 @@ fn build_ddl_section(tab: &TableTabState, structure: &TableStructure, k: &Kit) -
     section
 }
 
-fn build_indexes_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
+fn build_indexes_view(s: &AppState, tab: &TableTabState, k: &Kit, cx: &Cx<AppState>) -> El {
     let c = &k.c;
     if tab.structure.is_none() && tab.structure_loading {
         return col()
@@ -1498,8 +1522,9 @@ fn build_indexes_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
     let warn_fg = c.warning.fg;
     let accent = c.text_accent;
     let muted = c.text_muted;
+    let idx_hscroll = tab.indexes_hscroll.clone();
 
-    Table::new(
+    let built = Table::new(
         |s: &AppState| s.active_indexes_table(),
         |s: &mut AppState| s.active_indexes_table_mut(),
         |s: &AppState| {
@@ -1522,6 +1547,7 @@ fn build_indexes_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
             .align(Align::End),
     )
     .column(TableColumn::new("definition", "Definition").flex(1.0).min(300.0))
+    .row(move |_, _, r| idx_hscroll.attach_row(r))
     .cell(move |s: &AppState, row_idx, col_id| {
         let Some(idx) = s
             .active_session()
@@ -1556,7 +1582,16 @@ fn build_indexes_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {
     .build(s, k)
     .w_full()
     .grow(1.0)
-    .min_h(0.0)
+    .min_h(0.0);
+
+    wrap_table_hscroll(
+        &format!("tv-idx-{}", tab.tab_id.get()),
+        &tab.indexes_hscroll,
+        built,
+        !structure.indexes.is_empty(),
+        cx,
+        k,
+    )
 }
 
 fn build_table_footer(session: &SessionState, tab: &TableTabState, k: &Kit, layer: &mut Vec<El>) -> El {
