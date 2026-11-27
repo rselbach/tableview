@@ -17,3 +17,6 @@ tv-core.workspace = true
 tv-update.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

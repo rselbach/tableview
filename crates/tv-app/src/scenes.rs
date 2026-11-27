@@ -24,6 +24,8 @@ pub type SceneEntry = (&'static str, fn(&mut AppState));
 pub const SCENES: &[SceneEntry] = &[
     ("launcher-dark", scene_launcher_dark),
     ("launcher-light", scene_launcher_light),
+    ("launcher-settings-dark", scene_launcher_settings_dark),
+    ("launcher-settings-light", scene_launcher_settings_light),
     ("connection-form", scene_connection_form),
     ("workspace-disconnected", scene_workspace_disconnected),
     ("workspace-no-db", scene_workspace_no_db),
@@ -99,6 +101,20 @@ fn scene_launcher_dark(s: &mut AppState) {
 
 fn scene_launcher_light(s: &mut AppState) {
     reset_to_sample_state(s, false);
+}
+
+fn scene_launcher_settings_dark(s: &mut AppState) {
+    reset_to_sample_state(s, true);
+    s.update.snapshot.status = UpdateStatus::UpToDate;
+    s.update.snapshot.automatic = true;
+    s.overlay = OverlayState::Settings;
+}
+
+fn scene_launcher_settings_light(s: &mut AppState) {
+    reset_to_sample_state(s, false);
+    s.update.snapshot.status = UpdateStatus::UpToDate;
+    s.update.snapshot.automatic = true;
+    s.overlay = OverlayState::Settings;
 }
 
 fn scene_connection_form(s: &mut AppState) {

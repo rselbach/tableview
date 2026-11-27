@@ -7,12 +7,13 @@ use rune_kit::diff::{DiffMode, DiffState, FileDiff};
 use rune_kit::shell::TabDragState;
 use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
-    AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, ConnectionStore,
-    DatabaseInfo, DbObject, DbObjectKind, DraftRowId, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow,
-    ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult, QueryHistoryEntry, QueryStatementResult, RequestId,
-    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo, SessionId, SortOrder, SortSpec, SslMode,
-    StagedCellValue, StagedChanges, StatementInspection, StoreData, TabId, TablePage, TableStructure,
-    build_fk_where_clause, default_export_filename, evaluate_sql_safety, evaluate_staged_commit_safety, export_rows,
+    AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionId,
+    ConnectionProfile, ConnectionStore, DatabaseInfo, DbObject, DbObjectKind, DraftRowId, EnvTag, ExecutedSql,
+    ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult,
+    QueryHistoryEntry, QueryStatementResult, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId,
+    SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue, StagedChanges,
+    StatementInspection, StoreData, TabId, TablePage, TableStructure, build_fk_where_clause,
+    default_export_filename, evaluate_sql_safety, evaluate_staged_commit_safety, export_rows,
 };
 use tv_core::sql::{cursor_line_col, format_sql, split_statements, statement_at_cursor};
 
@@ -375,6 +376,7 @@ pub enum OverlayState {
     SafetyConfirm(Box<SafetyConfirmModalState>),
     Export(Box<ExportModalState>),
     DeleteConfirm(ConnectionId),
+    Settings,
 }
 
 /// One SQL query entry recorded in a workspace session's bottom console log.
@@ -1037,6 +1039,7 @@ impl SessionState {
 /// Top-level application state owned by Rune.
 pub struct AppState {
     pub store_path: PathBuf,
+    pub settings_path: PathBuf,
     pub persist_enabled: bool,
     pub connections: Vec<ConnectionProfile>,
     pub folders: Vec<String>,
@@ -1066,6 +1069,24 @@ pub struct AppState {
     pub fallback_diff: DiffState,
 }
 
+/// Converts a persisted [`AppearancePreference`] into a Rune [`ColorScheme`].
+pub const fn appearance_from_pref(pref: AppearancePreference) -> ColorScheme {
+    match pref {
+        AppearancePreference::System => ColorScheme::System,
+        AppearancePreference::Light => ColorScheme::Light,
+        AppearancePreference::Dark => ColorScheme::Dark,
+    }
+}
+
+/// Converts a Rune [`ColorScheme`] into a persisted [`AppearancePreference`].
+pub const fn pref_from_appearance(scheme: ColorScheme) -> AppearancePreference {
+    match scheme {
+        ColorScheme::System => AppearancePreference::System,
+        ColorScheme::Light => AppearancePreference::Light,
+        ColorScheme::Dark => AppearancePreference::Dark,
+    }
+}
+
 impl AppState {
     /// Creates application state loaded from the default platform store (or memory fallback).
     pub fn init_default() -> Self {
@@ -1077,7 +1098,17 @@ impl AppState {
             }
             Err(_) => (PathBuf::from("connections.json"), StoreData::default()),
         };
+        let (settings_path, settings) = match SettingsStore::open_default() {
+            Ok(store) => {
+                let path = store.path().to_path_buf();
+                let data = store.load().unwrap_or_default();
+                (path, data)
+            }
+            Err(_) => (PathBuf::from("settings.json"), AppSettings::default()),
+        };
         let mut state = Self::from_store_data(store_path, store_data, true);
+        state.settings_path = settings_path;
+        state.appearance = appearance_from_pref(settings.appearance);
         let worker = WorkerBridge::spawn();
         let update_bridge = worker
             .as_ref()
@@ -1101,6 +1132,7 @@ impl AppState {
         let launcher_selected = data.connections.first().map(|c| c.id);
         Self {
             store_path,
+            settings_path: PathBuf::from("in-memory-settings.json"),
             persist_enabled,
             connections: data.connections,
             folders: data.folders,
@@ -4317,6 +4349,40 @@ impl AppState {
                     }
                 }
             }
+        }
+    }
+
+    pub fn persist_settings(&self) {
+        if !self.persist_enabled {
+            return;
+        }
+        let store = SettingsStore::at(self.settings_path.clone());
+        let settings = AppSettings {
+            appearance: pref_from_appearance(self.appearance),
+            ..AppSettings::default()
+        };
+        drop(store.save(&settings));
+    }
+
+    pub fn set_appearance(&mut self, scheme: ColorScheme, tx: &mut Tx) {
+        self.appearance = scheme;
+        tx.set_color_scheme(scheme);
+        self.persist_settings();
+    }
+
+    pub fn open_settings(&mut self) {
+        self.launcher_context_menu = None;
+        self.sort_dropdown_open = false;
+        if let Some(session) = self.active_session_mut() {
+            session.schema_dropdown_open = false;
+        }
+        self.overlay = OverlayState::Settings;
+    }
+
+    pub fn set_automatic_update_checks(&mut self, enabled: bool) {
+        self.update.snapshot.automatic = enabled;
+        if let Some(ref bridge) = self.update_bridge {
+            bridge.set_automatic_checks(enabled);
         }
     }
 

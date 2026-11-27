@@ -6,6 +6,7 @@ pub mod launcher;
 pub mod pickers;
 pub mod query_editor;
 pub mod safety_modal;
+pub mod settings_modal;
 pub mod staged_diff;
 pub mod table_grid;
 pub mod update_card;
@@ -72,6 +73,9 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         }
         OverlayState::DeleteConfirm(id) => {
             connection_form::build_delete_confirm(s, *id, &k, &mut layer);
+        }
+        OverlayState::Settings => {
+            settings_modal::build_settings_modal(s, &k, &mut layer);
         }
     }
 

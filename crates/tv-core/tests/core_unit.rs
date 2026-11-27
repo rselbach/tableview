@@ -4,12 +4,12 @@ use chrono::{Datelike, Utc};
 use tempfile::tempdir;
 use tv_core::engine::postgres::{quote_ident, synthesize_table_ddl};
 use tv_core::{
-    AccentColor, CellValue, ColumnMeta, ConnectionId, ConnectionProfile, ConnectionStore, EnvTag, ExplainPlan,
-    ExportFormat, ForeignKeyRef, IndexInfo, NewHistoryEntry, PasswordMode, QueryStatementResult, QueryStore,
-    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SortOrder, SslMode, StagedCellValue, StagedChanges,
-    StagingError, StatementRisk, StoreData, UrlParseError, ValidationError, build_explain_sql,
-    build_fk_where_clause, cursor_line_col, evaluate_sql_safety, evaluate_staged_commit_safety, export_csv,
-    export_json, export_rows, export_sql_inserts, format_sql, inspect_statement, split_statements,
+    AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ConnectionId, ConnectionProfile,
+    ConnectionStore, EnvTag, ExplainPlan, ExportFormat, ForeignKeyRef, IndexInfo, NewHistoryEntry, PasswordMode,
+    QueryStatementResult, QueryStore, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SettingsStore, SortOrder,
+    SslMode, StagedCellValue, StagedChanges, StagingError, StatementRisk, StoreData, UrlParseError, ValidationError,
+    build_explain_sql, build_fk_where_clause, cursor_line_col, evaluate_sql_safety, evaluate_staged_commit_safety,
+    export_csv, export_json, export_rows, export_sql_inserts, format_sql, inspect_statement, split_statements,
     statement_at_cursor,
 };
 
@@ -101,6 +101,34 @@ fn connection_store_roundtrip_duplicate_sort_delete_and_import() {
     assert_eq!(count, 3);
     assert!(other.delete(copy.id));
     assert_eq!(other.connections.len(), 2);
+}
+
+#[test]
+fn settings_store_roundtrip_and_missing_file_defaults() {
+    let dir = tempdir().expect("create tempdir");
+    let store = SettingsStore::at(dir.path().join("settings.json"));
+
+    let initial = store.load().expect("missing file returns default settings");
+    assert_eq!(initial, AppSettings::default());
+    assert_eq!(initial.appearance, AppearancePreference::System);
+
+    for appearance in [
+        AppearancePreference::Light,
+        AppearancePreference::Dark,
+        AppearancePreference::System,
+    ] {
+        let settings = AppSettings {
+            appearance,
+            ..AppSettings::default()
+        };
+        store.save(&settings).expect("atomic save succeeds");
+        let reloaded = store.load().expect("reload succeeds");
+        assert_eq!(reloaded, settings);
+    }
+
+    let raw = std::fs::read_to_string(store.path()).expect("settings json exists");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid settings json");
+    assert_eq!(parsed["appearance"], "system");
 }
 
 #[test]

@@ -30,4 +30,7 @@ pub use staging::{
     DraftRowId, StagedCellValue, StagedChanges, StagedInsertRow, StagedRowUpdate, StagingError, build_fk_where_clause,
     escape_sql_string, format_pg_cell_literal, format_pg_literal,
 };
-pub use storage::{ConnectionStore, SortOrder, StorageError, StoreData};
+pub use storage::{
+    AppSettings, AppearancePreference, ConnectionStore, SETTINGS_SCHEMA_VERSION, SettingsStore, SortOrder, StorageError,
+    StoreData,
+};

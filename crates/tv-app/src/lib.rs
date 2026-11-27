@@ -31,8 +31,13 @@ pub fn run() {
         ..AppSpec::new("TableView", (1280.0, 800.0), AppState::init_default, views::view)
     };
 
+    let initial_scheme = tv_core::SettingsStore::open_default()
+        .and_then(|store| store.load())
+        .map(|settings| state::appearance_from_pref(settings.appearance))
+        .unwrap_or(ColorScheme::System);
+
     let base = App::new(spec)
-        .color_scheme(ColorScheme::System)
+        .color_scheme(initial_scheme)
         .standard_menus()
         .on_quit(|s: &mut AppState, _| s.install_update_on_quit());
 

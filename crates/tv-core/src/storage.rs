@@ -12,6 +12,39 @@ use crate::connection::ConnectionProfile;
 use crate::ids::ConnectionId;
 
 pub const STORE_SCHEMA_VERSION: u32 = 1;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+
+/// Persisted theme appearance preference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearancePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Persisted global application preferences stored in `settings.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSettings {
+    #[serde(default = "default_settings_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub appearance: AppearancePreference,
+}
+
+const fn default_settings_version() -> u32 {
+    SETTINGS_SCHEMA_VERSION
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_SCHEMA_VERSION,
+            appearance: AppearancePreference::System,
+        }
+    }
+}
 
 /// Ordering options for the Connection Launcher list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -176,27 +209,70 @@ impl ConnectionStore {
 
     /// Atomically writes connection data via a temporary sibling file and rename.
     pub fn save(&self, data: &StoreData) -> Result<(), StorageError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| StorageError::Io(e.to_string()))?;
-        }
-        let encoded = serde_json::to_vec_pretty(data).map_err(|e| StorageError::Serialize(e.to_string()))?;
-        let tmp_name = format!(
-            ".{}.tmp.{}",
-            self.path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("connections.json"),
-            std::process::id()
-        );
-        let tmp_path = self.path.with_file_name(tmp_name);
-        {
-            let mut file = fs::File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
-            file.write_all(&encoded).map_err(|e| StorageError::Io(e.to_string()))?;
-            file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
-        }
-        fs::rename(&tmp_path, &self.path).map_err(|e| StorageError::Io(e.to_string()))?;
-        Ok(())
+        atomic_write_json(&self.path, data, "connections.json")
     }
+}
+
+/// Atomic JSON persistence for global application settings.
+#[derive(Clone, Debug)]
+pub struct SettingsStore {
+    path: PathBuf,
+}
+
+impl SettingsStore {
+    /// Resolves the platform settings file path (`settings.json`).
+    pub fn default_path() -> Result<PathBuf, StorageError> {
+        let dirs = ProjectDirs::from("dev", "tableview", "TableView").ok_or(StorageError::NoConfigDir)?;
+        Ok(dirs.config_dir().join("settings.json"))
+    }
+
+    /// Opens a store backed by the given path (used for custom paths and isolated tests).
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Opens the default platform settings store.
+    pub fn open_default() -> Result<Self, StorageError> {
+        Ok(Self::at(Self::default_path()?))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Loads saved settings from disk, returning defaults if the file does not exist yet.
+    pub fn load(&self) -> Result<AppSettings, StorageError> {
+        match fs::read_to_string(&self.path) {
+            Ok(raw) => serde_json::from_str(&raw).map_err(|e| StorageError::Parse(e.to_string())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AppSettings::default()),
+            Err(err) => Err(StorageError::Io(err.to_string())),
+        }
+    }
+
+    /// Atomically writes settings via a temporary sibling file and rename.
+    pub fn save(&self, settings: &AppSettings) -> Result<(), StorageError> {
+        atomic_write_json(&self.path, settings, "settings.json")
+    }
+}
+
+fn atomic_write_json<T: Serialize>(path: &Path, data: &T, fallback_name: &str) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| StorageError::Io(e.to_string()))?;
+    }
+    let encoded = serde_json::to_vec_pretty(data).map_err(|e| StorageError::Serialize(e.to_string()))?;
+    let tmp_name = format!(
+        ".{}.tmp.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or(fallback_name),
+        std::process::id()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
+        file.write_all(&encoded).map_err(|e| StorageError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+    }
+    fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))?;
+    Ok(())
 }
 
 /// Errors produced when loading or persisting connection storage.

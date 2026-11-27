@@ -79,10 +79,10 @@ pub static LINK_IMPORT: Icon = Icon {
     body: r#"<path d="M6.5 9.5L9.5 6.5M5.2 7.5L3.8 8.9A2.6 2.6 0 0 0 7.5 12.6L8.9 11.2M7.1 4.8L8.5 3.4A2.6 2.6 0 0 1 12.2 7.1L10.8 8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" fill="none"/>"#,
 };
 
-pub static SUN_MOON: Icon = Icon {
-    name: "tv-theme",
-    view: 16.0,
-    body: r#"<circle cx="8" cy="8" r="5" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M8 3A5 5 0 0 1 8 13Z" fill="currentColor"/>"#,
+pub static SETTINGS: Icon = Icon {
+    name: "tv-settings",
+    view: 24.0,
+    body: r#"<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="1.8" fill="none"/>"#,
 };
 
 pub static SHIELD: Icon = Icon {

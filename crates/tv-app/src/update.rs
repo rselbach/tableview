@@ -166,6 +166,10 @@ impl UpdateBridge {
         self.updater.check_now();
     }
 
+    pub fn set_automatic_checks(&self, enabled: bool) {
+        self.updater.set_automatic_checks(enabled);
+    }
+
     pub fn restart_to_update(&self) {
         let updater = self.updater.clone();
         drop(

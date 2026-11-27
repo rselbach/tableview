@@ -185,15 +185,17 @@ fn build_toolbar(s: &AppState, session: &SessionState, k: &Kit) -> Toolbar {
                 .build(k),
         )
         .child(
-            IconButton::new(&icons::SUN_MOON)
+            IconButton::new(&icons::SETTINGS)
                 .variant(IconButtonVariant::GhostMuted)
                 .control_size(ControlSize::Regular)
-                .label("Cycle theme")
-                .help("Cycle theme")
+                .label("Settings")
+                .help("Settings")
+                .shortcut("mod+comma")
                 .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
-                    platform::dispatch_action(s, Action::CycleColorScheme, tx);
+                    platform::dispatch_action(s, Action::OpenSettings, tx);
                 })
-                .build(k),
+                .build(k)
+                .key("workspace-settings-btn"),
         );
 
     Toolbar::new()

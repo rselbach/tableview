@@ -1,7 +1,7 @@
-use rune::{ColorScheme, Cx, El, Key, ScrollSpec, Tx, col, el, icon, row, spacer, text};
+use rune::{Cx, El, Key, ScrollSpec, Tx, col, el, icon, row, spacer, text};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, Divider, IconButton, IconButtonVariant, Kit, MenuItem, SegmentedControl,
-    Select, SelectAppearance, TextInput, context_menu,
+    Button, ButtonVariant, ControlSize, Divider, IconButton, IconButtonVariant, Kit, MenuItem, Select,
+    SelectAppearance, TextInput, context_menu,
 };
 use tv_core::{ConnectionProfile, EnvTag, SafetyPolicy, SortOrder};
 
@@ -145,31 +145,6 @@ fn build_left_rail(s: &AppState, k: &Kit, top_inset: f32) -> El {
         }
     }
 
-    let scheme_idx = match s.appearance {
-        ColorScheme::System => 0,
-        ColorScheme::Light => 1,
-        ColorScheme::Dark => 2,
-    };
-    let theme_picker = col()
-        .key("launcher-theme-wrap")
-        .w_full()
-        .gap(6.0)
-        .child(text("APPEARANCE").font(k.ty.small_medium).color(c.text_faint).px(4.0))
-        .child(
-            SegmentedControl::new(&["System", "Light", "Dark"], Some(scheme_idx))
-                .label("Appearance")
-                .width(None)
-                .on_pick(|s: &mut AppState, idx, tx| {
-                    let next = match idx {
-                        1 => ColorScheme::Light,
-                        2 => ColorScheme::Dark,
-                        _ => ColorScheme::System,
-                    };
-                    platform::dispatch_action(s, Action::SetColorScheme(next), tx);
-                })
-                .build(k),
-        );
-
     let mut rail_inner = col()
         .key("launcher-rail-inner")
         .w_full()
@@ -188,8 +163,6 @@ fn build_left_rail(s: &AppState, k: &Kit, top_inset: f32) -> El {
     if let Some(card) = update_card::build(s, k) {
         rail_inner = rail_inner.child(card);
     }
-
-    rail_inner = rail_inner.child(theme_picker);
 
     col()
         .key("launcher-rail")
@@ -285,14 +258,32 @@ fn build_main_panel(s: &AppState, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(el().key("launcher-search-wrap").grow(1.0).min_w(0.0).child(search))
         .child(sort_select)
         .child(
-            IconButton::new(&icons::PLUS)
-                .variant(IconButtonVariant::Ghost)
-                .control_size(ControlSize::Regular)
-                .label("New connection")
-                .help("New connection")
-                .shortcut("mod+n")
-                .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_new_connection_form(tx))
-                .build(k),
+            row()
+                .gap(4.0)
+                .center_y()
+                .child(
+                    IconButton::new(&icons::PLUS)
+                        .variant(IconButtonVariant::Ghost)
+                        .control_size(ControlSize::Regular)
+                        .label("New connection")
+                        .help("New connection")
+                        .shortcut("mod+n")
+                        .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_new_connection_form(tx))
+                        .build(k),
+                )
+                .child(
+                    IconButton::new(&icons::SETTINGS)
+                        .variant(IconButtonVariant::GhostMuted)
+                        .control_size(ControlSize::Regular)
+                        .label("Settings")
+                        .help("Settings")
+                        .shortcut("mod+comma")
+                        .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                            platform::dispatch_action(s, Action::OpenSettings, tx);
+                        })
+                        .build(k)
+                        .key("launcher-settings-btn"),
+                ),
         );
 
     let filtered = s.filtered_connections();

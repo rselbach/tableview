@@ -32,8 +32,8 @@ pub enum Action {
     Disconnect,
     ShowLauncher,
     CheckForUpdates,
+    OpenSettings,
     SetColorScheme(ColorScheme),
-    CycleColorScheme,
     DismissOverlay,
 }
 
@@ -157,6 +157,9 @@ pub fn action_for_key(ev: &KeyEvent) -> Option<Action> {
     }
     if ev.is_command('3') && !ev.mods.shift && !ev.mods.alt {
         return Some(Action::ToggleInspector);
+    }
+    if ev.is_command(',') && !ev.mods.shift && !ev.mods.alt {
+        return Some(Action::OpenSettings);
     }
     None
 }
@@ -348,19 +351,12 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
             s.check_for_updates();
             true
         }
-        Action::SetColorScheme(scheme) => {
-            s.appearance = scheme;
-            tx.set_color_scheme(scheme);
+        Action::OpenSettings => {
+            s.open_settings();
             true
         }
-        Action::CycleColorScheme => {
-            let next = match s.appearance {
-                ColorScheme::System => ColorScheme::Dark,
-                ColorScheme::Dark => ColorScheme::Light,
-                ColorScheme::Light => ColorScheme::System,
-            };
-            s.appearance = next;
-            tx.set_color_scheme(next);
+        Action::SetColorScheme(scheme) => {
+            s.set_appearance(scheme, tx);
             true
         }
     }
@@ -411,6 +407,19 @@ pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
         })
         .id("tv-check-updates")
         .after("tv-about"),
+        MenuItem::separator().after("tv-check-updates"),
+        {
+            let mut item = MenuItem::new("Settings…", |s: &mut AppState, tx| {
+                dispatch_action(s, Action::OpenSettings, tx);
+            })
+            .id("tv-settings")
+            .after("tv-check-updates")
+            .keys_first();
+            if let Some(sc) = shortcut("mod+comma") {
+                item = item.key_equivalent(sc);
+            }
+            item
+        },
         item_with_shortcut("conn-new", "New Connection…", "Connection", "mod+n", |s, tx| {
             dispatch_action(s, Action::NewConnection, tx);
         }),

@@ -1,12 +1,12 @@
 #![allow(clippy::expect_used)]
 
-use rune::{Env, Key, KeyEvent, Mods, Runtime};
+use rune::{ColorScheme, Env, Key, KeyEvent, Mods, Runtime};
 use rune_kit::diff::DiffMode;
 use tv_app::platform::{Action, dispatch_action};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
 use tv_app::state::{AppState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
 use tv_app::views;
-use tv_core::{EnvTag, ExportFormat, SafetyPolicy};
+use tv_core::{AppearancePreference, EnvTag, ExportFormat, SafetyPolicy, SettingsStore};
 use tv_update::{UpdateFailure, UpdateStatus};
 
 fn sample_runtime(dark: bool) -> Runtime<AppState> {
@@ -991,4 +991,147 @@ fn update_card_renders_available_downloading_relaunch_and_os_warning_states() {
     rt.frame(0.1);
     assert!(rt.state.update.dismissed_os_warning);
     assert!(rt.find("update-dock-card").is_none());
+}
+
+#[test]
+fn launcher_omits_bottom_left_appearance_and_opens_settings_dialog() {
+    let mut rt = sample_runtime(true);
+    rt.frame(0.0);
+
+    assert!(rt.find("launcher-theme-wrap").is_none());
+    assert!(!has_text(&rt, "APPEARANCE"));
+
+    let (sx, sy) = rt.find("launcher-settings-btn").expect("launcher settings button");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.1);
+
+    assert!(matches!(rt.state.overlay, OverlayState::Settings));
+    assert!(rt.find("settings-modal-dialog").is_some());
+    assert!(has_text(&rt, "APPEARANCE"));
+    assert!(has_text(&rt, "UPDATES"));
+
+    let (lx, ly) = rt.find("settings-appearance/segment1").expect("Light theme segment");
+    rt.pointer_down(lx, ly);
+    rt.pointer_up(lx, ly);
+    rt.frame(0.1);
+    assert_eq!(rt.state.appearance, ColorScheme::Light);
+
+    let (dx, dy) = rt.find("settings-appearance/segment2").expect("Dark theme segment");
+    rt.pointer_down(dx, dy);
+    rt.pointer_up(dx, dy);
+    rt.frame(0.1);
+    assert_eq!(rt.state.appearance, ColorScheme::Dark);
+
+    let (sys_x, sys_y) = rt.find("settings-appearance/segment0").expect("System theme segment");
+    rt.pointer_down(sys_x, sys_y);
+    rt.pointer_up(sys_x, sys_y);
+    rt.frame(0.1);
+    assert_eq!(rt.state.appearance, ColorScheme::System);
+
+    let (done_x, done_y) = rt.find("settings-done-btn").expect("settings done button");
+    rt.pointer_down(done_x, done_y);
+    rt.pointer_up(done_x, done_y);
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+    assert!(rt.find("settings-modal-dialog").is_none());
+}
+
+#[test]
+fn settings_shortcut_and_workspace_button_open_and_escape_dismisses() {
+    let mut rt = sample_runtime(false);
+    rt.frame(0.0);
+
+    let open_settings_key = KeyEvent {
+        key: Key::Command(','),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    };
+    rt.key(open_settings_key.clone());
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::Settings));
+    assert!(rt.find("settings-modal-dialog").is_some());
+
+    rt.key(KeyEvent::from(Key::Escape));
+    rt.frame(0.5);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+
+    apply_scene(&mut rt, "workspace-connected-dark");
+    rt.frame(0.5);
+    let (wx, wy) = rt.find("workspace-settings-btn").expect("workspace settings button");
+    rt.pointer_down(wx, wy);
+    rt.pointer_up(wx, wy);
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::Settings));
+    assert!(rt.find("settings-modal-dialog").is_some());
+
+    rt.key(KeyEvent::from(Key::Escape));
+    rt.frame(0.5);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+
+    rt.key(open_settings_key);
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::Settings));
+}
+
+#[test]
+fn settings_dialog_updates_controls_and_persists_appearance() {
+    let mut rt = sample_runtime(true);
+    rt.update(|s, _| s.overlay = OverlayState::Settings);
+    rt.frame(0.1);
+
+    // Disabled updater keeps the automatic-updates switch disabled.
+    assert!(!rt.state.update.snapshot.automatic);
+    let (sw_x, sw_y) = rt
+        .find("settings-auto-updates-switch")
+        .expect("automatic updates switch");
+    rt.pointer_down(sw_x, sw_y);
+    rt.pointer_up(sw_x, sw_y);
+    rt.frame(0.1);
+    assert!(!rt.state.update.snapshot.automatic);
+
+    // Active updater lets the user toggle automatic checks and trigger a manual check.
+    rt.update(|s, _| {
+        s.update.snapshot.status = UpdateStatus::UpToDate;
+        s.update.snapshot.automatic = true;
+    });
+    rt.frame(0.1);
+    let (sw_x, sw_y) = rt
+        .find("settings-auto-updates-switch")
+        .expect("automatic updates switch");
+    rt.pointer_down(sw_x, sw_y);
+    rt.pointer_up(sw_x, sw_y);
+    rt.frame(0.1);
+    assert!(!rt.state.update.snapshot.automatic);
+
+    let (act_x, act_y) = rt
+        .find("settings-update-action-btn")
+        .expect("update action button");
+    rt.pointer_down(act_x, act_y);
+    rt.pointer_up(act_x, act_y);
+    rt.frame(0.1);
+    assert!(rt.state.status_notice.is_some());
+
+    // Appearance changes persist to settings.json when persistence is enabled.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    rt.update(|s, tx| {
+        s.settings_path = settings_path.clone();
+        s.persist_enabled = true;
+        assert!(dispatch_action(s, Action::SetColorScheme(ColorScheme::Light), tx));
+    });
+    let reloaded = SettingsStore::at(settings_path.clone())
+        .load()
+        .expect("load persisted settings");
+    assert_eq!(reloaded.appearance, AppearancePreference::Light);
+
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::SetColorScheme(ColorScheme::Dark), tx));
+    });
+    let reloaded = SettingsStore::at(settings_path)
+        .load()
+        .expect("load updated settings");
+    assert_eq!(reloaded.appearance, AppearancePreference::Dark);
 }
