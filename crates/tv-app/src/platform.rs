@@ -394,7 +394,10 @@ fn item_with_shortcut(
 pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
     vec![
         MenuItem::about("About TableView", |s: &mut AppState, tx| {
-            s.set_notice("TableView 0.1.0 — PostgreSQL client built with Rune", false);
+            s.set_notice(
+                concat!("TableView ", env!("CARGO_PKG_VERSION"), " — PostgreSQL client built with Rune"),
+                false,
+            );
             s.sync_window_title(tx);
         })
         .id("tv-about"),

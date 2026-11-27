@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for a manual release build (e.g. 0.1.0); defaults to Cargo.toml version
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Validate version & scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve and validate release version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            version="${REF_NAME#v}"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            version="${INPUT_VERSION#v}"
+          else
+            version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          fi
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::invalid release version '${version}' (expected X.Y.Z or X.Y.Z-prerelease)" >&2
+            exit 1
+          fi
+
+          prerelease="false"
+          if [[ "${version}" == *-* ]]; then
+            prerelease="true"
+          fi
+
+          {
+            echo "version=${version}"
+            echo "prerelease=${prerelease}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Lint release scripts
+        run: shellcheck scripts/bundle-macos-app.sh scripts/release-macos.sh
+
+  build-macos:
+    name: Build, sign, and notarize macOS DMG
+    needs: check
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Validate required secrets
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          missing=0
+          for name in \
+            MACOS_CERTIFICATE_P12_BASE64 \
+            MACOS_CERTIFICATE_PASSWORD \
+            APPLE_ID \
+            APPLE_TEAM_ID \
+            APPLE_APP_SPECIFIC_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::repository secret ${name} is not set" >&2
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Configure macOS deployment target
+        run: |
+          target="$(plutil -extract LSMinimumSystemVersion raw -o - packaging/macos/Info.plist)"
+          echo "MACOSX_DEPLOYMENT_TARGET=${target}" >>"${GITHUB_ENV}"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          [[ "$(uname -m)" == "arm64" ]]
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: macos-rust
+          env-vars: MACOSX_DEPLOYMENT_TARGET
+
+      - name: Lint and test
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked -p tv-core --lib --test core_unit
+          cargo test --locked -p tv-app
+
+      - name: Import Developer ID signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          umask 077
+          cert_path="${RUNNER_TEMP}/certificate.p12"
+          trap 'rm -f "${cert_path}"' EXIT
+
+          keychain_path="${RUNNER_TEMP}/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+
+          printf '%s' "${CERTIFICATE_P12}" | tr -d '[:space:]' | base64 --decode >"${cert_path}"
+          security import "${cert_path}" \
+            -P "${CERTIFICATE_PASSWORD}" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "${keychain_path}"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "${keychain_password}" \
+            "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}" login.keychain-db
+
+          signing_identity="$(security find-identity -v -p codesigning "${keychain_path}" \
+            | awk '/"Developer ID Application:/ { print $2; exit }')"
+          if [[ ! "${signing_identity}" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo "::error::no Developer ID Application certificate found in imported keychain" >&2
+            exit 1
+          fi
+
+          {
+            echo "SIGNING_IDENTITY=${signing_identity}"
+            echo "SIGNING_KEYCHAIN_PATH=${keychain_path}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Build, sign, notarize, and package DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          NOTARIZATION_LOG_DIR: build/notarization
+        run: |
+          scripts/release-macos.sh \
+            --version "${{ needs.check.outputs.version }}" \
+            --build "${GITHUB_RUN_NUMBER}"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tableview-macos-arm64
+          path: |
+            build/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg
+            build/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload notarization logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tableview-macos-notarization
+          path: build/notarization/*.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Clean up signing keychain
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/certificate.p12"
+          if [[ -n "${SIGNING_KEYCHAIN_PATH:-}" && -f "${SIGNING_KEYCHAIN_PATH}" ]]; then
+            security delete-keychain "${SIGNING_KEYCHAIN_PATH}" || true
+          fi
+
+  publish:
+    name: Publish GitHub Release
+    needs: [check, build-macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tableview-macos-arm64
+          path: release
+
+      - name: Verify checksum
+        run: |
+          (
+            cd release
+            sha256sum -c "TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256"
+          )
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ needs.check.outputs.prerelease == 'true' }}
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          files: |
+            release/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg
+            release/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256
