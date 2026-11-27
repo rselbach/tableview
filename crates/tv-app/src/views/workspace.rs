@@ -1,5 +1,5 @@
 use chrono::Local;
-use rune::{Cx, El, ScrollSpec, Tx, col, el, icon, rich, row, spacer, text};
+use rune::{Cursor, Cx, Drag, El, Phase, ScrollSpec, Tx, col, el, icon, rich, row, spacer, text};
 use rune_kit::shell::SidebarToggle;
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{
@@ -11,8 +11,8 @@ use tv_core::{DbObject, DbObjectKind, QueryHistoryEntry, SafetyPolicy, SavedQuer
 use crate::icons;
 use crate::platform::{self, Action};
 use crate::state::{
-    AppState, ColumnLoadState, ConnectedData, ConnectionState, PickerKind, SessionState, SidebarTab, TabContent,
-    WorkspaceTab,
+    AppState, CONSOLE_MIN_HEIGHT, ColumnLoadState, ConnectedData, ConnectionState, PickerKind, SessionState,
+    SidebarTab, TabContent, WorkspaceTab,
 };
 use crate::theme;
 use crate::views::{empty_cta, inspector, pill_badge, query_editor, staged_diff, table_grid, update_card};
@@ -734,6 +734,11 @@ fn build_main_pane(
     cx: &Cx<AppState>,
     layer: &mut Vec<El>,
 ) -> El {
+    let main_h = cx
+        .layout_size("workspace-main-inner")
+        .map(|sz| sz[1])
+        .filter(|&h| h.is_finite() && h > 0.0)
+        .unwrap_or(752.0);
     let stage = build_stage(s, session, k, cx, layer);
     let mut main = col().key("workspace-main-inner").w_full().h_full().min_h(0.0).child(stage);
     if let Some(table_tab) = session.active_table_tab()
@@ -741,7 +746,7 @@ fn build_main_pane(
     {
         main = main.child(staged_diff::build_drawer(s, session, table_tab, k));
     } else if session.console_open {
-        main = main.child(build_console_drawer(session, k));
+        main = main.child(build_console_drawer(session, main_h, k));
     }
     main
 }
@@ -906,19 +911,74 @@ fn build_no_db_stage(data: &ConnectedData, k: &Kit) -> El {
         .child(quick_dbs)
 }
 
-fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
+fn build_console_drawer(session: &SessionState, container_h: f32, k: &Kit) -> El {
     let c = &k.c;
+    let sid = session.id;
+    let console_h = session.clamped_console_height(container_h);
+    let max_console_h = SessionState::console_max_height(container_h);
+    let selection_bg = k.selection();
     let syntax_theme = SyntaxTheme::from_kit(k);
+
+    let resize_handle = row()
+        .key("console-resize-handle")
+        .role("separator")
+        .label("Resize console log")
+        .range_value(
+            f64::from(console_h),
+            f64::from(CONSOLE_MIN_HEIGHT),
+            f64::from(max_console_h),
+        )
+        .range_step(16.0)
+        .focusable(false)
+        .w_full()
+        .h(6.0)
+        .center()
+        .fill(c.layer_01)
+        .border_sides([1.0, 0.0, 0.0, 0.0], c.border_muted)
+        .hover(c.hover)
+        .cursor(Cursor::ResizeRow)
+        .on_drag(move |s: &mut AppState, d: &mut Drag, tx: &mut Tx| match d.phase {
+            Phase::Down => {
+                d.data = console_h;
+                s.begin_console_drag(sid);
+            }
+            Phase::Move => {
+                s.set_console_height(sid, d.data - d.dy, container_h);
+                tx.instant();
+            }
+            Phase::Up => {
+                if d.cancelled() {
+                    s.cancel_console_drag(sid);
+                    tx.instant();
+                } else {
+                    s.finish_console_drag(sid);
+                    if d.dy != 0.0 {
+                        s.set_console_height(sid, d.data - d.dy, container_h);
+                    }
+                }
+            }
+        })
+        .on_double_press_tx(move |s: &mut AppState, tx: &mut Tx| {
+            s.reset_console_height(sid);
+            tx.instant();
+        })
+        .on_step(move |s: &mut AppState, steps, _| {
+            s.step_console_height(sid, steps as f32 * 16.0, container_h);
+        })
+        .on_set_value(move |s: &mut AppState, value, _| {
+            s.set_console_height(sid, value as f32, container_h);
+        })
+        .child(el().size(36.0, 2.0).radius(1.0).fill(c.border_strong));
 
     let header = row()
         .key("console-header")
         .w_full()
-        .h(32.0)
+        .h(30.0)
         .px(12.0)
         .gap(8.0)
         .center_y()
         .fill(c.layer_01)
-        .border_sides([1.0, 0.0, 1.0, 0.0], c.border_muted)
+        .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
         .child(icon(&icons::TERMINAL, 13.0).color(c.icon_muted))
         .child(text("Console Log").font(k.ty.small_medium).color(c.text_base))
         .child(
@@ -963,7 +1023,12 @@ fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
                     .color(c.text_faint),
             )
     } else {
-        let mut entries_col = col().key("console-entries").w_full().padding(10.0).gap(8.0);
+        let mut entries_col = col()
+            .key("console-entries")
+            .w_full()
+            .padding(10.0)
+            .gap(8.0)
+            .selection_group(true);
         for (i, entry) in session.console_entries.iter().enumerate() {
             let meta = format!("-- {} ({} ms)", entry.timestamp, entry.duration_ms);
             let highlights = syntax::highlight(Some("sql"), &entry.sql);
@@ -973,16 +1038,38 @@ fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
                 .key(format!("console/entry/{i}"))
                 .w_full()
                 .gap(2.0)
-                .child(text(meta).font(k.ty.small).color(c.text_faint))
+                .child(
+                    text(meta)
+                        .key(format!("console/entry/{i}/meta"))
+                        .font(k.ty.small)
+                        .color(c.text_faint)
+                        .w_full()
+                        .wrap()
+                        .selectable(true)
+                        .selection_color(selection_bg)
+                        .copy_breaks(2, 1),
+                )
                 .child(
                     rich(&entry.sql, spans)
+                        .key(format!("console/entry/{i}/sql"))
                         .font(k.ty.mono)
                         .color(c.text_base)
                         .w_full()
-                        .wrap(),
+                        .wrap()
+                        .selectable(true)
+                        .selection_color(selection_bg),
                 );
             if let Some(err) = &entry.error {
-                item = item.child(text(err).font(k.ty.small).color(c.danger.fg).w_full().wrap());
+                item = item.child(
+                    text(err)
+                        .key(format!("console/entry/{i}/error"))
+                        .font(k.ty.small)
+                        .color(c.danger.fg)
+                        .w_full()
+                        .wrap()
+                        .selectable(true)
+                        .selection_color(selection_bg),
+                );
             }
             entries_col = entries_col.child(item);
         }
@@ -1003,9 +1090,10 @@ fn build_console_drawer(session: &SessionState, k: &Kit) -> El {
     col()
         .key("workspace-console")
         .w_full()
-        .h(184.0)
+        .h(console_h)
         .min_h(0.0)
         .fill(c.bg_base)
+        .child(resize_handle)
         .child(header)
         .child(body)
 }
