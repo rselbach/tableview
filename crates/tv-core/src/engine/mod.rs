@@ -411,6 +411,8 @@ pub enum DbError {
     },
     #[error("database session is disconnected")]
     Disconnected,
+    #[error("database session disconnected before dispatch: {0}")]
+    DisconnectedBeforeDispatch(Box<DbError>),
     #[error("query cancelled by user")]
     Cancelled,
     #[error("invalid input: {0}")]
@@ -420,7 +422,11 @@ pub enum DbError {
 impl DbError {
     /// Returns true if the failure indicates credentials were rejected or missing.
     pub fn is_auth_failure(&self) -> bool {
-        matches!(self, Self::AuthFailed(_))
+        match self {
+            Self::AuthFailed(_) => true,
+            Self::DisconnectedBeforeDispatch(inner) => inner.is_auth_failure(),
+            _ => false,
+        }
     }
 }
 
@@ -504,6 +510,10 @@ pub struct FkPeekRow {
 pub trait DbSession: Send + Sync {
     fn engine(&self) -> DbEngine;
     fn server_info(&self) -> &ServerInfo;
+    /// Returns `true` when the underlying transport is already known to be closed.
+    fn is_disconnected(&self) -> bool {
+        false
+    }
     async fn list_databases(&self) -> Result<(Vec<DatabaseInfo>, ExecutedSql), DbError>;
     async fn list_schemas(&self) -> Result<(Vec<SchemaInfo>, ExecutedSql), DbError>;
     async fn list_objects(&self, schema: &str) -> Result<(Vec<DbObject>, ExecutedSql), DbError>;
@@ -515,6 +525,18 @@ pub trait DbSession: Send + Sync {
         statements: &[String],
         row_limit: Option<usize>,
     ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError>;
+    async fn execute_sql_cancellable(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        _cancel_key: u64,
+        cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        if cancel_flag.is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(DbError::Cancelled);
+        }
+        self.execute_sql(statements, row_limit).await
+    }
     async fn execute_transaction(
         &self,
         statements: &[String],
@@ -527,6 +549,9 @@ pub trait DbSession: Send + Sync {
         source_col: &ColumnMeta,
     ) -> Result<(FkPeekRow, ExecutedSql), DbError>;
     async fn cancel_running_query(&self) -> Result<(), DbError>;
+    async fn cancel_query_by_key(&self, _cancel_key: u64) -> Result<(), DbError> {
+        self.cancel_running_query().await
+    }
     async fn ping(&self) -> Result<(), DbError>;
 }
 

@@ -1,14 +1,23 @@
 #![allow(clippy::expect_used)]
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use rune::{ColorScheme, Env, Key, KeyEvent, Mods, Runtime};
 use rune_kit::diff::DiffMode;
 use tv_app::platform::{Action, dispatch_action};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
-use tv_app::state::{AppState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
+use tv_app::state::{AppState, ConnectionState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
 use tv_app::views;
+use tv_app::worker::{SessionConnector, WorkerBridge};
 use tv_core::{
-    AppearancePreference, ConnectionProfile, DbEngine, EnvTag, ExplainPlan, ExportFormat, SafetyPolicy,
-    SettingsStore, StoreData,
+    AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbEngine, DbError,
+    DbObject, DbObjectKind, DbSession, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef,
+    IndexInfo, PageRequest, PasswordMode, QueryBatchResult, QueryStatementResult, SafetyPolicy, SchemaInfo,
+    ServerInfo, SettingsStore, StoreData, TablePage, TableStats, TableStructure, TransactionOutcome,
 };
 use tv_update::{UpdateFailure, UpdateStatus};
 
@@ -1939,4 +1948,1894 @@ fn launcher_new_connection_respects_and_reconciles_filters() {
     assert!(rt.find("launcher-empty").is_none());
     assert!(rt.find(&format!("launcher/conn/{local_id}")).is_some());
     assert!(has_text(&rt, "troy_barnes_local"));
+}
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+struct MockSession {
+    server_info: ServerInfo,
+    disconnected: AtomicBool,
+    half_open: AtomicBool,
+    fail_next_sql: AtomicBool,
+    fail_next_pre_dispatch: AtomicBool,
+    fail_with_auth_on_disconnect: AtomicBool,
+    ping_delay: Mutex<Duration>,
+    pre_dispatch_delay: Mutex<Duration>,
+    cancelled_keys: Mutex<Vec<u64>>,
+    ping_calls: AtomicUsize,
+    page_calls: AtomicUsize,
+    describe_calls: AtomicUsize,
+    sql_calls: AtomicUsize,
+    pre_dispatch_entries: AtomicUsize,
+    explain_calls: AtomicUsize,
+    tx_calls: AtomicUsize,
+}
+
+impl MockSession {
+    fn new(database: &str) -> Self {
+        Self {
+            server_info: ServerInfo {
+                version: "PostgreSQL 18.4".to_owned(),
+                current_database: database.to_owned(),
+                current_user: "troy_barnes".to_owned(),
+            },
+            disconnected: AtomicBool::new(false),
+            half_open: AtomicBool::new(false),
+            fail_next_sql: AtomicBool::new(false),
+            fail_next_pre_dispatch: AtomicBool::new(false),
+            fail_with_auth_on_disconnect: AtomicBool::new(false),
+            ping_delay: Mutex::new(Duration::ZERO),
+            pre_dispatch_delay: Mutex::new(Duration::ZERO),
+            cancelled_keys: Mutex::new(Vec::new()),
+            ping_calls: AtomicUsize::new(0),
+            page_calls: AtomicUsize::new(0),
+            describe_calls: AtomicUsize::new(0),
+            sql_calls: AtomicUsize::new(0),
+            pre_dispatch_entries: AtomicUsize::new(0),
+            explain_calls: AtomicUsize::new(0),
+            tx_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn set_disconnected(&self, value: bool) {
+        self.disconnected.store(value, Ordering::Release);
+    }
+
+    fn set_half_open(&self, value: bool) {
+        self.half_open.store(value, Ordering::Release);
+    }
+
+    fn set_fail_next_sql(&self, value: bool) {
+        self.fail_next_sql.store(value, Ordering::Release);
+    }
+
+    fn set_fail_next_pre_dispatch(&self, value: bool) {
+        self.fail_next_pre_dispatch.store(value, Ordering::Release);
+    }
+
+    fn set_fail_with_auth_on_disconnect(&self, value: bool) {
+        self.fail_with_auth_on_disconnect.store(value, Ordering::Release);
+    }
+
+    fn set_ping_delay(&self, delay: Duration) {
+        *self.ping_delay.lock().expect("ping_delay lock") = delay;
+    }
+
+    fn set_pre_dispatch_delay(&self, delay: Duration) {
+        *self.pre_dispatch_delay.lock().expect("pre_dispatch_delay lock") = delay;
+    }
+
+    fn cancelled_keys(&self) -> Vec<u64> {
+        self.cancelled_keys.lock().expect("cancelled_keys lock").clone()
+    }
+
+    fn check_transport(&self) -> Result<(), DbError> {
+        if self.disconnected.load(Ordering::Acquire) || self.half_open.load(Ordering::Acquire) {
+            if self.fail_with_auth_on_disconnect.load(Ordering::Acquire) {
+                self.disconnected.store(true, Ordering::Release);
+                return Err(DbError::AuthFailed("Access denied for user".to_owned()));
+            }
+            return Err(DbError::Disconnected);
+        }
+        Ok(())
+    }
+}
+
+fn mock_columns_for(table: &str) -> Vec<ColumnMeta> {
+    if table == "courses" {
+        vec![
+            ColumnMeta {
+                name: "course_id".to_owned(),
+                data_type: "integer".to_owned(),
+                udt_name: "int4".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "title".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ]
+    } else {
+        vec![
+            ColumnMeta {
+                name: "student_id".to_owned(),
+                data_type: "integer".to_owned(),
+                udt_name: "int4".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "full_name".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ]
+    }
+}
+
+impl DbSession for MockSession {
+    fn engine(&self) -> DbEngine {
+        DbEngine::Postgres
+    }
+
+    fn server_info(&self) -> &ServerInfo {
+        &self.server_info
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
+    fn list_databases<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<(Vec<DatabaseInfo>, ExecutedSql), DbError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.check_transport()?;
+            Ok((
+                vec![
+                    DatabaseInfo {
+                        name: "postgres".to_owned(),
+                        owner: "troy_barnes".to_owned(),
+                        size_bytes: Some(8_192),
+                    },
+                    DatabaseInfo {
+                        name: "greendale_idp_dev".to_owned(),
+                        owner: "troy_barnes".to_owned(),
+                        size_bytes: Some(65_536),
+                    },
+                ],
+                ExecutedSql {
+                    sql: "SELECT datname FROM pg_database".to_owned(),
+                    duration_ms: 1,
+                    error: None,
+                },
+            ))
+        })
+    }
+
+    fn list_schemas<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<(Vec<SchemaInfo>, ExecutedSql), DbError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.check_transport()?;
+            Ok((
+                vec![
+                    SchemaInfo {
+                        name: "public".to_owned(),
+                        is_system: false,
+                    },
+                    SchemaInfo {
+                        name: "study_room".to_owned(),
+                        is_system: false,
+                    },
+                ],
+                ExecutedSql {
+                    sql: "SELECT nspname FROM pg_namespace".to_owned(),
+                    duration_ms: 1,
+                    error: None,
+                },
+            ))
+        })
+    }
+
+    fn list_objects<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        schema: &'life1 str,
+    ) -> BoxFuture<'async_trait, Result<(Vec<DbObject>, ExecutedSql), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.check_transport()?;
+            let objects = if schema == "study_room" {
+                vec![
+                    DbObject {
+                        schema: "study_room".to_owned(),
+                        name: "courses".to_owned(),
+                        kind: DbObjectKind::Table,
+                        estimated_rows: Some(1),
+                        total_bytes: Some(16_384),
+                    },
+                    DbObject {
+                        schema: "study_room".to_owned(),
+                        name: "students".to_owned(),
+                        kind: DbObjectKind::Table,
+                        estimated_rows: Some(2),
+                        total_bytes: Some(32_768),
+                    },
+                ]
+            } else {
+                vec![DbObject {
+                    schema: schema.to_owned(),
+                    name: "campus_news".to_owned(),
+                    kind: DbObjectKind::Table,
+                    estimated_rows: Some(5),
+                    total_bytes: Some(8_192),
+                }]
+            };
+            Ok((
+                objects,
+                ExecutedSql {
+                    sql: format!("SELECT relname FROM pg_class WHERE nspname = '{schema}'"),
+                    duration_ms: 1,
+                    error: None,
+                },
+            ))
+        })
+    }
+
+    fn list_columns<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        schema: &'life1 str,
+        object: &'life2 str,
+    ) -> BoxFuture<'async_trait, Result<(Vec<ColumnSummary>, ExecutedSql), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.check_transport()?;
+            let cols = mock_columns_for(object)
+                .into_iter()
+                .map(|c| ColumnSummary {
+                    name: c.name,
+                    data_type: c.data_type,
+                    nullable: c.nullable,
+                    is_primary_key: c.is_primary_key,
+                })
+                .collect();
+            Ok((
+                cols,
+                ExecutedSql {
+                    sql: format!("SELECT attname FROM pg_attribute WHERE {schema}.{object}"),
+                    duration_ms: 1,
+                    error: None,
+                },
+            ))
+        })
+    }
+
+    fn fetch_table_page<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        req: &'life1 PageRequest,
+    ) -> BoxFuture<'async_trait, Result<(TablePage, Vec<ExecutedSql>), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.page_calls.fetch_add(1, Ordering::AcqRel);
+            self.check_transport()?;
+            let columns = mock_columns_for(&req.table);
+            let rows = if req.table == "courses" {
+                vec![vec![CellValue::Int(101), CellValue::Text("Spanish 101".to_owned())]]
+            } else {
+                vec![
+                    vec![CellValue::Int(1), CellValue::Text("Troy Barnes".to_owned())],
+                    vec![CellValue::Int(2), CellValue::Text("Abed Nadir".to_owned())],
+                ]
+            };
+            let len = rows.len() as i64;
+            let sql = format!("SELECT * FROM \"{}\".\"{}\"", req.schema, req.table);
+            Ok((
+                TablePage {
+                    columns,
+                    rows,
+                    offset: req.offset,
+                    limit: req.limit,
+                    total_rows_estimate: Some(len),
+                    total_is_exact: true,
+                    has_more: false,
+                    elapsed_ms: 2,
+                },
+                vec![ExecutedSql {
+                    sql,
+                    duration_ms: 2,
+                    error: None,
+                }],
+            ))
+        })
+    }
+
+    fn describe_table<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        schema: &'life1 str,
+        table: &'life2 str,
+    ) -> BoxFuture<'async_trait, Result<(TableStructure, Vec<ExecutedSql>), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.describe_calls.fetch_add(1, Ordering::AcqRel);
+            self.check_transport()?;
+            let columns = mock_columns_for(table);
+            let pk_col = columns[0].name.clone();
+            Ok((
+                TableStructure {
+                    columns,
+                    indexes: vec![IndexInfo {
+                        name: format!("{table}_pkey"),
+                        columns: vec![pk_col.clone()],
+                        is_unique: true,
+                        is_primary: true,
+                        method: "btree".to_owned(),
+                        size_bytes: Some(8_192),
+                        definition: format!("CREATE UNIQUE INDEX {table}_pkey ON {schema}.{table} ({pk_col})"),
+                    }],
+                    stats: TableStats {
+                        total_bytes: Some(16_384),
+                        data_bytes: Some(8_192),
+                        index_bytes: Some(8_192),
+                        estimated_rows: Some(2),
+                        comment: None,
+                        ddl: format!("CREATE TABLE \"{schema}\".\"{table}\" ();"),
+                    },
+                },
+                vec![ExecutedSql {
+                    sql: format!("DESCRIBE {schema}.{table}"),
+                    duration_ms: 1,
+                    error: None,
+                }],
+            ))
+        })
+    }
+
+    fn execute_sql<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        statements: &'life1 [String],
+        _row_limit: Option<usize>,
+    ) -> BoxFuture<'async_trait, Result<(QueryBatchResult, Vec<ExecutedSql>), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.sql_calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_sql.swap(false, Ordering::AcqRel) {
+                return Err(DbError::Disconnected);
+            }
+            self.check_transport()?;
+            let mut results = Vec::new();
+            let mut logs = Vec::new();
+            for sql in statements {
+                let is_select = sql.trim_start().to_ascii_uppercase().starts_with("SELECT");
+                let (columns, rows, rows_affected) = if is_select {
+                    (
+                        vec![ColumnMeta {
+                            name: "full_name".to_owned(),
+                            data_type: "text".to_owned(),
+                            udt_name: "text".to_owned(),
+                            nullable: false,
+                            default_expr: None,
+                            is_primary_key: false,
+                            is_unique: false,
+                            comment: None,
+                            foreign_key: None,
+                        }],
+                        vec![vec![CellValue::Text("Troy Barnes".to_owned())]],
+                        None,
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), Some(1))
+                };
+                results.push(QueryStatementResult {
+                    sql: sql.clone(),
+                    columns,
+                    rows,
+                    rows_affected,
+                    truncated: false,
+                    total_rows_seen: 1,
+                    elapsed_ms: 1,
+                    error: None,
+                });
+                logs.push(ExecutedSql {
+                    sql: sql.clone(),
+                    duration_ms: 1,
+                    error: None,
+                });
+            }
+            Ok((
+                QueryBatchResult {
+                    results,
+                    total_elapsed_ms: 1,
+                    cancelled: false,
+                },
+                logs,
+            ))
+        })
+    }
+
+    fn execute_sql_cancellable<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        statements: &'life1 [String],
+        row_limit: Option<usize>,
+        _cancel_key: u64,
+        cancel_flag: Option<&'life2 AtomicBool>,
+    ) -> BoxFuture<'async_trait, Result<(QueryBatchResult, Vec<ExecutedSql>), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.pre_dispatch_entries.fetch_add(1, Ordering::AcqRel);
+            let delay = *self.pre_dispatch_delay.lock().expect("pre_dispatch_delay lock");
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if cancel_flag.is_some_and(|f| f.load(Ordering::Acquire)) {
+                return Err(DbError::Cancelled);
+            }
+            if self.fail_next_pre_dispatch.swap(false, Ordering::AcqRel) {
+                self.disconnected.store(true, Ordering::Release);
+                return Err(DbError::DisconnectedBeforeDispatch(Box::new(DbError::Disconnected)));
+            }
+            self.execute_sql(statements, row_limit).await
+        })
+    }
+
+    fn execute_transaction<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        statements: &'life1 [String],
+    ) -> BoxFuture<'async_trait, Result<(TransactionOutcome, Vec<ExecutedSql>), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.tx_calls.fetch_add(1, Ordering::AcqRel);
+            self.check_transport()?;
+            let logs = statements
+                .iter()
+                .map(|sql| ExecutedSql {
+                    sql: sql.clone(),
+                    duration_ms: 1,
+                    error: None,
+                })
+                .collect();
+            Ok((
+                TransactionOutcome {
+                    statements_executed: statements.len(),
+                    total_rows_affected: statements.len() as u64,
+                    elapsed_ms: 2,
+                },
+                logs,
+            ))
+        })
+    }
+
+    fn explain_sql<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        statement: &'life1 str,
+        _analyze: bool,
+    ) -> BoxFuture<'async_trait, Result<(ExplainPlan, ExecutedSql), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.explain_calls.fetch_add(1, Ordering::AcqRel);
+            self.check_transport()?;
+            Err(DbError::InvalidInput(format!("unused mock explain for {statement}")))
+        })
+    }
+
+    fn fetch_fk_row<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        fk: &'life1 ForeignKeyRef,
+        _value: &'life2 CellValue,
+        _source_col: &'life3 ColumnMeta,
+    ) -> BoxFuture<'async_trait, Result<(FkPeekRow, ExecutedSql), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.check_transport()?;
+            Err(DbError::InvalidInput(format!("unused mock fk {}", fk.constraint_name)))
+        })
+    }
+
+    fn cancel_running_query<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'async_trait, Result<(), DbError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn cancel_query_by_key<'life0, 'async_trait>(
+        &'life0 self,
+        cancel_key: u64,
+    ) -> BoxFuture<'async_trait, Result<(), DbError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.cancelled_keys.lock().expect("cancelled_keys lock").push(cancel_key);
+            Ok(())
+        })
+    }
+
+    fn ping<'life0, 'async_trait>(&'life0 self) -> BoxFuture<'async_trait, Result<(), DbError>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let delay = *self.ping_delay.lock().expect("ping_delay lock");
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            self.ping_calls.fetch_add(1, Ordering::AcqRel);
+            self.check_transport()
+        })
+    }
+}
+
+struct MockCluster {
+    connect_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
+    fail_connect: Mutex<Option<DbError>>,
+    expected_password: Mutex<Option<String>>,
+    sessions: Mutex<Vec<Arc<MockSession>>>,
+    connect_delay: Duration,
+}
+
+impl MockCluster {
+    fn new(connect_delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            connect_calls: Mutex::new(Vec::new()),
+            fail_connect: Mutex::new(None),
+            expected_password: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
+            connect_delay,
+        })
+    }
+
+    fn connector(self: &Arc<Self>) -> SessionConnector {
+        let cluster = Arc::clone(self);
+        Arc::new(move |_profile, password, database| {
+            let cluster = Arc::clone(&cluster);
+            Box::pin(async move {
+                if !cluster.connect_delay.is_zero() {
+                    tokio::time::sleep(cluster.connect_delay).await;
+                }
+                cluster
+                    .connect_calls
+                    .lock()
+                    .expect("connect_calls lock")
+                    .push((password.clone(), database.clone()));
+
+                if let Some(err) = cluster.fail_connect.lock().expect("fail_connect lock").clone() {
+                    return Err(err);
+                }
+                if let Some(expected) = cluster
+                    .expected_password
+                    .lock()
+                    .expect("expected_password lock")
+                    .clone()
+                    && password.as_deref() != Some(expected.as_str())
+                {
+                    return Err(DbError::AuthFailed("password authentication failed".to_owned()));
+                }
+
+                let db_name = database.unwrap_or_else(|| "postgres".to_owned());
+                let sess = Arc::new(MockSession::new(&db_name));
+                cluster.sessions.lock().expect("sessions lock").push(Arc::clone(&sess));
+                Ok((
+                    sess as Arc<dyn DbSession>,
+                    vec![ExecutedSql {
+                        sql: "SELECT version(), current_database(), current_user".to_owned(),
+                        duration_ms: 1,
+                        error: None,
+                    }],
+                ))
+            })
+        })
+    }
+
+    fn connect_count(&self) -> usize {
+        self.connect_calls.lock().expect("connect_calls lock").len()
+    }
+
+    fn connect_calls(&self) -> Vec<(Option<String>, Option<String>)> {
+        self.connect_calls.lock().expect("connect_calls lock").clone()
+    }
+
+    fn latest_session(&self) -> Arc<MockSession> {
+        Arc::clone(
+            self.sessions
+                .lock()
+                .expect("sessions lock")
+                .last()
+                .expect("at least one mock session"),
+        )
+    }
+
+    fn set_fail_connect(&self, err: Option<DbError>) {
+        *self.fail_connect.lock().expect("fail_connect lock") = err;
+    }
+
+    fn set_expected_password(&self, pw: Option<&str>) {
+        *self.expected_password.lock().expect("expected_password lock") = pw.map(str::to_owned);
+    }
+}
+
+fn worker_runtime(cluster: &Arc<MockCluster>) -> Runtime<AppState> {
+    let mut store = sample_store_data();
+    store.connections.retain(|c| c.name == "greendale_local");
+    store.connections[0].database = None;
+    let mut state = AppState::init_in_memory(store);
+    state.appearance = ColorScheme::Dark;
+    state.worker = Some(WorkerBridge::spawn_with_connector(cluster.connector()).expect("spawn mock worker"));
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(true, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+    rt
+}
+
+fn poll_until(
+    rt: &mut Runtime<AppState>,
+    timeout: Duration,
+    mut pred: impl FnMut(&mut Runtime<AppState>) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        rt.frame(0.02);
+        if pred(rt) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for async UI condition"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn connect_select_db_schema_and_students(rt: &mut Runtime<AppState>) {
+    let conn_id = rt.state.connections[0].id;
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    poll_until(rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    rt.update(|s, tx| s.select_database("greendale_idp_dev".to_owned(), tx));
+    poll_until(rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("greendale_idp_dev"))
+        })
+    });
+
+    rt.update(|s, _| s.select_schema("study_room".to_owned()));
+    poll_until(rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some_and(|c| {
+                c.active_schema.as_deref() == Some("study_room")
+                    && c.objects.iter().any(|o| o.name == "students")
+            })
+    });
+
+    let (sx, sy) = rt
+        .find("sidebar/obj/study_room.students")
+        .expect("students sidebar item");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    poll_until(rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_table_tab())
+            .is_some_and(|t| t.object_name == "students" && t.page.is_some() && t.structure.is_some())
+    });
+}
+
+#[test]
+fn idle_disconnect_silently_reconnects_in_background_on_table_click() {
+    let cluster = MockCluster::new(Duration::from_millis(25));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let connects_before = cluster.connect_count();
+
+    // Simulate the database closing the idle socket while the app sat idle.
+    cluster.latest_session().set_disconnected(true);
+
+    let (cx, cy) = rt
+        .find("sidebar/obj/study_room.courses")
+        .expect("courses sidebar item");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        assert!(
+            rt.find("stage-disconnected").is_none(),
+            "stage-disconnected must never flash during silent reconnect"
+        );
+        let sess = rt.state.active_session().expect("session");
+        assert!(sess.status.as_connected().is_some());
+        sess.active_table_tab()
+            .is_some_and(|t| t.object_name == "courses" && t.page.is_some() && t.structure.is_some())
+    });
+
+    // Concurrent FetchTablePage + DescribeTable coalesced into a single reconnect targeting the active DB.
+    assert_eq!(cluster.connect_count(), connects_before + 1);
+    assert_eq!(
+        cluster.connect_calls().last().and_then(|(_, db)| db.as_deref()),
+        Some("greendale_idp_dev")
+    );
+
+    let sess = rt.state.active_session().expect("session");
+    assert!(!sess.console_entries.iter().any(|entry| {
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("database session is disconnected"))
+    }));
+}
+
+#[test]
+fn half_open_disconnect_silently_reconnects_for_reads_sql_and_staged_commit() {
+    let cluster = MockCluster::new(Duration::from_millis(20));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+
+    // 1. Half-open drop on table page read (is_disconnected() is false, wire query fails with Disconnected).
+    let mut connects = cluster.connect_count();
+    let stale_read = cluster.latest_session();
+    stale_read.set_half_open(true);
+    let (cx, cy) = rt
+        .find("sidebar/obj/study_room.courses")
+        .expect("courses sidebar item");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_table_tab())
+            .is_some_and(|t| t.object_name == "courses" && t.page.is_some() && t.structure.is_some())
+    });
+    assert_eq!(cluster.connect_count(), connects + 1);
+    connects = cluster.connect_count();
+
+    // 2. Half-open drop on read-only SQL execution retries transparently and succeeds.
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.1);
+    cluster.latest_session().set_half_open(true);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT full_name FROM study_room.students;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && !q.results.is_empty())
+    });
+    assert_eq!(cluster.connect_count(), connects + 1);
+    let qtab = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_query_tab()
+        .expect("query tab");
+    assert!(qtab.batch_error.is_none());
+    assert_eq!(qtab.results[0].statement.rows.len(), 1);
+    connects = cluster.connect_count();
+
+    // 3. Half-open drop before staged commit runs pre-flight ping, reconnects before BEGIN, and executes tx once.
+    let students_tab_id = rt
+        .state
+        .active_session()
+        .expect("session")
+        .tabs
+        .iter()
+        .find(|t| t.schema_and_name() == Some(("study_room", "students")))
+        .expect("students tab")
+        .id;
+    rt.update(|s, tx| s.activate_tab(students_tab_id, tx));
+    rt.frame(0.1);
+    rt.update(|s, tx| {
+        assert!(s.begin_cell_edit(RowKey::Existing(0), 1, tx));
+    });
+    rt.frame(0.1);
+    rt.key(KeyEvent::from(Key::Text("Troy 'T-Bone' Barnes".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    let stale_tx_sess = cluster.latest_session();
+    stale_tx_sess.set_half_open(true);
+    rt.update(|s, _| s.commit_staged_changes());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_table_tab())
+            .is_some_and(|t| !t.committing && !t.staged.has_changes() && !t.page_loading)
+    });
+    assert_eq!(cluster.connect_count(), connects + 1);
+    assert!(stale_tx_sess.ping_calls.load(Ordering::Acquire) >= 1);
+    assert_eq!(stale_tx_sess.tx_calls.load(Ordering::Acquire), 0);
+    assert_eq!(cluster.latest_session().tx_calls.load(Ordering::Acquire), 1);
+    connects = cluster.connect_count();
+
+    // 4. Half-open drop before mutating SQL runs pre-flight ping, reconnects, and executes UPDATE once.
+    let query_tab_id = rt
+        .state
+        .active_session()
+        .expect("session")
+        .tabs
+        .iter()
+        .find(|t| t.as_query().is_some())
+        .expect("query tab")
+        .id;
+    rt.update(|s, tx| s.activate_tab(query_tab_id, tx));
+    rt.frame(0.1);
+    let stale_write_sess = cluster.latest_session();
+    stale_write_sess.set_half_open(true);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("UPDATE study_room.students SET full_name = 'Troy' WHERE student_id = 1;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.results.first().is_some_and(|r| r.statement.rows_affected == Some(1)))
+    });
+    assert_eq!(cluster.connect_count(), connects + 1);
+    assert!(stale_write_sess.ping_calls.load(Ordering::Acquire) >= 1);
+    assert_eq!(stale_write_sess.sql_calls.load(Ordering::Acquire), 0);
+    assert_eq!(cluster.latest_session().sql_calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn failed_silent_reconnect_and_manual_reconnect_restores_database_schema_and_tab() {
+    let cluster = MockCluster::new(Duration::from_millis(25));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let connects_before = cluster.connect_count();
+
+    // Drop session AND reject reconnect while server is unreachable.
+    cluster.latest_session().set_disconnected(true);
+    cluster.set_fail_connect(Some(DbError::ConnectionFailed("Connection refused".to_owned())));
+
+    let (cx, cy) = rt
+        .find("sidebar/obj/study_room.courses")
+        .expect("courses sidebar item");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.find("stage-disconnected").is_some()
+            && rt
+                .state
+                .active_session()
+                .is_some_and(|s| matches!(s.status, ConnectionState::Disconnected { .. }))
+    });
+
+    // Only one silent reconnect attempt happened for concurrent FetchTablePage + DescribeTable.
+    assert_eq!(cluster.connect_count(), connects_before + 1);
+    match &rt.state.active_session().expect("session").status {
+        ConnectionState::Disconnected { reason: Some(reason) } => {
+            assert!(reason.contains("Connection refused"), "unexpected reason: {reason}");
+        }
+        other => panic!("expected Disconnected with Connection refused, got {other:?}"),
+    }
+
+    // Bring server back online and click the Reconnect button in the disconnected stage.
+    cluster.set_fail_connect(None);
+    let stage_rect = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("stage-disconnected"))
+        .expect("stage-disconnected")
+        .rect;
+    let reconnect_btn = rt
+        .elements()
+        .into_iter()
+        .find(|el| {
+            !el.exiting
+                && !el.inert
+                && el.role == "button"
+                && el.label.as_deref() == Some("Reconnect")
+                && el.rect[0] >= stage_rect[0]
+                && el.rect[1] >= stage_rect[1]
+                && el.rect[0] + el.rect[2] <= stage_rect[0] + stage_rect[2]
+                && el.rect[1] + el.rect[3] <= stage_rect[1] + stage_rect[3]
+        })
+        .expect("Reconnect button inside stage-disconnected");
+    rt.pointer_down(
+        reconnect_btn.rect[0] + reconnect_btn.rect[2] * 0.5,
+        reconnect_btn.rect[1] + reconnect_btn.rect[3] * 0.5,
+    );
+    rt.pointer_up(
+        reconnect_btn.rect[0] + reconnect_btn.rect[2] * 0.5,
+        reconnect_btn.rect[1] + reconnect_btn.rect[3] * 0.5,
+    );
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        assert!(rt.find("stage-no-db").is_none(), "must never return to Open Database screen");
+        let sess = rt.state.active_session().expect("session");
+        sess.status.as_connected().is_some()
+            && sess
+                .active_table_tab()
+                .is_some_and(|t| t.object_name == "courses" && t.page.is_some() && t.structure.is_some())
+    });
+
+    let sess = rt.state.active_session().expect("session");
+    let connected = sess.status.as_connected().expect("connected");
+    assert_eq!(connected.active_database.as_deref(), Some("greendale_idp_dev"));
+    assert_eq!(connected.active_schema.as_deref(), Some("study_room"));
+    assert_eq!(
+        connected.selected_object,
+        Some(("study_room".to_owned(), "courses".to_owned()))
+    );
+    assert!(
+        sess.tabs
+            .iter()
+            .any(|t| t.schema_and_name() == Some(("study_room", "students"))),
+        "previous students tab must remain open"
+    );
+}
+
+#[test]
+fn explicit_disconnect_stays_disconnected_and_reconnect_restores_context() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let connects_before = cluster.connect_count();
+
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Disconnect, tx));
+    });
+    rt.frame(0.2);
+    assert!(rt.find("stage-disconnected").is_some());
+
+    // Any in-flight or stray reload while explicitly disconnected must NOT silently reconnect.
+    rt.update(|s, _| s.reload_active_tab());
+    std::thread::sleep(Duration::from_millis(50));
+    rt.frame(0.1);
+    assert_eq!(cluster.connect_count(), connects_before);
+    assert!(rt.find("stage-disconnected").is_some());
+
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        assert!(rt.find("stage-no-db").is_none());
+        let sess = rt.state.active_session().expect("session");
+        sess.status.as_connected().is_some()
+            && sess
+                .active_table_tab()
+                .is_some_and(|t| t.object_name == "students" && t.page.is_some() && t.structure.is_some())
+    });
+
+    let connected = rt
+        .state
+        .active_session()
+        .expect("session")
+        .status
+        .as_connected()
+        .expect("connected");
+    assert_eq!(connected.active_database.as_deref(), Some("greendale_idp_dev"));
+    assert_eq!(connected.active_schema.as_deref(), Some("study_room"));
+}
+
+#[test]
+fn ask_every_time_password_prompt_reconnects_in_place_preserving_context() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    cluster.set_expected_password(Some("dean_pelton_secret"));
+    let mut rt = worker_runtime(&cluster);
+    rt.update(|s, _| {
+        s.connections[0].password_mode = PasswordMode::AskEveryTime;
+    });
+    rt.frame(0.0);
+
+    let conn_id = rt.state.connections[0].id;
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::PasswordPrompt(_)));
+
+    rt.key(KeyEvent::from(Key::Text("dean_pelton_secret".to_owned())));
+    rt.frame(0.0);
+    rt.update(|s, tx| s.submit_password_prompt(tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    rt.update(|s, tx| s.select_database("greendale_idp_dev".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("greendale_idp_dev"))
+        })
+    });
+    rt.update(|s, _| s.select_schema("study_room".to_owned()));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some_and(|c| c.active_schema.as_deref() == Some("study_room"))
+    });
+    let (sx, sy) = rt
+        .find("sidebar/obj/study_room.students")
+        .expect("students sidebar item");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_table_tab())
+            .is_some_and(|t| t.page.is_some() && t.structure.is_some())
+    });
+
+    let original_sid = rt.state.active_session().expect("session").id;
+
+    // Disconnect clears session_password; triggering Reconnect opens PasswordPrompt targeting original_sid.
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Disconnect, tx));
+    });
+    rt.frame(0.1);
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+    rt.frame(0.1);
+    match &rt.state.overlay {
+        OverlayState::PasswordPrompt(prompt) => {
+            assert_eq!(prompt.session_id, Some(original_sid));
+            assert_eq!(prompt.database_override.as_deref(), Some("greendale_idp_dev"));
+            assert_eq!(prompt.preferred_schema.as_deref(), Some("study_room"));
+        }
+        other => panic!("expected PasswordPrompt overlay, got {other:?}"),
+    }
+
+    rt.key(KeyEvent::from(Key::Text("dean_pelton_secret".to_owned())));
+    rt.frame(0.0);
+    rt.update(|s, tx| s.submit_password_prompt(tx));
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+            && rt
+                .state
+                .active_session()
+                .and_then(|s| s.active_table_tab())
+                .is_some_and(|t| t.page.is_some() && t.structure.is_some())
+    });
+
+    let sess = rt.state.active_session().expect("session");
+    assert_eq!(sess.id, original_sid);
+    let connected = sess.status.as_connected().expect("connected");
+    assert_eq!(connected.active_database.as_deref(), Some("greendale_idp_dev"));
+    assert_eq!(connected.active_schema.as_deref(), Some("study_room"));
+    assert_eq!(
+        sess.active_table_tab().map(|t| t.object_name.as_str()),
+        Some("students")
+    );
+}
+
+#[test]
+fn superseded_write_does_not_execute_on_switched_database_or_disconnect_it() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+
+    let db_a_sess = cluster.latest_session();
+    db_a_sess.set_ping_delay(Duration::from_millis(120));
+    db_a_sess.set_half_open(true);
+
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("UPDATE study_room.students SET full_name = 'Troy' WHERE student_id = 1;");
+        assert!(s.run_active_query(true));
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    rt.frame(0.02);
+
+    // Switch database while DB A's preflight ping is still pending and destined to fail.
+    rt.update(|s, tx| s.select_database("postgres".to_owned(), tx));
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("postgres"))
+                && s.active_query_tab().is_some_and(|q| !q.running)
+        })
+    });
+
+    // Pump additional frames past DB A's ping delay to ensure delayed events do not drop DB B.
+    let settle_until = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < settle_until {
+        rt.frame(0.02);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(rt.find("stage-disconnected").is_none());
+    let sess = rt.state.active_session().expect("session");
+    let connected = sess.status.as_connected().expect("postgres stays connected");
+    assert_eq!(connected.active_database.as_deref(), Some("postgres"));
+    assert_eq!(cluster.latest_session().sql_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn mid_flight_sql_does_not_replay_and_cancel_during_reconnect_skips_dispatch() {
+    let cluster = MockCluster::new(Duration::from_millis(120));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+
+    // Part A: Mid-flight drop after preflight ping passes must NOT replay uncertain SQL like nextval.
+    let seq_sess = cluster.latest_session();
+    seq_sess.set_fail_next_sql(true);
+    let connects_before = cluster.connect_count();
+
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT nextval('study_room.students_id_seq');");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.find("stage-disconnected").is_some()
+            && rt
+                .state
+                .active_session()
+                .and_then(|s| s.active_query_tab())
+                .is_some_and(|q| !q.running)
+    });
+    assert_eq!(cluster.connect_count(), connects_before);
+    assert_eq!(seq_sess.sql_calls.load(Ordering::Acquire), 1);
+
+    // Part B: Cancelling a query while silent reconnect is in progress prevents dispatch onto replacement.
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    cluster.latest_session().set_disconnected(true);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 42;");
+        assert!(s.run_active_query(true));
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    rt.frame(0.02);
+
+    rt.update(|s, _| {
+        assert!(s.cancel_active_query());
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.batch_cancelled)
+    });
+
+    let settle_until = Instant::now() + Duration::from_millis(160);
+    while Instant::now() < settle_until {
+        rt.frame(0.02);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(cluster.latest_session().sql_calls.load(Ordering::Acquire), 0);
+
+    // Part C: Cancelling during pre-dispatch checkout/ping skips wire SQL dispatch and targets req key.
+    let connects_before_c = cluster.connect_count();
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        cluster.connect_count() == connects_before_c + 1
+            && rt
+                .state
+                .active_session()
+                .and_then(|s| s.status.as_connected())
+                .is_some()
+    });
+
+    let active_sess = cluster.latest_session();
+    let connects_before_c_query = cluster.connect_count();
+    active_sess.set_pre_dispatch_delay(Duration::from_millis(120));
+    let mut cancelled_req_id = None;
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 99;");
+        assert!(s.run_active_query(true));
+        cancelled_req_id = s
+            .active_session()
+            .and_then(|sess| sess.active_query_tab())
+            .and_then(|qt| qt.active_req_id)
+            .map(tv_core::RequestId::get);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |_| {
+        active_sess.pre_dispatch_entries.load(Ordering::Acquire) == 1
+    });
+
+    rt.update(|s, _| {
+        assert!(s.cancel_active_query());
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.batch_cancelled)
+            && !active_sess.cancelled_keys().is_empty()
+    });
+
+    let settle_part_c = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < settle_part_c {
+        rt.frame(0.02);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(cluster.connect_count(), connects_before_c_query);
+    assert_eq!(active_sess.pre_dispatch_entries.load(Ordering::Acquire), 1);
+    assert_eq!(active_sess.sql_calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        active_sess.cancelled_keys(),
+        vec![cancelled_req_id.expect("active_req_id")]
+    );
+}
+
+#[test]
+fn mysql_pool_replacement_auth_failure_prompts_ask_every_time() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    cluster.set_expected_password(Some("old_secret"));
+    let mut rt = worker_runtime(&cluster);
+    rt.update(|s, _| {
+        s.connections[0].password_mode = PasswordMode::AskEveryTime;
+    });
+    rt.frame(0.0);
+
+    let conn_id = rt.state.connections[0].id;
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    rt.frame(0.1);
+    rt.key(KeyEvent::from(Key::Text("old_secret".to_owned())));
+    rt.frame(0.0);
+    rt.update(|s, tx| s.submit_password_prompt(tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    rt.update(|s, tx| s.select_database("greendale_idp_dev".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("greendale_idp_dev"))
+        })
+    });
+    rt.update(|s, _| s.select_schema("study_room".to_owned()));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some_and(|c| c.active_schema.as_deref() == Some("study_room"))
+    });
+    let (sx, sy) = rt
+        .find("sidebar/obj/study_room.students")
+        .expect("students sidebar item");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_table_tab())
+            .is_some_and(|t| t.page.is_some() && t.structure.is_some())
+    });
+
+    let original_sid = rt.state.active_session().expect("session").id;
+
+    // Simulate rotated DB password causing replacement checkout auth failure on dead pool socket.
+    cluster.set_expected_password(Some("new_secret"));
+    let stale_sess = cluster.latest_session();
+    stale_sess.set_half_open(true);
+    stale_sess.set_fail_with_auth_on_disconnect(true);
+
+    let (cx, cy) = rt
+        .find("sidebar/obj/study_room.courses")
+        .expect("courses sidebar item");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        matches!(rt.state.overlay, OverlayState::PasswordPrompt(_))
+    });
+    match &rt.state.overlay {
+        OverlayState::PasswordPrompt(prompt) => {
+            assert_eq!(prompt.session_id, Some(original_sid));
+            assert_eq!(prompt.database_override.as_deref(), Some("greendale_idp_dev"));
+            assert_eq!(prompt.preferred_schema.as_deref(), Some("study_room"));
+            assert!(prompt.error.is_some());
+        }
+        other => panic!("expected PasswordPrompt overlay, got {other:?}"),
+    }
+
+    rt.key(KeyEvent::from(Key::Text("new_secret".to_owned())));
+    rt.frame(0.0);
+    rt.update(|s, tx| s.submit_password_prompt(tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+            && rt
+                .state
+                .active_session()
+                .and_then(|s| s.active_table_tab())
+                .is_some_and(|t| t.object_name == "courses" && t.page.is_some() && t.structure.is_some())
+    });
+}
+
+#[test]
+fn reconnect_preserves_none_selected_object_after_schema_switch() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    rt.update(|s, _| s.select_schema("public".to_owned()));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some_and(|c| c.active_schema.as_deref() == Some("public") && c.selected_object.is_none())
+    });
+
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Disconnect, tx));
+    });
+    rt.frame(0.1);
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    let connected = rt
+        .state
+        .active_session()
+        .expect("session")
+        .status
+        .as_connected()
+        .expect("connected");
+    assert_eq!(connected.active_schema.as_deref(), Some("public"));
+    assert_eq!(connected.selected_object, None);
+}
+
+#[test]
+fn disconnect_and_manual_reconnect_ignores_stale_query_from_reused_slot() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+
+    let stale_sess = cluster.latest_session();
+    stale_sess.set_ping_delay(Duration::from_millis(120));
+    stale_sess.set_half_open(true);
+
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("UPDATE study_room.students SET full_name = 'Troy' WHERE student_id = 1;");
+        assert!(s.run_active_query(true));
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    rt.frame(0.02);
+
+    // Explicit disconnect drops worker entry, then manual reconnect creates a fresh entry with new req ID.
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Disconnect, tx));
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    rt.frame(0.02);
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+            && rt
+                .state
+                .active_session()
+                .and_then(|s| s.active_query_tab())
+                .is_some_and(|q| !q.running)
+    });
+
+    let settle_until = Instant::now() + Duration::from_millis(160);
+    while Instant::now() < settle_until {
+        rt.frame(0.02);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert!(rt.find("stage-disconnected").is_none());
+    let sess = rt.state.active_session().expect("session");
+    assert!(sess.status.as_connected().is_some());
+    assert_eq!(cluster.latest_session().sql_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn pre_dispatch_disconnect_reconnects_write_once_and_failed_db_switch_keeps_prior_db() {
+    let cluster = MockCluster::new(Duration::from_millis(10));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+
+    // Part A: Pre-dispatch disconnect (MySQL checked-out socket ping failure) reconnects and runs UPDATE once.
+    let before_s5 = cluster.connect_count();
+    let pre_drop_sess = cluster.latest_session();
+    pre_drop_sess.set_fail_next_pre_dispatch(true);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("UPDATE study_room.students SET full_name = 'Abed' WHERE student_id = 2;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.results.first().is_some_and(|r| r.statement.rows_affected == Some(1)))
+    });
+    assert!(rt.find("stage-disconnected").is_none());
+    assert_eq!(cluster.connect_count(), before_s5 + 1);
+    assert_eq!(pre_drop_sess.sql_calls.load(Ordering::Acquire), 0);
+    assert_eq!(cluster.latest_session().sql_calls.load(Ordering::Acquire), 1);
+
+    // Part B: Failed DB switch preserves prior connected DB and active_connect_req_id so subsequent SQL works.
+    cluster.set_fail_connect(Some(DbError::ConnectionFailed("permission denied".to_owned())));
+    rt.update(|s, tx| s.select_database("postgres".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|s| s.pending_db_switch_req.is_none())
+    });
+    {
+        let sess = rt.state.active_session().expect("session");
+        let connected = sess.status.as_connected().expect("still connected");
+        assert_eq!(connected.active_database.as_deref(), Some("greendale_idp_dev"));
+    }
+
+    cluster.set_fail_connect(None);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT full_name FROM study_room.students;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.results.first().is_some_and(|r| !r.statement.rows.is_empty()))
+    });
+
+    // Part C: EXPLAIN ANALYZE from DB A superseded by DB switch must not execute on DB B.
+    let db_a = cluster.latest_session();
+    db_a.set_ping_delay(Duration::from_millis(120));
+    db_a.set_half_open(true);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("UPDATE study_room.students SET full_name = 'Annie' WHERE student_id = 2;");
+        assert!(s.run_active_query_explain(true));
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    rt.frame(0.02);
+
+    rt.update(|s, tx| s.select_database("postgres".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("postgres"))
+                && s.active_query_tab().is_some_and(|q| !q.explain_loading)
+        })
+    });
+
+    let settle_until = Instant::now() + Duration::from_millis(150);
+    while Instant::now() < settle_until {
+        rt.frame(0.02);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(rt.find("stage-disconnected").is_none());
+    assert_eq!(cluster.latest_session().explain_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn cancel_after_database_switch_targets_executing_session_only() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+
+    let sess_a = cluster.latest_session();
+    sess_a.set_pre_dispatch_delay(Duration::from_millis(250));
+    let mut query_req_id = None;
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 1;");
+        assert!(s.run_active_query(true));
+        query_req_id = s
+            .active_session()
+            .and_then(|sess| sess.active_query_tab())
+            .and_then(|qt| qt.active_req_id)
+            .map(tv_core::RequestId::get);
+    });
+    let query_req_id = query_req_id.expect("query_req_id");
+    poll_until(&mut rt, Duration::from_secs(3), |_| {
+        sess_a.pre_dispatch_entries.load(Ordering::Acquire) == 1
+    });
+
+    rt.update(|s, tx| s.select_database("postgres".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("postgres"))
+        })
+    });
+    let sess_b = cluster.latest_session();
+    assert!(!Arc::ptr_eq(&sess_a, &sess_b));
+
+    rt.update(|s, _| {
+        assert!(s.cancel_active_query());
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.batch_cancelled)
+            && !sess_a.cancelled_keys().is_empty()
+    });
+
+    let settle_until = Instant::now() + Duration::from_millis(120);
+    while Instant::now() < settle_until {
+        rt.frame(0.02);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(sess_a.cancelled_keys(), vec![query_req_id]);
+    assert!(sess_b.cancelled_keys().is_empty());
+}
+
+#[test]
+fn select_schema_during_database_switch_does_not_drop_switch() {
+    let cluster = MockCluster::new(Duration::from_millis(120));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    let conn_id = rt.state.connections[0].id;
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    rt.update(|s, tx| {
+        s.select_database("greendale_idp_dev".to_owned(), tx);
+        assert!(
+            s.active_session()
+                .is_some_and(|sess| sess.pending_db_switch_req.is_some())
+        );
+        s.select_schema("public".to_owned());
+    });
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("greendale_idp_dev"))
+        })
+    });
+
+    let db_b_sess = cluster.latest_session();
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 1;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.results.first().is_some_and(|r| !r.statement.rows.is_empty()))
+    });
+
+    assert_eq!(db_b_sess.sql_calls.load(Ordering::Acquire), 1);
+    assert!(rt.find("stage-disconnected").is_none());
+}
+
+#[test]
+fn queued_db_b_success_preserved_when_db_c_fails() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    let conn_id = rt.state.connections[0].id;
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+
+    // Request DB B and wait for the worker to finish installing B and queuing its event BEFORE pumping UI frames.
+    rt.update(|s, tx| s.select_database("greendale_idp_dev".to_owned(), tx));
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    while cluster.connect_count() < 2 {
+        assert!(Instant::now() < wait_deadline, "timed out waiting for DB B connect");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::sleep(Duration::from_millis(25));
+
+    cluster.set_fail_connect(Some(DbError::ConnectionFailed("db C denied".to_owned())));
+    rt.update(|s, tx| s.select_database("study_room_c".to_owned(), tx));
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|s| s.pending_db_switch_req.is_none())
+    });
+    assert_eq!(
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .and_then(|c| c.active_database.as_deref()),
+        Some("greendale_idp_dev")
+    );
+
+    cluster.set_fail_connect(None);
+    let db_b_sess = cluster.latest_session();
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 1;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.results.first().is_some_and(|r| !r.statement.rows.is_empty()))
+    });
+    assert_eq!(db_b_sess.sql_calls.load(Ordering::Acquire), 1);
+    assert!(rt.find("stage-disconnected").is_none());
+}
+
+#[test]
+fn background_disconnect_of_db_a_does_not_drop_in_flight_switch_to_db_b() {
+    let cluster = MockCluster::new(Duration::from_millis(140));
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    let conn_id = rt.state.connections[0].id;
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+    rt.update(|s, tx| s.open_new_query_tab(tx));
+    rt.frame(0.05);
+
+    let sess_a = cluster.latest_session();
+    sess_a.set_pre_dispatch_delay(Duration::from_millis(40));
+    sess_a.set_fail_next_sql(true);
+
+    rt.update(|s, tx| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 1;");
+        assert!(s.run_active_query(true));
+        s.select_database("greendale_idp_dev".to_owned(), tx);
+    });
+
+    // DB A's mid-flight disconnect reaches the UI before DB B's 140ms connect finishes.
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.find("stage-disconnected").is_some()
+            && rt
+                .state
+                .active_session()
+                .is_some_and(|s| s.pending_db_switch_req.is_some())
+    });
+
+    // DB B's switch still completes cleanly and transitions the session back to Connected on B.
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|s| {
+            s.pending_db_switch_req.is_none()
+                && s.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("greendale_idp_dev"))
+        })
+    });
+    assert!(rt.find("stage-disconnected").is_none());
+
+    let db_b_sess = cluster.latest_session();
+    assert!(!Arc::ptr_eq(&sess_a, &db_b_sess));
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .and_then(|sess| sess.active_query_tab_mut())
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 1;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.active_query_tab())
+            .is_some_and(|q| !q.running && q.results.first().is_some_and(|r| !r.statement.rows.is_empty()))
+    });
+    assert_eq!(db_b_sess.sql_calls.load(Ordering::Acquire), 1);
+    assert!(rt.find("stage-disconnected").is_none());
 }

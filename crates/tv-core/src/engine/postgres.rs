@@ -27,11 +27,43 @@ use std::collections::HashMap;
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.get_or_init(|| {
         drop(rustls::crypto::ring::default_provider().install_default());
     });
+}
+
+#[derive(Default)]
+struct PostgresCancelState {
+    active_key: u64,
+    in_flight_cancels: usize,
+    cancel_requested: bool,
+}
+
+struct ActiveCancelKeyGuard<'a>(&'a Mutex<PostgresCancelState>);
+
+impl Drop for ActiveCancelKeyGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.active_key = 0;
+        }
+    }
+}
+
+struct InFlightCancelGuard<'a> {
+    state: &'a Mutex<PostgresCancelState>,
+    tx: &'a tokio::sync::watch::Sender<usize>,
+}
+
+impl Drop for InFlightCancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight_cancels = state.in_flight_cancels.saturating_sub(1);
+            self.tx.send_replace(state.in_flight_cancels);
+        }
+    }
 }
 
 /// Active PostgreSQL database session backed by `tokio-postgres`.
@@ -41,8 +73,10 @@ pub struct PostgresSession {
     ssl: SslConfig,
     use_tls_for_cancel: bool,
     disconnected: Arc<AtomicBool>,
+    cancel_state: Mutex<PostgresCancelState>,
+    cancel_in_flight_tx: tokio::sync::watch::Sender<usize>,
     conn_task: Mutex<Option<JoinHandle<()>>>,
-    tx_lock: tokio::sync::Mutex<()>,
+    client_lock: tokio::sync::Mutex<()>,
 }
 
 impl Drop for PostgresSession {
@@ -81,6 +115,7 @@ impl PostgresSession {
                 Err(err) => return Err(err),
             };
 
+        let (cancel_in_flight_tx, _) = tokio::sync::watch::channel(0usize);
         let mut session = Self {
             client: Arc::new(client),
             server_info: ServerInfo {
@@ -91,8 +126,10 @@ impl PostgresSession {
             ssl: profile.ssl.clone(),
             use_tls_for_cancel: used_tls,
             disconnected,
+            cancel_state: Mutex::new(PostgresCancelState::default()),
+            cancel_in_flight_tx,
             conn_task: Mutex::new(Some(conn_task)),
-            tx_lock: tokio::sync::Mutex::new(()),
+            client_lock: tokio::sync::Mutex::new(()),
         };
 
         let (info, log) = session.fetch_server_info().await?;
@@ -136,10 +173,27 @@ impl PostgresSession {
     }
 
     fn ensure_alive(&self) -> Result<(), DbError> {
-        if self.disconnected.load(Ordering::Acquire) || self.client.is_closed() {
+        if self.is_disconnected() {
             return Err(DbError::Disconnected);
         }
         Ok(())
+    }
+
+    fn map_session_err(&self, err: tokio_postgres::Error) -> DbError {
+        if err.is_closed() {
+            self.disconnected.store(true, Ordering::Release);
+            return DbError::Disconnected;
+        }
+        if let Some(db) = err.as_db_error()
+            && is_pg_disconnect_sqlstate(db.code().code())
+        {
+            self.disconnected.store(true, Ordering::Release);
+            return DbError::Disconnected;
+        }
+        if err.as_db_error().is_none() && self.is_disconnected() {
+            return DbError::Disconnected;
+        }
+        map_pg_err(err)
     }
 
     async fn fetch_column_metas(&self, schema: &str, table: &str) -> Result<(Vec<ColumnMeta>, ExecutedSql), DbError> {
@@ -166,7 +220,7 @@ impl PostgresSession {
             .client
             .query(col_sql, &[&schema, &table])
             .await
-            .map_err(map_pg_err)?;
+            .map_err(|e| self.map_session_err(e))?;
 
         let fk_sql = "SELECT a_src.attname, con.conname, nf.nspname, cf.relname, a_dst.attname \
                       FROM pg_catalog.pg_constraint con \
@@ -183,7 +237,7 @@ impl PostgresSession {
             .client
             .query(fk_sql, &[&schema, &table])
             .await
-            .map_err(map_pg_err)?;
+            .map_err(|e| self.map_session_err(e))?;
 
         let mut fks: HashMap<String, ForeignKeyRef> = HashMap::new();
         for row in fk_rows {
@@ -238,7 +292,12 @@ impl DbSession for PostgresSession {
         &self.server_info
     }
 
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire) || self.client.is_closed()
+    }
+
     async fn list_databases(&self) -> Result<(Vec<DatabaseInfo>, ExecutedSql), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let sql = "SELECT d.datname, COALESCE(pg_catalog.pg_get_userbyid(d.datdba), ''), \
                    pg_catalog.pg_database_size(d.datname) \
@@ -253,7 +312,11 @@ impl DbSession for PostgresSession {
                                     FROM pg_catalog.pg_database d \
                                     WHERE d.datistemplate = false \
                                     ORDER BY d.datname ASC";
-                let rows = self.client.query(fallback_sql, &[]).await.map_err(map_pg_err)?;
+                let rows = self
+                    .client
+                    .query(fallback_sql, &[])
+                    .await
+                    .map_err(|e| self.map_session_err(e))?;
                 let dbs = rows
                     .into_iter()
                     .map(|row| DatabaseInfo {
@@ -271,7 +334,7 @@ impl DbSession for PostgresSession {
                     },
                 ));
             }
-            Err(err) => return Err(map_pg_err(err)),
+            Err(err) => return Err(self.map_session_err(err)),
         };
 
         let dbs = rows
@@ -293,6 +356,7 @@ impl DbSession for PostgresSession {
     }
 
     async fn list_schemas(&self) -> Result<(Vec<SchemaInfo>, ExecutedSql), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let sql = "SELECT nspname FROM pg_catalog.pg_namespace \
                    WHERE nspname NOT LIKE 'pg_temp_%' AND nspname NOT LIKE 'pg_toast_temp_%' \
@@ -300,7 +364,11 @@ impl DbSession for PostgresSession {
                             (nspname LIKE 'pg_%' OR nspname = 'information_schema') ASC, \
                             nspname ASC";
         let start = Instant::now();
-        let rows = self.client.query(sql, &[]).await.map_err(map_pg_err)?;
+        let rows = self
+            .client
+            .query(sql, &[])
+            .await
+            .map_err(|e| self.map_session_err(e))?;
         let schemas = rows
             .into_iter()
             .map(|row| {
@@ -320,6 +388,7 @@ impl DbSession for PostgresSession {
     }
 
     async fn list_objects(&self, schema: &str) -> Result<(Vec<DbObject>, ExecutedSql), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let sql = "SELECT c.relname, c.relkind::text, \
                    CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint ELSE NULL END, \
@@ -329,7 +398,11 @@ impl DbSession for PostgresSession {
                    WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
                    ORDER BY c.relname ASC";
         let start = Instant::now();
-        let rows = self.client.query(sql, &[&schema]).await.map_err(map_pg_err)?;
+        let rows = self
+            .client
+            .query(sql, &[&schema])
+            .await
+            .map_err(|e| self.map_session_err(e))?;
         let objects = rows
             .into_iter()
             .filter_map(|row| {
@@ -362,6 +435,7 @@ impl DbSession for PostgresSession {
     }
 
     async fn list_columns(&self, schema: &str, object: &str) -> Result<(Vec<ColumnSummary>, ExecutedSql), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let sql = "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
                    NOT a.attnotnull, BOOL_OR(COALESCE(i.indisprimary, false)) \
@@ -373,7 +447,11 @@ impl DbSession for PostgresSession {
                    GROUP BY a.attnum, a.attname, a.atttypid, a.atttypmod, a.attnotnull \
                    ORDER BY a.attnum ASC";
         let start = Instant::now();
-        let rows = self.client.query(sql, &[&schema, &object]).await.map_err(map_pg_err)?;
+        let rows = self
+            .client
+            .query(sql, &[&schema, &object])
+            .await
+            .map_err(|e| self.map_session_err(e))?;
         let cols = rows
             .into_iter()
             .map(|row| ColumnSummary {
@@ -398,12 +476,20 @@ impl DbSession for PostgresSession {
     }
 
     async fn ping(&self) -> Result<(), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
-        self.client.simple_query("SELECT 1").await.map_err(map_pg_err)?;
-        Ok(())
+        match tokio::time::timeout(PING_TIMEOUT, self.client.check_connection()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(self.map_session_err(err)),
+            Err(_) => {
+                self.disconnected.store(true, Ordering::Release);
+                Err(DbError::Disconnected)
+            }
+        }
     }
 
     async fn fetch_table_page(&self, req: &PageRequest) -> Result<(TablePage, Vec<ExecutedSql>), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let limit = req.limit.clamp(1, 5000);
         let offset = req.offset.max(0);
@@ -436,7 +522,11 @@ impl DbSession for PostgresSession {
 
         let sql = build_table_page_sql(&req.schema, &req.table, &columns, req, limit, offset);
         let start = Instant::now();
-        let pg_rows = self.client.query(&sql, &[]).await.map_err(map_pg_err)?;
+        let pg_rows = self
+            .client
+            .query(&sql, &[])
+            .await
+            .map_err(|e| self.map_session_err(e))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let mut logs = vec![ExecutedSql {
@@ -451,7 +541,9 @@ impl DbSession for PostgresSession {
         for row in pg_rows.into_iter().take(limit as usize) {
             let mut cells = Vec::with_capacity(columns.len());
             for (idx, col) in columns.iter().enumerate() {
-                let raw = row.try_get::<usize, Option<String>>(idx).map_err(map_pg_err)?;
+                let raw = row
+                    .try_get::<usize, Option<String>>(idx)
+                    .map_err(|e| self.map_session_err(e))?;
                 cells.push(CellValue::parse_from_pg_text(&col.udt_name, raw));
             }
             decoded_rows.push(cells);
@@ -504,6 +596,7 @@ impl DbSession for PostgresSession {
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<(TableStructure, Vec<ExecutedSql>), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let mut logs = Vec::new();
         let (columns, col_log) = self.fetch_column_metas(schema, table).await?;
@@ -535,7 +628,7 @@ impl DbSession for PostgresSession {
             .client
             .query(idx_sql, &[&schema, &table])
             .await
-            .map_err(map_pg_err)?;
+            .map_err(|e| self.map_session_err(e))?;
         logs.push(ExecutedSql {
             sql: format!(
                 "{idx_sql} -- $1 = '{}', $2 = '{}'",
@@ -575,7 +668,7 @@ impl DbSession for PostgresSession {
             .client
             .query_opt(stats_sql, &[&schema, &table])
             .await
-            .map_err(map_pg_err)?;
+            .map_err(|e| self.map_session_err(e))?;
         logs.push(ExecutedSql {
             sql: format!(
                 "{stats_sql} -- $1 = '{}', $2 = '{}'",
@@ -644,165 +737,72 @@ impl DbSession for PostgresSession {
         statements: &[String],
         row_limit: Option<usize>,
     ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
-        self.ensure_alive()?;
-        let batch_start = Instant::now();
-        let mut results = Vec::new();
-        let mut logs = Vec::new();
-        let mut cancelled = false;
+        self.execute_sql_inner(statements, row_limit, 0, None).await
+    }
 
-        for raw_stmt in statements {
-            let stmt = raw_stmt.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            let start = Instant::now();
-            let prepared_cols: Option<Vec<(String, String)>> = self
-                .client
-                .prepare(stmt)
-                .await
-                .ok()
-                .map(|s| {
-                    s.columns()
-                        .iter()
-                        .map(|c| (c.name().to_owned(), c.type_().name().to_owned()))
-                        .collect()
-                });
-
-            match self.client.simple_query(stmt).await {
-                Ok(messages) => {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let mut columns: Vec<ColumnMeta> = Vec::new();
-                    let mut rows: Vec<Vec<CellValue>> = Vec::new();
-                    let mut rows_affected: Option<u64> = None;
-                    let mut truncated = false;
-                    let mut total_rows_seen = 0usize;
-
-                    for msg in messages {
-                        match msg {
-                            SimpleQueryMessage::RowDescription(desc) => {
-                                columns = desc
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, col)| {
-                                        let udt_name = prepared_cols
-                                            .as_ref()
-                                            .and_then(|pc| pc.get(idx))
-                                            .filter(|(_, _)| prepared_cols.as_ref().is_some_and(|p| p.len() == desc.len()))
-                                            .map_or_else(|| "text".to_owned(), |(_, ty)| ty.clone());
-                                        ColumnMeta {
-                                            name: col.name().to_owned(),
-                                            data_type: human_pg_type(&udt_name).to_owned(),
-                                            udt_name,
-                                            nullable: true,
-                                            default_expr: None,
-                                            is_primary_key: false,
-                                            is_unique: false,
-                                            comment: None,
-                                            foreign_key: None,
-                                        }
-                                    })
-                                    .collect();
-                            }
-                            SimpleQueryMessage::Row(row) => {
-                                total_rows_seen += 1;
-                                if row_limit.is_none_or(|lim| rows.len() < lim) {
-                                    let mut decoded = Vec::with_capacity(columns.len());
-                                    for (idx, col) in columns.iter().enumerate() {
-                                        let val = row.get(idx).map(str::to_owned);
-                                        decoded.push(CellValue::parse_from_pg_text(&col.udt_name, val));
-                                    }
-                                    rows.push(decoded);
-                                } else {
-                                    truncated = true;
-                                }
-                            }
-                            SimpleQueryMessage::CommandComplete(affected) => {
-                                rows_affected = Some(affected);
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    logs.push(ExecutedSql {
-                        sql: stmt.to_owned(),
-                        duration_ms: elapsed_ms,
-                        error: None,
-                    });
-                    results.push(QueryStatementResult {
-                        sql: stmt.to_owned(),
-                        columns,
-                        rows,
-                        rows_affected,
-                        truncated,
-                        total_rows_seen,
-                        elapsed_ms,
-                        error: None,
-                    });
-                }
-                Err(pg_err) => {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let mapped = map_pg_err(pg_err);
-                    if matches!(mapped, DbError::Cancelled) {
-                        cancelled = true;
-                    }
-                    let err_msg = mapped.to_string();
-                    logs.push(ExecutedSql {
-                        sql: stmt.to_owned(),
-                        duration_ms: elapsed_ms,
-                        error: Some(err_msg.clone()),
-                    });
-                    results.push(QueryStatementResult {
-                        sql: stmt.to_owned(),
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                        rows_affected: None,
-                        truncated: false,
-                        total_rows_seen: 0,
-                        elapsed_ms,
-                        error: Some(err_msg),
-                    });
-                    break;
-                }
-            }
-        }
-
-        Ok((
-            QueryBatchResult {
-                results,
-                total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
-                cancelled,
-            },
-            logs,
-        ))
+    async fn execute_sql_cancellable(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: u64,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        self.execute_sql_inner(statements, row_limit, cancel_key, cancel_flag).await
     }
 
     async fn cancel_running_query(&self) -> Result<(), DbError> {
-        self.ensure_alive()?;
-        let token = self.client.cancel_token();
-        if !self.use_tls_for_cancel {
-            token.cancel_query(NoTls).await.map_err(map_pg_err)?;
-            return Ok(());
-        }
-        let tls_cfg = build_rustls_config(&self.ssl)?;
-        let connector = MakeRustlsConnect::new(tls_cfg);
-        match token.cancel_query(connector).await {
-            Ok(()) => Ok(()),
-            Err(err) if self.ssl.mode == SslMode::Prefer && err.as_db_error().is_none() => {
-                token.cancel_query(NoTls).await.map_err(map_pg_err)
+        {
+            let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+            if state.cancel_requested {
+                return Ok(());
             }
-            Err(err) => Err(map_pg_err(err)),
+            if self.is_disconnected() {
+                return Err(DbError::Disconnected);
+            }
+            state.cancel_requested = true;
+            state.in_flight_cancels += 1;
+            self.cancel_in_flight_tx.send_replace(state.in_flight_cancels);
         }
+        let _in_flight = InFlightCancelGuard {
+            state: &self.cancel_state,
+            tx: &self.cancel_in_flight_tx,
+        };
+        self.send_cancel_request().await
+    }
+
+    async fn cancel_query_by_key(&self, cancel_key: u64) -> Result<(), DbError> {
+        {
+            let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+            if state.active_key != cancel_key {
+                return Ok(());
+            }
+            if state.cancel_requested {
+                return Ok(());
+            }
+            if self.is_disconnected() {
+                return Err(DbError::Disconnected);
+            }
+            state.cancel_requested = true;
+            state.in_flight_cancels += 1;
+            self.cancel_in_flight_tx.send_replace(state.in_flight_cancels);
+        }
+        let _in_flight = InFlightCancelGuard {
+            state: &self.cancel_state,
+            tx: &self.cancel_in_flight_tx,
+        };
+        self.send_cancel_request().await
     }
 
     async fn execute_transaction(
         &self,
         statements: &[String],
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
-        self.ensure_alive()?;
         if statements.is_empty() {
             return Err(DbError::InvalidInput("no SQL statements to execute in transaction".to_owned()));
         }
-        let _tx_guard = self.tx_lock.lock().await;
+        let _guard = self.client_lock.lock().await;
+        self.ensure_alive()
+            .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
         let total_start = Instant::now();
         let mut logs = Vec::with_capacity(statements.len() + 2);
         let mut total_rows_affected = 0u64;
@@ -810,7 +810,7 @@ impl DbSession for PostgresSession {
 
         let begin_start = Instant::now();
         if let Err(pg_err) = self.client.simple_query("BEGIN").await {
-            let mapped = map_pg_err(pg_err);
+            let mapped = self.map_session_err(pg_err);
             logs.push(ExecutedSql {
                 sql: "BEGIN;".to_owned(),
                 duration_ms: begin_start.elapsed().as_millis() as u64,
@@ -845,7 +845,7 @@ impl DbSession for PostgresSession {
                     });
                 }
                 Err(pg_err) => {
-                    let mapped = map_pg_err(pg_err);
+                    let mapped = self.map_session_err(pg_err);
                     drop(self.client.simple_query("ROLLBACK").await);
                     return Err(mapped);
                 }
@@ -870,7 +870,7 @@ impl DbSession for PostgresSession {
                 ))
             }
             Err(pg_err) => {
-                let mapped = map_pg_err(pg_err);
+                let mapped = self.map_session_err(pg_err);
                 drop(self.client.simple_query("ROLLBACK").await);
                 Err(mapped)
             }
@@ -878,7 +878,9 @@ impl DbSession for PostgresSession {
     }
 
     async fn explain_sql(&self, statement: &str, analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError> {
-        self.ensure_alive()?;
+        let _guard = self.client_lock.lock().await;
+        self.ensure_alive()
+            .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
         let trimmed = statement.trim();
         if trimmed.is_empty() {
             return Err(DbError::InvalidInput("cannot explain an empty SQL statement".to_owned()));
@@ -887,7 +889,7 @@ impl DbSession for PostgresSession {
         let start = Instant::now();
         let messages = match self.client.simple_query(&explain_query).await {
             Ok(msgs) => msgs,
-            Err(err) => return Err(map_pg_err(err)),
+            Err(err) => return Err(self.map_session_err(err)),
         };
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -919,6 +921,7 @@ impl DbSession for PostgresSession {
         value: &CellValue,
         source_col: &ColumnMeta,
     ) -> Result<(FkPeekRow, ExecutedSql), DbError> {
+        let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let Some(where_clause) = build_fk_where_clause(&fk.target_column, value, source_col) else {
             return Err(DbError::InvalidInput("cannot peek NULL foreign-key value".to_owned()));
@@ -944,13 +947,19 @@ impl DbSession for PostgresSession {
         };
         let sql = build_table_page_sql(&fk.target_schema, &fk.target_table, &target_columns, &req, 1, 0);
         let start = Instant::now();
-        let pg_rows = self.client.query(&sql, &[]).await.map_err(map_pg_err)?;
+        let pg_rows = self
+            .client
+            .query(&sql, &[])
+            .await
+            .map_err(|e| self.map_session_err(e))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let row = if let Some(first) = pg_rows.into_iter().next() {
             let mut cells = Vec::with_capacity(target_columns.len());
             for (idx, col) in target_columns.iter().enumerate() {
-                let raw = first.try_get::<usize, Option<String>>(idx).map_err(map_pg_err)?;
+                let raw = first
+                    .try_get::<usize, Option<String>>(idx)
+                    .map_err(|e| self.map_session_err(e))?;
                 cells.push(CellValue::parse_from_pg_text(&col.udt_name, raw));
             }
             Some(cells)
@@ -972,6 +981,244 @@ impl DbSession for PostgresSession {
                 error: None,
             },
         ))
+    }
+}
+
+fn should_retire_after_cancel(cancel_requested: bool, server_observed_cancel: bool) -> bool {
+    cancel_requested && !server_observed_cancel
+}
+
+impl PostgresSession {
+    fn retire_connection(&self) {
+        self.disconnected.store(true, Ordering::Release);
+        if let Ok(mut guard) = self.conn_task.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
+        }
+    }
+
+    async fn send_cancel_request(&self) -> Result<(), DbError> {
+        let token = self.client.cancel_token();
+        if !self.use_tls_for_cancel {
+            match tokio::time::timeout(PING_TIMEOUT, token.cancel_query(NoTls)).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(err)) => return Err(map_pg_err(err)),
+                Err(_) => return Err(DbError::ConnectionFailed("cancel request timed out".to_owned())),
+            }
+        }
+        let tls_cfg = build_rustls_config(&self.ssl)?;
+        let connector = MakeRustlsConnect::new(tls_cfg);
+        match tokio::time::timeout(PING_TIMEOUT, token.cancel_query(connector)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) if self.ssl.mode == SslMode::Prefer && err.as_db_error().is_none() => {
+                match tokio::time::timeout(PING_TIMEOUT, token.cancel_query(NoTls)).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(map_pg_err(err)),
+                    Err(_) => Err(DbError::ConnectionFailed("cancel request timed out".to_owned())),
+                }
+            }
+            Ok(Err(err)) => Err(map_pg_err(err)),
+            Err(_) => Err(DbError::ConnectionFailed("cancel request timed out".to_owned())),
+        }
+    }
+
+    async fn execute_sql_inner(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: u64,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
+        if is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        let _guard = self.client_lock.lock().await;
+        if is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        self.ensure_alive()
+            .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
+        {
+            let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+            state.active_key = cancel_key;
+            state.cancel_requested = false;
+        }
+        let active_guard = ActiveCancelKeyGuard(&self.cancel_state);
+        let mut server_observed_cancel = false;
+
+        let outcome: Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> = async {
+            if is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
+
+            let batch_start = Instant::now();
+            let mut results = Vec::new();
+            let mut logs = Vec::new();
+            let mut cancelled = false;
+
+            for raw_stmt in statements {
+                let stmt = raw_stmt.trim();
+                if stmt.is_empty() {
+                    continue;
+                }
+                if is_cancelled() {
+                    if results.is_empty() {
+                        return Err(DbError::Cancelled);
+                    }
+                    cancelled = true;
+                    break;
+                }
+                let start = Instant::now();
+                let prepared_cols: Option<Vec<(String, String)>> = self
+                    .client
+                    .prepare(stmt)
+                    .await
+                    .ok()
+                    .map(|s| {
+                        s.columns()
+                            .iter()
+                            .map(|c| (c.name().to_owned(), c.type_().name().to_owned()))
+                            .collect()
+                    });
+                if is_cancelled() {
+                    if results.is_empty() {
+                        return Err(DbError::Cancelled);
+                    }
+                    cancelled = true;
+                    break;
+                }
+
+                match self.client.simple_query(stmt).await {
+                    Ok(messages) => {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let mut columns: Vec<ColumnMeta> = Vec::new();
+                        let mut rows: Vec<Vec<CellValue>> = Vec::new();
+                        let mut rows_affected: Option<u64> = None;
+                        let mut truncated = false;
+                        let mut total_rows_seen = 0usize;
+
+                        for msg in messages {
+                            match msg {
+                                SimpleQueryMessage::RowDescription(desc) => {
+                                    columns = desc
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(idx, col)| {
+                                            let udt_name = prepared_cols
+                                                .as_ref()
+                                                .and_then(|pc| pc.get(idx))
+                                                .filter(|(_, _)| prepared_cols.as_ref().is_some_and(|p| p.len() == desc.len()))
+                                                .map_or_else(|| "text".to_owned(), |(_, ty)| ty.clone());
+                                            ColumnMeta {
+                                                name: col.name().to_owned(),
+                                                data_type: human_pg_type(&udt_name).to_owned(),
+                                                udt_name,
+                                                nullable: true,
+                                                default_expr: None,
+                                                is_primary_key: false,
+                                                is_unique: false,
+                                                comment: None,
+                                                foreign_key: None,
+                                            }
+                                        })
+                                        .collect();
+                                }
+                                SimpleQueryMessage::Row(row) => {
+                                    total_rows_seen += 1;
+                                    if row_limit.is_none_or(|lim| rows.len() < lim) {
+                                        let mut decoded = Vec::with_capacity(columns.len());
+                                        for (idx, col) in columns.iter().enumerate() {
+                                            let val = row.get(idx).map(str::to_owned);
+                                            decoded.push(CellValue::parse_from_pg_text(&col.udt_name, val));
+                                        }
+                                        rows.push(decoded);
+                                    } else {
+                                        truncated = true;
+                                    }
+                                }
+                                SimpleQueryMessage::CommandComplete(affected) => {
+                                    rows_affected = Some(affected);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        logs.push(ExecutedSql {
+                            sql: stmt.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: None,
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt.to_owned(),
+                            columns,
+                            rows,
+                            rows_affected,
+                            truncated,
+                            total_rows_seen,
+                            elapsed_ms,
+                            error: None,
+                        });
+                    }
+                    Err(pg_err) => {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let mapped = self.map_session_err(pg_err);
+                        if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                            return Err(DbError::Disconnected);
+                        }
+                        if matches!(mapped, DbError::Cancelled) {
+                            server_observed_cancel = true;
+                            cancelled = true;
+                        }
+                        let err_msg = mapped.to_string();
+                        logs.push(ExecutedSql {
+                            sql: stmt.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: Some(err_msg.clone()),
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt.to_owned(),
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            rows_affected: None,
+                            truncated: false,
+                            total_rows_seen: 0,
+                            elapsed_ms,
+                            error: Some(err_msg),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            Ok((
+                QueryBatchResult {
+                    results,
+                    total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                    cancelled,
+                },
+                logs,
+            ))
+        }
+        .await;
+
+        let had_cancel = if let Ok(mut state) = self.cancel_state.lock() {
+            state.active_key = 0;
+            state.cancel_requested
+        } else {
+            false
+        };
+        drop(active_guard);
+
+        let mut rx = self.cancel_in_flight_tx.subscribe();
+        drop(rx.wait_for(|&n| n == 0).await);
+
+        if should_retire_after_cancel(had_cancel, server_observed_cancel) {
+            self.retire_connection();
+        }
+
+        outcome
     }
 }
 
@@ -1110,6 +1357,10 @@ async fn connect_raw(
     cfg.host(host);
     if !host.starts_with('/') {
         cfg.port(profile.port);
+        cfg.keepalives(true);
+        cfg.keepalives_idle(Duration::from_secs(60));
+        cfg.keepalives_interval(Duration::from_secs(10));
+        cfg.keepalives_retries(3);
     }
     cfg.user(profile.user.trim());
     if profile.password_mode != PasswordMode::None
@@ -1381,6 +1632,10 @@ fn is_insufficient_privilege(err: &tokio_postgres::Error) -> bool {
         .is_some_and(|db| db.code().code() == "42501")
 }
 
+fn is_pg_disconnect_sqlstate(code: &str) -> bool {
+    matches!(code, "57P01" | "57P02" | "57P03") || code.starts_with("08")
+}
+
 fn map_pg_err(err: tokio_postgres::Error) -> DbError {
     if let Some(db) = err.as_db_error() {
         let code = db.code().code().to_owned();
@@ -1416,7 +1671,7 @@ pub fn concise_pg_version(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::concise_pg_version;
+    use super::{concise_pg_version, is_pg_disconnect_sqlstate, should_retire_after_cancel};
 
     #[test]
     fn parses_concise_postgresql_version() {
@@ -1425,5 +1680,23 @@ mod tests {
             "PostgreSQL 18.4"
         );
         assert_eq!(concise_pg_version("PostgreSQL 14.8 on x86_64-pc-linux-gnu"), "PostgreSQL 14.8");
+    }
+
+    #[test]
+    fn classifies_pg_disconnect_sqlstates() {
+        for code in ["57P01", "57P02", "57P03", "08006", "08000"] {
+            assert!(is_pg_disconnect_sqlstate(code), "{code} should indicate disconnect");
+        }
+        for code in ["42601", "28P01", "57014", "23505"] {
+            assert!(!is_pg_disconnect_sqlstate(code), "{code} should not indicate disconnect");
+        }
+    }
+
+    #[test]
+    fn retires_postgres_connection_only_when_cancel_not_confirmed_consumed() {
+        assert!(should_retire_after_cancel(true, false));
+        assert!(!should_retire_after_cancel(true, true));
+        assert!(!should_retire_after_cancel(false, false));
+        assert!(!should_retire_after_cancel(false, true));
     }
 }

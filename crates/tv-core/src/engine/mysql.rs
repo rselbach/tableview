@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -9,8 +9,7 @@ use chrono::{DateTime, Utc};
 use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
 use mysql_async::{
-    ClientIdentity, Column, DriverError, Error as MysqlError, IoError, Opts, OptsBuilder, Pool, PoolConstraints,
-    PoolOpts, Row, SslOpts, Value,
+    ClientIdentity, Column, DriverError, Error as MysqlError, IoError, Opts, OptsBuilder, Row, SslOpts, Value,
 };
 use uuid::Uuid;
 
@@ -25,6 +24,8 @@ use crate::staging::build_fk_where_clause_for_engine;
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
+const MYSQL_POOL_MAX: usize = 4;
 
 fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.get_or_init(|| {
@@ -32,19 +33,152 @@ fn ensure_crypto_provider() {
     });
 }
 
+struct ActiveMysqlQuery {
+    conn_id: u64,
+    cancel_requested: Arc<AtomicBool>,
+}
+
+struct PooledMysqlConn {
+    inner: Option<(mysql_async::Conn, tokio::sync::OwnedSemaphorePermit)>,
+    idle_conns: Arc<std::sync::Mutex<VecDeque<mysql_async::Conn>>>,
+}
+
+impl PooledMysqlConn {
+    fn conn_mut(&mut self) -> Result<&mut mysql_async::Conn, DbError> {
+        self.inner
+            .as_mut()
+            .map(|(conn, _)| conn)
+            .ok_or(DbError::Disconnected)
+    }
+
+    fn return_clean(mut self) {
+        let Some((conn, permit)) = self.inner.take() else {
+            return;
+        };
+        let mut excess = None;
+        if let Ok(mut q) = self.idle_conns.lock() {
+            if q.len() < MYSQL_POOL_MAX {
+                q.push_back(conn);
+            } else {
+                excess = Some(conn);
+            }
+        } else {
+            excess = Some(conn);
+        }
+        if let Some(conn) = excess
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+                drop(permit);
+            });
+            return;
+        }
+        drop(permit);
+    }
+
+    fn discard(mut self) {
+        let Some((conn, permit)) = self.inner.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+                drop(permit);
+            });
+        }
+    }
+}
+
+impl Drop for PooledMysqlConn {
+    fn drop(&mut self) {
+        let Some((mut conn, permit)) = self.inner.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let idle_conns = Arc::clone(&self.idle_conns);
+            handle.spawn(async move {
+                let reset_ok = matches!(
+                    tokio::time::timeout(PING_TIMEOUT, conn.reset()).await,
+                    Ok(Ok(true))
+                );
+                if reset_ok {
+                    let mut excess = None;
+                    if let Ok(mut q) = idle_conns.lock() {
+                        if q.len() < MYSQL_POOL_MAX {
+                            q.push_back(conn);
+                        } else {
+                            excess = Some(conn);
+                        }
+                    } else {
+                        excess = Some(conn);
+                    }
+                    if let Some(conn) = excess {
+                        drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+                    }
+                    drop(permit);
+                    return;
+                }
+                drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+                drop(permit);
+            });
+        }
+    }
+}
+
+async fn acquire_pool_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, DbError> {
+    match tokio::time::timeout(timeout, Arc::clone(slots).acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(DbError::Disconnected),
+        Err(_) => Err(DbError::ConnectionFailed(
+            "all pooled connections are busy; wait for a running query to finish and retry".to_owned(),
+        )),
+    }
+}
+
 /// Active MySQL / MariaDB database session backed by `mysql_async`.
 pub struct MysqlSession {
-    pool: Pool,
+    opts: Opts,
     server_info: ServerInfo,
-    active_conn_id: Arc<AtomicU64>,
+    active_conn_ids: Arc<std::sync::Mutex<HashMap<u64, ActiveMysqlQuery>>>,
+    idle_conns: Arc<std::sync::Mutex<VecDeque<mysql_async::Conn>>>,
+    pool_slots: Arc<tokio::sync::Semaphore>,
+    disconnected: AtomicBool,
     tx_lock: tokio::sync::Mutex<()>,
 }
 
-struct ActiveConnGuard<'a>(&'a AtomicU64);
-
-impl Drop for ActiveConnGuard<'_> {
+impl Drop for MysqlSession {
     fn drop(&mut self) {
-        self.0.store(0, Ordering::Release);
+        let Ok(mut q) = self.idle_conns.lock() else {
+            return;
+        };
+        let conns: Vec<_> = q.drain(..).collect();
+        drop(q);
+        if !conns.is_empty()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                for conn in conns {
+                    drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+                }
+            });
+        }
+    }
+}
+
+struct ActiveConnMapGuard<'a> {
+    map: &'a std::sync::Mutex<HashMap<u64, ActiveMysqlQuery>>,
+    cancel_key: u64,
+}
+
+impl Drop for ActiveConnMapGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.map.lock() {
+            guard.remove(&self.cancel_key);
+        }
     }
 }
 
@@ -64,16 +198,22 @@ impl MysqlSession {
             .filter(|s| !s.is_empty())
             .or_else(|| profile.database.as_deref().map(str::trim).filter(|s| !s.is_empty()));
 
-        let (pool, mut conn) = connect_pool_with_fallback(profile, password, target_db).await?;
+        let (mut conn, opts) = connect_conn_with_fallback(profile, password, target_db).await?;
 
         let info_sql = "SELECT VERSION(), COALESCE(DATABASE(), ''), CURRENT_USER()";
         let start = Instant::now();
-        let row: Option<Row> = conn.query_first(info_sql).await.map_err(map_mysql_err)?;
+        let row: Option<Row> = match conn.query_first(info_sql).await {
+            Ok(row) => row,
+            Err(err) => {
+                let mapped = map_mysql_err(err);
+                drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+                return Err(mapped);
+            }
+        };
         let duration_ms = start.elapsed().as_millis() as u64;
-        drop(conn);
 
         let Some(row) = row else {
-            drop(pool.disconnect().await);
+            drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
             return Err(DbError::ConnectionFailed(
                 "MySQL server returned no rows for version query".to_owned(),
             ));
@@ -96,9 +236,12 @@ impl MysqlSession {
 
         Ok((
             Self {
-                pool,
+                opts,
                 server_info,
-                active_conn_id: Arc::new(AtomicU64::new(0)),
+                active_conn_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                idle_conns: Arc::new(std::sync::Mutex::new(VecDeque::from([conn]))),
+                pool_slots: Arc::new(tokio::sync::Semaphore::new(MYSQL_POOL_MAX)),
+                disconnected: AtomicBool::new(false),
                 tx_lock: tokio::sync::Mutex::new(()),
             },
             vec![log],
@@ -112,41 +255,160 @@ impl MysqlSession {
     ) -> Result<ServerInfo, DbError> {
         let (session, _) = Self::connect(profile, password, None).await?;
         let info = session.server_info().clone();
-        drop(session.pool.disconnect().await);
+        let conns: Vec<_> = session
+            .idle_conns
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        for conn in conns {
+            drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+        }
         Ok(info)
     }
 
-    async fn get_conn(&self) -> Result<mysql_async::Conn, DbError> {
-        match tokio::time::timeout(CONNECT_TIMEOUT, self.pool.get_conn()).await {
-            Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(err)) => Err(map_mysql_err(err)),
-            Err(_) => Err(DbError::ConnectionFailed("connection timed out".to_owned())),
+    fn ensure_alive(&self) -> Result<(), DbError> {
+        if self.is_disconnected() {
+            return Err(DbError::Disconnected);
+        }
+        Ok(())
+    }
+
+    fn map_session_err(&self, err: MysqlError) -> DbError {
+        let mapped = map_mysql_session_err(err);
+        if matches!(mapped, DbError::Disconnected) {
+            self.disconnected.store(true, Ordering::Release);
+        }
+        mapped
+    }
+
+    fn map_checkout_err(&self, err: MysqlError) -> DbError {
+        let mapped = map_mysql_session_err(err);
+        if matches!(
+            mapped,
+            DbError::Disconnected | DbError::AuthFailed(_) | DbError::ConnectionFailed(_) | DbError::TlsConfig(_)
+        ) {
+            self.disconnected.store(true, Ordering::Release);
+        }
+        mapped
+    }
+
+    async fn get_conn(&self) -> Result<PooledMysqlConn, DbError> {
+        self.ensure_alive()?;
+        let permit = acquire_pool_slot(&self.pool_slots, CONNECT_TIMEOUT).await?;
+        if let Some(conn) = self.idle_conns.lock().ok().and_then(|mut q| q.pop_back()) {
+            return Ok(PooledMysqlConn {
+                inner: Some((conn, permit)),
+                idle_conns: Arc::clone(&self.idle_conns),
+            });
+        }
+        match tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(self.opts.clone())).await {
+            Ok(Ok(conn)) => Ok(PooledMysqlConn {
+                inner: Some((conn, permit)),
+                idle_conns: Arc::clone(&self.idle_conns),
+            }),
+            Ok(Err(err)) => Err(self.map_checkout_err(err)),
+            Err(_) => {
+                self.disconnected.store(true, Ordering::Release);
+                Err(DbError::ConnectionFailed("connection timed out".to_owned()))
+            }
         }
     }
 
+    async fn get_checked_conn(
+        &self,
+        retry_once_on_timeout: bool,
+        wrap_pre_dispatch: bool,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<PooledMysqlConn, DbError> {
+        let wrap_err = |err: DbError| -> DbError {
+            if wrap_pre_dispatch {
+                DbError::DisconnectedBeforeDispatch(Box::new(err))
+            } else {
+                err
+            }
+        };
+        let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
+
+        if is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        if let Err(err) = self.ensure_alive() {
+            return Err(wrap_err(err));
+        }
+
+        let mut timed_out_once = false;
+        for _ in 0..=MYSQL_POOL_MAX {
+            if is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
+            let mut lease = match self.get_conn().await {
+                Ok(c) => c,
+                Err(err) => {
+                    return if self.is_disconnected() {
+                        Err(wrap_err(err))
+                    } else {
+                        Err(err)
+                    };
+                }
+            };
+            let ping_res = {
+                let conn = lease.conn_mut()?;
+                tokio::time::timeout(PING_TIMEOUT, conn.ping()).await
+            };
+            match ping_res {
+                Ok(Ok(())) => {
+                    if is_cancelled() {
+                        lease.return_clean();
+                        return Err(DbError::Cancelled);
+                    }
+                    return Ok(lease);
+                }
+                Ok(Err(err)) => {
+                    lease.discard();
+                    let mapped = map_mysql_session_err(err);
+                    if !matches!(mapped, DbError::Disconnected) {
+                        return Err(mapped);
+                    }
+                }
+                Err(_) => {
+                    lease.discard();
+                    if retry_once_on_timeout && !timed_out_once {
+                        timed_out_once = true;
+                        continue;
+                    }
+                    self.disconnected.store(true, Ordering::Release);
+                    return Err(wrap_err(DbError::Disconnected));
+                }
+            }
+        }
+        self.disconnected.store(true, Ordering::Release);
+        Err(wrap_err(DbError::Disconnected))
+    }
+
     async fn fetch_column_metas(&self, schema: &str, table: &str) -> Result<(Vec<ColumnMeta>, ExecutedSql), DbError> {
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let col_sql = "SELECT COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, \
                        COLUMN_KEY, COLUMN_COMMENT, EXTRA \
                        FROM information_schema.COLUMNS \
                        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                        ORDER BY ORDINAL_POSITION ASC";
         let start = Instant::now();
-        let col_rows: Vec<Row> = conn.exec(col_sql, (schema, table)).await.map_err(map_mysql_err)?;
+        let col_rows: Vec<Row> = conn.exec(col_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
 
         let fk_sql = "SELECT COLUMN_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, \
                       REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
                       FROM information_schema.KEY_COLUMN_USAGE \
                       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
                       ORDER BY CONSTRAINT_NAME ASC, ORDINAL_POSITION ASC";
-        let fk_rows: Vec<Row> = conn.exec(fk_sql, (schema, table)).await.map_err(map_mysql_err)?;
+        let fk_rows: Vec<Row> = conn.exec(fk_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
 
         let stats_sql = "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX \
                          FROM information_schema.STATISTICS \
                          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                          ORDER BY INDEX_NAME ASC, SEQ_IN_INDEX ASC";
-        let stat_rows: Vec<Row> = conn.exec(stats_sql, (schema, table)).await.map_err(map_mysql_err)?;
-        drop(conn);
+        let stat_rows: Vec<Row> = conn.exec(stats_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
+        drop(lease);
 
         let mut fks: HashMap<String, ForeignKeyRef> = HashMap::new();
         for row in fk_rows {
@@ -247,8 +509,13 @@ impl DbSession for MysqlSession {
         &self.server_info
     }
 
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
     async fn list_databases(&self) -> Result<(Vec<DatabaseInfo>, ExecutedSql), DbError> {
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let sql = "SELECT s.SCHEMA_NAME, CAST(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) AS SIGNED) \
                    FROM information_schema.SCHEMATA s \
                    LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME \
@@ -276,7 +543,7 @@ impl DbSession for MysqlSession {
             }
             Err(err) if is_mysql_permission_error(&err) => {
                 let fallback_sql = "SHOW DATABASES";
-                let rows: Vec<Row> = conn.query(fallback_sql).await.map_err(map_mysql_err)?;
+                let rows: Vec<Row> = conn.query(fallback_sql).await.map_err(|e| self.map_session_err(e))?;
                 let mut dbs: Vec<DatabaseInfo> = rows
                     .into_iter()
                     .map(|row| DatabaseInfo {
@@ -295,7 +562,7 @@ impl DbSession for MysqlSession {
                     },
                 ))
             }
-            Err(err) => Err(map_mysql_err(err)),
+            Err(err) => Err(self.map_session_err(err)),
         }
     }
 
@@ -315,12 +582,13 @@ impl DbSession for MysqlSession {
             ));
         }
 
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let sql = "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
                    ORDER BY (SCHEMA_NAME IN ('information_schema', 'mysql', 'performance_schema', 'sys')) ASC, \
                             SCHEMA_NAME ASC";
         let start = Instant::now();
-        let rows: Vec<Row> = conn.query(sql).await.map_err(map_mysql_err)?;
+        let rows: Vec<Row> = conn.query(sql).await.map_err(|e| self.map_session_err(e))?;
         let schemas = rows
             .into_iter()
             .map(|row| {
@@ -340,13 +608,14 @@ impl DbSession for MysqlSession {
     }
 
     async fn list_objects(&self, schema: &str) -> Result<(Vec<DbObject>, ExecutedSql), DbError> {
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let sql = "SELECT TABLE_NAME, TABLE_TYPE, TABLE_ROWS, (DATA_LENGTH + INDEX_LENGTH) \
                    FROM information_schema.TABLES \
                    WHERE TABLE_SCHEMA = ? \
                    ORDER BY TABLE_NAME ASC";
         let start = Instant::now();
-        let rows: Vec<Row> = conn.exec(sql, (schema,)).await.map_err(map_mysql_err)?;
+        let rows: Vec<Row> = conn.exec(sql, (schema,)).await.map_err(|e| self.map_session_err(e))?;
         let objects = rows
             .into_iter()
             .filter_map(|row| {
@@ -377,13 +646,14 @@ impl DbSession for MysqlSession {
     }
 
     async fn list_columns(&self, schema: &str, object: &str) -> Result<(Vec<ColumnSummary>, ExecutedSql), DbError> {
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let sql = "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY \
                    FROM information_schema.COLUMNS \
                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                    ORDER BY ORDINAL_POSITION ASC";
         let start = Instant::now();
-        let rows: Vec<Row> = conn.exec(sql, (schema, object)).await.map_err(map_mysql_err)?;
+        let rows: Vec<Row> = conn.exec(sql, (schema, object)).await.map_err(|e| self.map_session_err(e))?;
         let cols = rows
             .into_iter()
             .map(|row| ColumnSummary {
@@ -438,9 +708,10 @@ impl DbSession for MysqlSession {
         }
 
         let sql = build_mysql_page_sql(&req.schema, &req.table, &columns, req, limit + 1, offset);
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let start = Instant::now();
-        let mysql_rows: Vec<Row> = conn.query(&sql).await.map_err(map_mysql_err)?;
+        let mysql_rows: Vec<Row> = conn.query(&sql).await.map_err(|e| self.map_session_err(e))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let mut logs = vec![ExecutedSql {
@@ -517,14 +788,15 @@ impl DbSession for MysqlSession {
         let (columns, col_log) = self.fetch_column_metas(schema, table).await?;
         logs.push(col_log);
 
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
 
         let idx_sql = "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, INDEX_TYPE, SEQ_IN_INDEX \
                        FROM information_schema.STATISTICS \
                        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                        ORDER BY (INDEX_NAME = 'PRIMARY') DESC, NON_UNIQUE ASC, INDEX_NAME ASC, SEQ_IN_INDEX ASC";
         let idx_start = Instant::now();
-        let idx_rows: Vec<Row> = conn.exec(idx_sql, (schema, table)).await.map_err(map_mysql_err)?;
+        let idx_rows: Vec<Row> = conn.exec(idx_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
         logs.push(ExecutedSql {
             sql: format!(
                 "{idx_sql} -- ? = '{}', ? = '{}'",
@@ -588,7 +860,7 @@ impl DbSession for MysqlSession {
                          FROM information_schema.TABLES \
                          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
         let stats_start = Instant::now();
-        let stats_row: Option<Row> = conn.exec_first(stats_sql, (schema, table)).await.map_err(map_mysql_err)?;
+        let stats_row: Option<Row> = conn.exec_first(stats_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
         logs.push(ExecutedSql {
             sql: format!(
                 "{stats_sql} -- ? = '{}', ? = '{}'",
@@ -686,145 +958,17 @@ impl DbSession for MysqlSession {
         statements: &[String],
         row_limit: Option<usize>,
     ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
-        let mut conn = self.get_conn().await?;
-        let conn_id = u64::from(conn.id());
-        self.active_conn_id.store(conn_id, Ordering::Release);
-        let _guard = ActiveConnGuard(&self.active_conn_id);
+        self.execute_sql_inner(statements, row_limit, 0, None).await
+    }
 
-        let batch_start = Instant::now();
-        let mut results = Vec::new();
-        let mut logs = Vec::new();
-        let mut cancelled = false;
-
-        for raw_stmt in statements {
-            let stmt = raw_stmt.trim();
-            if stmt.is_empty() {
-                continue;
-            }
-            let start = Instant::now();
-
-            match conn.query_iter(stmt).await {
-                Ok(mut result) => {
-                    let wire_cols = result.columns().unwrap_or_else(|| Arc::from([]));
-                    let columns: Vec<ColumnMeta> = wire_cols.iter().map(column_meta_from_wire_column).collect();
-                    let mut rows: Vec<Vec<CellValue>> = Vec::new();
-                    let mut truncated = false;
-                    let mut total_rows_seen = 0usize;
-                    let mut stream_err: Option<MysqlError> = None;
-
-                    loop {
-                        match result.next().await {
-                            Ok(Some(row)) => {
-                                total_rows_seen += 1;
-                                if row_limit.is_none_or(|lim| rows.len() < lim) {
-                                    let mut decoded = Vec::with_capacity(wire_cols.len());
-                                    for (idx, wire_col) in wire_cols.iter().enumerate() {
-                                        let val = row.as_ref(idx).unwrap_or(&Value::NULL);
-                                        decoded.push(decode_mysql_cell(val, Some(wire_col), None));
-                                    }
-                                    rows.push(decoded);
-                                } else {
-                                    truncated = true;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(err) => {
-                                stream_err = Some(err);
-                                break;
-                            }
-                        }
-                    }
-
-                    if stream_err.is_none() {
-                        if let Err(err) = result.drop_result().await {
-                            stream_err = Some(err);
-                        }
-                    } else {
-                        drop(result);
-                    }
-
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    if let Some(err) = stream_err {
-                        let mapped = map_mysql_err(err);
-                        if matches!(mapped, DbError::Cancelled) {
-                            cancelled = true;
-                        }
-                        let err_msg = mapped.to_string();
-                        logs.push(ExecutedSql {
-                            sql: stmt.to_owned(),
-                            duration_ms: elapsed_ms,
-                            error: Some(err_msg.clone()),
-                        });
-                        results.push(QueryStatementResult {
-                            sql: stmt.to_owned(),
-                            columns: Vec::new(),
-                            rows: Vec::new(),
-                            rows_affected: None,
-                            truncated: false,
-                            total_rows_seen: 0,
-                            elapsed_ms,
-                            error: Some(err_msg),
-                        });
-                        break;
-                    }
-
-                    let rows_affected = if columns.is_empty() {
-                        Some(conn.affected_rows())
-                    } else {
-                        None
-                    };
-
-                    logs.push(ExecutedSql {
-                        sql: stmt.to_owned(),
-                        duration_ms: elapsed_ms,
-                        error: None,
-                    });
-                    results.push(QueryStatementResult {
-                        sql: stmt.to_owned(),
-                        columns,
-                        rows,
-                        rows_affected,
-                        truncated,
-                        total_rows_seen,
-                        elapsed_ms,
-                        error: None,
-                    });
-                }
-                Err(mysql_err) => {
-                    let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let mapped = map_mysql_err(mysql_err);
-                    if matches!(mapped, DbError::Cancelled) {
-                        cancelled = true;
-                    }
-                    let err_msg = mapped.to_string();
-                    logs.push(ExecutedSql {
-                        sql: stmt.to_owned(),
-                        duration_ms: elapsed_ms,
-                        error: Some(err_msg.clone()),
-                    });
-                    results.push(QueryStatementResult {
-                        sql: stmt.to_owned(),
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                        rows_affected: None,
-                        truncated: false,
-                        total_rows_seen: 0,
-                        elapsed_ms,
-                        error: Some(err_msg),
-                    });
-                    break;
-                }
-            }
-        }
-
-        Ok((
-            QueryBatchResult {
-                results,
-                total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
-                cancelled,
-            },
-            logs,
-        ))
+    async fn execute_sql_cancellable(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: u64,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        self.execute_sql_inner(statements, row_limit, cancel_key, cancel_flag).await
     }
 
     async fn execute_transaction(
@@ -838,7 +982,8 @@ impl DbSession for MysqlSession {
         }
 
         let _tx_guard = self.tx_lock.lock().await;
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_checked_conn(true, true, None).await?;
+        let conn = lease.conn_mut()?;
         let total_start = Instant::now();
         let mut logs = Vec::with_capacity(statements.len() + 2);
         let mut total_rows_affected = 0u64;
@@ -846,7 +991,7 @@ impl DbSession for MysqlSession {
 
         let begin_start = Instant::now();
         if let Err(err) = conn.query_drop("START TRANSACTION").await {
-            let mapped = map_mysql_err(err);
+            let mapped = self.map_session_err(err);
             logs.push(ExecutedSql {
                 sql: "START TRANSACTION;".to_owned(),
                 duration_ms: begin_start.elapsed().as_millis() as u64,
@@ -877,7 +1022,7 @@ impl DbSession for MysqlSession {
                     });
                 }
                 Err(err) => {
-                    let mapped = map_mysql_err(err);
+                    let mapped = self.map_session_err(err);
                     drop(conn.query_drop("ROLLBACK").await);
                     return Err(mapped);
                 }
@@ -902,7 +1047,7 @@ impl DbSession for MysqlSession {
                 ))
             }
             Err(err) => {
-                let mapped = map_mysql_err(err);
+                let mapped = self.map_session_err(err);
                 drop(conn.query_drop("ROLLBACK").await);
                 Err(mapped)
             }
@@ -918,9 +1063,14 @@ impl DbSession for MysqlSession {
         }
 
         let explain_query = build_explain_sql_for_engine(DbEngine::Mysql, trimmed, analyze);
-        let mut conn = self.get_conn().await?;
+        let mut lease = if analyze {
+            self.get_checked_conn(true, true, None).await?
+        } else {
+            self.get_conn().await?
+        };
+        let conn = lease.conn_mut()?;
         let start = Instant::now();
-        let rows: Vec<Row> = conn.query(&explain_query).await.map_err(map_mysql_err)?;
+        let rows: Vec<Row> = conn.query(&explain_query).await.map_err(|e| self.map_session_err(e))?;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let mut chunks = Vec::with_capacity(rows.len());
@@ -987,9 +1137,10 @@ impl DbSession for MysqlSession {
         };
         let sql = build_mysql_page_sql(target_schema, &fk.target_table, &target_columns, &req, 1, 0);
 
-        let mut conn = self.get_conn().await?;
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
         let start = Instant::now();
-        let first_row: Option<Row> = conn.query_first(&sql).await.map_err(map_mysql_err)?;
+        let first_row: Option<Row> = conn.query_first(&sql).await.map_err(|e| self.map_session_err(e))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let row = first_row.map(|r| {
@@ -1021,23 +1172,272 @@ impl DbSession for MysqlSession {
     }
 
     async fn cancel_running_query(&self) -> Result<(), DbError> {
-        let conn_id = self.active_conn_id.load(Ordering::Acquire);
-        if conn_id == 0 {
+        let target = self.active_conn_ids.lock().ok().and_then(|guard| {
+            let (&key, entry) = guard.get_key_value(&0).or_else(|| {
+                if guard.len() == 1 {
+                    guard.iter().next()
+                } else {
+                    None
+                }
+            })?;
+            entry.cancel_requested.store(true, Ordering::Release);
+            Some((key, entry.conn_id))
+        });
+        let Some((cancel_key, conn_id)) = target else {
             return Ok(());
-        }
-        let mut conn = self.get_conn().await?;
-        let kill_sql = format!("KILL QUERY {conn_id}");
-        match conn.query_drop(kill_sql).await {
-            Ok(()) => Ok(()),
-            // ER_NO_SUCH_THREAD: query completed before KILL QUERY arrived
-            Err(MysqlError::Server(se)) if se.code == 1094 => Ok(()),
-            Err(err) => Err(map_mysql_err(err)),
-        }
+        };
+        self.kill_query_conn_id(conn_id, Some(cancel_key)).await
+    }
+
+    async fn cancel_query_by_key(&self, cancel_key: u64) -> Result<(), DbError> {
+        let conn_id = self.active_conn_ids.lock().ok().and_then(|guard| {
+            let entry = guard.get(&cancel_key)?;
+            entry.cancel_requested.store(true, Ordering::Release);
+            Some(entry.conn_id)
+        });
+        let Some(conn_id) = conn_id else {
+            return Ok(());
+        };
+        self.kill_query_conn_id(conn_id, Some(cancel_key)).await
     }
 
     async fn ping(&self) -> Result<(), DbError> {
-        let mut conn = self.get_conn().await?;
-        conn.ping().await.map_err(map_mysql_err)
+        let lease = self.get_checked_conn(false, false, None).await?;
+        lease.return_clean();
+        Ok(())
+    }
+}
+
+impl MysqlSession {
+    async fn execute_sql_inner(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: u64,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
+        let mut lease = self.get_checked_conn(true, true, cancel_flag).await?;
+        if is_cancelled() {
+            lease.return_clean();
+            return Err(DbError::Cancelled);
+        }
+        let conn_id = u64::from(lease.conn_mut()?.id());
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        if let Ok(mut guard) = self.active_conn_ids.lock() {
+            guard.insert(
+                cancel_key,
+                ActiveMysqlQuery {
+                    conn_id,
+                    cancel_requested: Arc::clone(&cancel_requested),
+                },
+            );
+        }
+        let active_guard = ActiveConnMapGuard {
+            map: &self.active_conn_ids,
+            cancel_key,
+        };
+
+        let outcome: Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> = async {
+            let conn = lease.conn_mut()?;
+            if is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
+
+            let batch_start = Instant::now();
+            let mut results = Vec::new();
+            let mut logs = Vec::new();
+            let mut cancelled = false;
+
+            for raw_stmt in statements {
+                let stmt = raw_stmt.trim();
+                if stmt.is_empty() {
+                    continue;
+                }
+                if is_cancelled() {
+                    if results.is_empty() {
+                        return Err(DbError::Cancelled);
+                    }
+                    cancelled = true;
+                    break;
+                }
+                let start = Instant::now();
+
+                match conn.query_iter(stmt).await {
+                    Ok(mut result) => {
+                        let wire_cols = result.columns().unwrap_or_else(|| Arc::from([]));
+                        let columns: Vec<ColumnMeta> = wire_cols.iter().map(column_meta_from_wire_column).collect();
+                        let mut rows: Vec<Vec<CellValue>> = Vec::new();
+                        let mut truncated = false;
+                        let mut total_rows_seen = 0usize;
+                        let mut stream_err: Option<MysqlError> = None;
+
+                        loop {
+                            match result.next().await {
+                                Ok(Some(row)) => {
+                                    total_rows_seen += 1;
+                                    if row_limit.is_none_or(|lim| rows.len() < lim) {
+                                        let mut decoded = Vec::with_capacity(wire_cols.len());
+                                        for (idx, wire_col) in wire_cols.iter().enumerate() {
+                                            let val = row.as_ref(idx).unwrap_or(&Value::NULL);
+                                            decoded.push(decode_mysql_cell(val, Some(wire_col), None));
+                                        }
+                                        rows.push(decoded);
+                                    } else {
+                                        truncated = true;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(err) => {
+                                    stream_err = Some(err);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if stream_err.is_none() {
+                            if let Err(err) = result.drop_result().await {
+                                stream_err = Some(err);
+                            }
+                        } else {
+                            drop(result);
+                        }
+
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        if let Some(err) = stream_err {
+                            let mapped = self.map_session_err(err);
+                            if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                                return Err(DbError::Disconnected);
+                            }
+                            if matches!(mapped, DbError::Cancelled) {
+                                cancelled = true;
+                            }
+                            let err_msg = mapped.to_string();
+                            logs.push(ExecutedSql {
+                                sql: stmt.to_owned(),
+                                duration_ms: elapsed_ms,
+                                error: Some(err_msg.clone()),
+                            });
+                            results.push(QueryStatementResult {
+                                sql: stmt.to_owned(),
+                                columns: Vec::new(),
+                                rows: Vec::new(),
+                                rows_affected: None,
+                                truncated: false,
+                                total_rows_seen: 0,
+                                elapsed_ms,
+                                error: Some(err_msg),
+                            });
+                            break;
+                        }
+
+                        let rows_affected = if columns.is_empty() {
+                            Some(conn.affected_rows())
+                        } else {
+                            None
+                        };
+
+                        logs.push(ExecutedSql {
+                            sql: stmt.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: None,
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt.to_owned(),
+                            columns,
+                            rows,
+                            rows_affected,
+                            truncated,
+                            total_rows_seen,
+                            elapsed_ms,
+                            error: None,
+                        });
+                    }
+                    Err(mysql_err) => {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let mapped = self.map_session_err(mysql_err);
+                        if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                            return Err(DbError::Disconnected);
+                        }
+                        if matches!(mapped, DbError::Cancelled) {
+                            cancelled = true;
+                        }
+                        let err_msg = mapped.to_string();
+                        logs.push(ExecutedSql {
+                            sql: stmt.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: Some(err_msg.clone()),
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt.to_owned(),
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            rows_affected: None,
+                            truncated: false,
+                            total_rows_seen: 0,
+                            elapsed_ms,
+                            error: Some(err_msg),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            Ok((
+                QueryBatchResult {
+                    results,
+                    total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                    cancelled,
+                },
+                logs,
+            ))
+        }
+        .await;
+
+        drop(active_guard);
+        if is_cancelled()
+            || cancel_requested.load(Ordering::Acquire)
+            || matches!(outcome, Err(DbError::Disconnected))
+        {
+            lease.discard();
+        }
+        outcome
+    }
+
+    async fn kill_query_conn_id(&self, conn_id: u64, cancel_key: Option<u64>) -> Result<(), DbError> {
+        let mut cancel_conn = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            mysql_async::Conn::new(self.opts.clone()),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(err)) => return Err(map_mysql_err(err)),
+            Err(_) => return Err(DbError::ConnectionFailed("cancel connection timed out".to_owned())),
+        };
+
+        if let Some(key) = cancel_key {
+            let still_owns = self
+                .active_conn_ids
+                .lock()
+                .ok()
+                .is_some_and(|guard| guard.get(&key).is_some_and(|e| e.conn_id == conn_id));
+            if !still_owns {
+                drop(tokio::time::timeout(Duration::from_millis(500), cancel_conn.disconnect()).await);
+                return Ok(());
+            }
+        }
+
+        let kill_sql = format!("KILL QUERY {conn_id}");
+        let res = match tokio::time::timeout(PING_TIMEOUT, cancel_conn.query_drop(kill_sql)).await {
+            Ok(Ok(())) => Ok(()),
+            // ER_NO_SUCH_THREAD: query completed before KILL QUERY arrived
+            Ok(Err(MysqlError::Server(se))) if se.code == 1094 => Ok(()),
+            Ok(Err(err)) => Err(map_mysql_err(err)),
+            Err(_) => Err(DbError::ConnectionFailed("cancel request timed out".to_owned())),
+        };
+        drop(tokio::time::timeout(Duration::from_millis(500), cancel_conn.disconnect()).await);
+        res
     }
 }
 
@@ -1072,11 +1472,11 @@ fn is_prefer_tls_fallback_error(err: &MysqlError) -> bool {
     }
 }
 
-async fn connect_pool_with_fallback(
+async fn connect_conn_with_fallback(
     profile: &ConnectionProfile,
     password: Option<&str>,
     target_db: Option<&str>,
-) -> Result<(Pool, mysql_async::Conn), DbError> {
+) -> Result<(mysql_async::Conn, Opts), DbError> {
     let host = profile.host.trim();
     let initial_ssl = if host.starts_with('/') {
         None
@@ -1085,36 +1485,20 @@ async fn connect_pool_with_fallback(
     };
 
     let opts = build_mysql_opts(profile, password, target_db, initial_ssl);
-    let pool = Pool::new(opts);
-
-    match tokio::time::timeout(CONNECT_TIMEOUT, pool.get_conn()).await {
-        Ok(Ok(conn)) => Ok((pool, conn)),
+    match tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(opts.clone())).await {
+        Ok(Ok(conn)) => Ok((conn, opts)),
         Ok(Err(err))
             if profile.ssl.mode == SslMode::Prefer && !host.starts_with('/') && is_prefer_tls_fallback_error(&err) =>
         {
-            drop(pool.disconnect().await);
             let plain_opts = build_mysql_opts(profile, password, target_db, None);
-            let plain_pool = Pool::new(plain_opts);
-            match tokio::time::timeout(CONNECT_TIMEOUT, plain_pool.get_conn()).await {
-                Ok(Ok(conn)) => Ok((plain_pool, conn)),
-                Ok(Err(plain_err)) => {
-                    drop(plain_pool.disconnect().await);
-                    Err(map_mysql_err(plain_err))
-                }
-                Err(_) => {
-                    drop(plain_pool.disconnect().await);
-                    Err(DbError::ConnectionFailed("connection timed out".to_owned()))
-                }
+            match tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(plain_opts.clone())).await {
+                Ok(Ok(conn)) => Ok((conn, plain_opts)),
+                Ok(Err(plain_err)) => Err(map_mysql_err(plain_err)),
+                Err(_) => Err(DbError::ConnectionFailed("connection timed out".to_owned())),
             }
         }
-        Ok(Err(err)) => {
-            drop(pool.disconnect().await);
-            Err(map_mysql_err(err))
-        }
-        Err(_) => {
-            drop(pool.disconnect().await);
-            Err(DbError::ConnectionFailed("connection timed out".to_owned()))
-        }
+        Ok(Err(err)) => Err(map_mysql_err(err)),
+        Err(_) => Err(DbError::ConnectionFailed("connection timed out".to_owned())),
     }
 }
 
@@ -1172,7 +1556,8 @@ pub fn build_mysql_opts(
         builder = builder
             .ip_or_hostname(host)
             .tcp_port(profile.port)
-            .prefer_socket(false);
+            .prefer_socket(false)
+            .tcp_keepalive(Some(60_000u32));
     }
 
     builder = builder.user(Some(profile.user.trim()));
@@ -1180,13 +1565,31 @@ pub fn build_mysql_opts(
         builder = builder.pass(password);
     }
     builder = builder.db_name(target_db);
-    if let Some(constraints) = PoolConstraints::new(1, 4) {
-        builder = builder.pool_opts(PoolOpts::default().with_constraints(constraints));
-    }
     if let Some(ssl) = ssl_opts {
         builder = builder.ssl_opts(ssl);
     }
     Opts::from(builder)
+}
+
+/// Maps a `mysql_async::Error` from an established session into our typed [`DbError`].
+pub fn map_mysql_session_err(err: MysqlError) -> DbError {
+    match &err {
+        MysqlError::Driver(DriverError::ConnectionClosed | DriverError::PoolDisconnected) => DbError::Disconnected,
+        MysqlError::Server(se) if matches!(se.code, 1927 | 2006 | 2013 | 4031) => DbError::Disconnected,
+        MysqlError::Io(IoError::Io(io_err))
+            if matches!(
+                io_err.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::NotConnected
+            ) =>
+        {
+            DbError::Disconnected
+        }
+        _ => map_mysql_err(err),
+    }
 }
 
 /// Maps a `mysql_async::Error` into our typed [`DbError`].
@@ -1940,6 +2343,48 @@ mod tests {
     }
 
     #[test]
+    fn maps_mysql_session_disconnect_errors() {
+        for code in [1927, 2006, 2013, 4031] {
+            let err = map_mysql_session_err(MysqlError::Server(ServerError {
+                code,
+                message: "MySQL server has gone away".to_owned(),
+                state: "HY000".to_owned(),
+            }));
+            assert_eq!(err, DbError::Disconnected, "code {code} should map to Disconnected");
+        }
+
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotConnected,
+        ] {
+            let err = map_mysql_session_err(MysqlError::Io(IoError::Io(io::Error::new(kind, "socket dropped"))));
+            assert_eq!(err, DbError::Disconnected, "kind {kind:?} should map to Disconnected");
+        }
+
+        let refused = map_mysql_session_err(MysqlError::Io(IoError::Io(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ))));
+        assert!(matches!(refused, DbError::ConnectionFailed(_)));
+
+        let syntax = map_mysql_session_err(MysqlError::Server(ServerError {
+            code: 1064,
+            message: "You have an error in your SQL syntax".to_owned(),
+            state: "42000".to_owned(),
+        }));
+        assert!(matches!(
+            syntax,
+            DbError::QueryFailed {
+                code: Some(ref c),
+                ..
+            } if c == "1064"
+        ));
+    }
+
+    #[test]
     fn synthesizes_mysql_ddl_fallback_with_auto_increment_fk_and_indexes() {
         let cols = vec![
             ColumnMeta {
@@ -2036,5 +2481,64 @@ mod tests {
         let full_opts = build_mysql_ssl_opts(&verify_full).expect("verify-full ssl opts");
         assert!(!full_opts.accept_invalid_certs());
         assert!(!full_opts.skip_domain_validation());
+    }
+
+    #[test]
+    fn builds_mysql_opts_sets_tcp_keepalive_only_for_tcp_hosts() {
+        let tcp_profile = ConnectionProfile::new_mysql("greendale_mysql", "db.greendale.edu", "abed");
+        let tcp_opts = build_mysql_opts(&tcp_profile, Some("secret"), Some("study_room"), None);
+        assert_eq!(tcp_opts.tcp_keepalive(), Some(60_000));
+
+        let mut sock_profile = ConnectionProfile::new_mysql("local_sock", "/tmp/mysql.sock", "abed");
+        sock_profile.password_mode = PasswordMode::None;
+        let sock_opts = build_mysql_opts(&sock_profile, None, None, None);
+        assert_eq!(sock_opts.tcp_keepalive(), None);
+    }
+
+    #[test]
+    fn acquire_pool_slot_times_out_when_busy_or_resetting_even_if_freed_later() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("tokio test runtime");
+        rt.block_on(async {
+            let slots = Arc::new(tokio::sync::Semaphore::new(MYSQL_POOL_MAX));
+            let mut held = Vec::with_capacity(MYSQL_POOL_MAX);
+            for _ in 0..MYSQL_POOL_MAX {
+                held.push(
+                    acquire_pool_slot(&slots, Duration::from_millis(20))
+                        .await
+                        .expect("initial permit"),
+                );
+            }
+
+            let err = acquire_pool_slot(&slots, Duration::from_millis(20))
+                .await
+                .expect_err("saturated pool should time out");
+            assert!(
+                matches!(err, DbError::ConnectionFailed(ref msg) if msg.contains("all pooled connections are busy")),
+                "expected busy message, got {err:?}"
+            );
+
+            // Simulate a dropped 4th connection holding its permit until async reset completes.
+            let resetting_permit = held.pop().expect("fourth permit");
+            let reset_task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                drop(resetting_permit);
+            });
+
+            let reset_busy_err = acquire_pool_slot(&slots, Duration::from_millis(15))
+                .await
+                .expect_err("caller should stay queued behind resetting permit");
+            assert!(
+                matches!(reset_busy_err, DbError::ConnectionFailed(ref msg) if msg.contains("all pooled connections are busy")),
+                "expected busy message while reset in flight, got {reset_busy_err:?}"
+            );
+
+            reset_task.await.expect("reset task finishes");
+            let _recovered = acquire_pool_slot(&slots, Duration::from_millis(20))
+                .await
+                .expect("permit should be available after reset releases it");
+        });
     }
 }

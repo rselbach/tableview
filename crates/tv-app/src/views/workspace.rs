@@ -237,22 +237,29 @@ fn build_status_pill(session: &SessionState, k: &Kit) -> El {
                         .truncate(),
                 )
         }
-        ConnectionState::Connecting | ConnectionState::Reconnecting => row()
-            .key("toolbar/status-pill")
-            .h(28.0)
-            .px(12.0)
-            .gap(8.0)
-            .center_y()
-            .radius(k.radius.md)
-            .fill(c.layer_02)
-            .border(0.5, c.border_base)
-            .child(Spinner::new().size(12.0).color(c.icon_muted).build(k))
-            .child(
-                text(format!("{tag}  |  Connecting to {}…", session.profile.name))
-                    .font(k.ty.mono)
-                    .color(c.text_muted)
-                    .truncate(),
-            ),
+        ConnectionState::Connecting | ConnectionState::Reconnecting => {
+            let verb = if matches!(session.status, ConnectionState::Reconnecting) {
+                "Reconnecting to"
+            } else {
+                "Connecting to"
+            };
+            row()
+                .key("toolbar/status-pill")
+                .h(28.0)
+                .px(12.0)
+                .gap(8.0)
+                .center_y()
+                .radius(k.radius.md)
+                .fill(c.layer_02)
+                .border(0.5, c.border_base)
+                .child(Spinner::new().size(12.0).color(c.icon_muted).build(k))
+                .child(
+                    text(format!("{tag}  |  {verb} {}…", session.profile.name))
+                        .font(k.ty.mono)
+                        .color(c.text_muted)
+                        .truncate(),
+                )
+        }
         ConnectionState::Connected(data) => {
             let mut summary = format!("{} : {}", data.server_version, session.profile.name);
             if let Some(db) = &data.active_database {
@@ -401,6 +408,11 @@ fn build_sidebar(s: &AppState, session: &SessionState, k: &Kit, layer: &mut Vec<
                 ));
             }
             ConnectionState::Connecting | ConnectionState::Reconnecting => {
+                let label = if matches!(session.status, ConnectionState::Reconnecting) {
+                    "Reconnecting…"
+                } else {
+                    "Connecting…"
+                };
                 sb = sb.child(
                     col()
                         .w_full()
@@ -408,7 +420,7 @@ fn build_sidebar(s: &AppState, session: &SessionState, k: &Kit, layer: &mut Vec<
                         .center()
                         .gap(10.0)
                         .child(Spinner::new().size(16.0).color(c.icon_muted).build(k))
-                        .child(text("Connecting…").font(k.ty.ui).color(c.text_muted)),
+                        .child(text(label).font(k.ty.ui).color(c.text_muted)),
                 );
             }
             ConnectionState::Connected(data) => {
@@ -801,19 +813,26 @@ fn build_stage(
                         platform::dispatch_action(s, Action::EditActiveConnection, tx);
                     })),
             ),
-        ConnectionState::Connecting | ConnectionState::Reconnecting => col()
-            .key("stage-connecting")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .center()
-            .gap(12.0)
-            .child(Spinner::new().size(20.0).color(c.text_accent).build(k))
-            .child(
-                text(format!("Connecting to {}…", session.profile.name))
-                    .font(k.ty.body_medium)
-                    .color(c.text_muted),
-            ),
+        ConnectionState::Connecting | ConnectionState::Reconnecting => {
+            let verb = if matches!(session.status, ConnectionState::Reconnecting) {
+                "Reconnecting to"
+            } else {
+                "Connecting to"
+            };
+            col()
+                .key("stage-connecting")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .center()
+                .gap(12.0)
+                .child(Spinner::new().size(20.0).color(c.text_accent).build(k))
+                .child(
+                    text(format!("{verb} {}…", session.profile.name))
+                        .font(k.ty.body_medium)
+                        .color(c.text_muted),
+                )
+        }
         ConnectionState::Connected(data) => {
             let Some(active_db) = &data.active_database else {
                 return build_no_db_stage(data, k);
