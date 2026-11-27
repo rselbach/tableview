@@ -10,7 +10,10 @@ use rune::{ColorScheme, Env, Key, KeyEvent, Mods, Runtime};
 use rune_kit::diff::DiffMode;
 use tv_app::platform::{Action, dispatch_action};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
-use tv_app::state::{AppState, ConnectionState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
+use tv_app::state::{
+    AppState, CONSOLE_DEFAULT_HEIGHT, CONSOLE_MIN_HEIGHT, CONSOLE_MIN_STAGE_HEIGHT, ConnectionState,
+    ConsoleLogEntry, OverlayState, PickerKind, RowKey, Screen, SessionState, TableViewMode,
+};
 use tv_app::views;
 use tv_app::worker::{SessionConnector, WorkerBridge};
 use tv_core::{
@@ -3838,4 +3841,280 @@ fn background_disconnect_of_db_a_does_not_drop_in_flight_switch_to_db_b() {
     });
     assert_eq!(db_b_sess.sql_calls.load(Ordering::Acquire), 1);
     assert!(rt.find("stage-disconnected").is_none());
+}
+
+fn element_rect(rt: &Runtime<AppState>, key: &str) -> [f32; 4] {
+    rt.elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("missing element {key}"))
+        .rect
+}
+
+fn visible_console_sql(rt: &Runtime<AppState>) -> (usize, [f32; 4]) {
+    let scroll_rect = element_rect(rt, "console-scroll");
+    let visible = rt
+        .elements()
+        .into_iter()
+        .filter(|el| {
+            el.key
+                .as_deref()
+                .is_some_and(|k| k.starts_with("console/entry/") && k.ends_with("/sql"))
+        })
+        .find(|el| {
+            let cy = el.rect[1] + el.rect[3] * 0.5;
+            el.rect[2] > 20.0
+                && cy >= scroll_rect[1] + 2.0
+                && cy <= scroll_rect[1] + scroll_rect[3] - 2.0
+        })
+        .expect("visible console sql element");
+    let idx = visible
+        .key
+        .as_deref()
+        .expect("sql key")
+        .strip_prefix("console/entry/")
+        .and_then(|s| s.strip_suffix("/sql"))
+        .and_then(|n| n.parse().ok())
+        .expect("entry index");
+    (idx, visible.rect)
+}
+
+fn drag_select_sql_line(rt: &mut Runtime<AppState>, rect: [f32; 4]) {
+    let y = rect[1] + (rect[3] * 0.5).min(8.0);
+    let x_start = rect[0] + 4.0;
+    let x_end = (rect[0] + rect[2] - 4.0).min(x_start + 180.0);
+    rt.pointer_down(x_start, y);
+    rt.pointer_move(x_end, y);
+    rt.pointer_up(x_end, y);
+    rt.frame(0.0);
+}
+
+#[test]
+fn console_log_pane_resizes_clamps_cancels_and_resets_on_double_click() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-connected-dark");
+    rt.frame(0.0);
+
+    let initial_rect = element_rect(&rt, "workspace-console");
+    assert_eq!(initial_rect[3], CONSOLE_DEFAULT_HEIGHT);
+
+    let (hx, hy) = rt.find("console-resize-handle").expect("console resize handle");
+    rt.pointer_down(hx, hy);
+    rt.pointer_move(hx, hy - 100.0);
+    rt.pointer_up(hx, hy - 100.0);
+    rt.frame(0.0);
+    assert_eq!(element_rect(&rt, "workspace-console")[3], 284.0);
+    assert_eq!(
+        rt.state.active_session().expect("session").console_height,
+        284.0
+    );
+
+    let (hx, hy) = rt.find("console-resize-handle").expect("console resize handle");
+    rt.pointer_down(hx, hy);
+    rt.pointer_move(hx, hy + 400.0);
+    rt.pointer_up(hx, hy + 400.0);
+    rt.frame(0.0);
+    assert_eq!(element_rect(&rt, "workspace-console")[3], CONSOLE_MIN_HEIGHT);
+    assert_eq!(
+        rt.state.active_session().expect("session").console_height,
+        CONSOLE_MIN_HEIGHT
+    );
+
+    let (hx, hy) = rt.find("console-resize-handle").expect("console resize handle");
+    rt.pointer_down(hx, hy);
+    rt.pointer_move(hx, hy - 1000.0);
+    rt.pointer_up(hx, hy - 1000.0);
+    rt.frame(0.0);
+    let main_h = element_rect(&rt, "workspace-main-inner")[3];
+    let max_h = SessionState::console_max_height(main_h);
+    let clamped_console_h = element_rect(&rt, "workspace-console")[3];
+    assert_eq!(clamped_console_h, max_h);
+    assert!(main_h - clamped_console_h >= CONSOLE_MIN_STAGE_HEIGHT);
+
+    let saved_h = rt.state.active_session().expect("session").console_height;
+    rt.set_viewport((1280.0, 560.0), 1.0);
+    rt.frame(0.0);
+    rt.frame(0.0);
+    assert!(element_rect(&rt, "workspace-console")[3] < saved_h);
+    assert_eq!(rt.state.active_session().expect("session").console_height, saved_h);
+
+    let (hx, hy) = rt.find("console-resize-handle").expect("console resize handle");
+    rt.pointer_down(hx, hy);
+    rt.pointer_move(hx, hy + 40.0);
+    rt.frame(0.0);
+    assert_ne!(
+        rt.state.active_session().expect("session").console_height,
+        saved_h
+    );
+    rt.key(KeyEvent::from(Key::Escape));
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").console_height, saved_h);
+
+    rt.set_viewport((1280.0, 800.0), 1.0);
+    rt.frame(0.0);
+    rt.frame(0.0);
+    assert_eq!(rt.state.active_session().expect("session").console_height, saved_h);
+    assert_eq!(element_rect(&rt, "workspace-console")[3], saved_h);
+
+    let (hx, hy) = rt.find("console-resize-handle").expect("console resize handle");
+    rt.pointer_down(hx, hy);
+    rt.pointer_up(hx, hy);
+    rt.frame(0.05);
+    rt.pointer_down(hx, hy);
+    rt.pointer_up(hx, hy);
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state.active_session().expect("session").console_height,
+        CONSOLE_DEFAULT_HEIGHT
+    );
+    assert_eq!(
+        element_rect(&rt, "workspace-console")[3],
+        CONSOLE_DEFAULT_HEIGHT
+    );
+}
+
+#[test]
+fn console_log_max_resize_preserves_sql_workbench_results_viewport() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sql-editor-dark");
+    rt.frame(0.0);
+
+    let tab_id = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_tab
+        .expect("active tab")
+        .get();
+    let (hx, hy) = rt.find("console-resize-handle").expect("console resize handle");
+    rt.pointer_down(hx, hy);
+    rt.pointer_move(hx, hy - 1000.0);
+    rt.pointer_up(hx, hy - 1000.0);
+    rt.frame(0.0);
+    rt.frame(0.0);
+
+    let console_rect = element_rect(&rt, "workspace-console");
+    let split_rect = element_rect(&rt, "sql-split-handle");
+    let results_header_rect = element_rect(&rt, "query-results-header");
+    let results_pane_rect = element_rect(&rt, &format!("query-results-pane-{tab_id}"));
+
+    assert!(split_rect[1] + split_rect[3] <= console_rect[1]);
+    assert!(results_header_rect[1] + results_header_rect[3] <= console_rect[1]);
+    assert!(results_pane_rect[1] + results_pane_rect[3] <= console_rect[1]);
+    assert!(results_pane_rect[3] - results_header_rect[3] >= 80.0);
+}
+
+#[test]
+fn console_log_text_can_be_selected_and_copied_without_hijacking_inputs() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    let clipboard = rune::clipboard::memory();
+    rt.use_clipboard(&clipboard);
+
+    rt.update(|s, _| {
+        if let Some(sess) = s.active_session_mut() {
+            sess.console_entries.push(ConsoleLogEntry {
+                timestamp: "2026-11-26 15:34:31.042".to_owned(),
+                sql: "SELECT * FROM greendale_missing;".to_owned(),
+                duration_ms: 2,
+                error: Some("ERROR: relation \"greendale_missing\" does not exist".to_owned()),
+            });
+        }
+    });
+    rt.frame(0.0);
+
+    let (visible_entry_idx, visible_sql_rect) = visible_console_sql(&rt);
+    let expected_entry_sql = rt
+        .state
+        .active_session()
+        .expect("session")
+        .console_entries[visible_entry_idx]
+        .sql
+        .clone();
+
+    drag_select_sql_line(&mut rt, visible_sql_rect);
+    assert!(rt.selection().is_some());
+
+    let cmd_mods = Mods {
+        cmd: true,
+        ..Default::default()
+    };
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: cmd_mods,
+    });
+    rt.frame(0.0);
+    let dragged_copy = clipboard.text().expect("copied selection");
+    assert!(!dragged_copy.is_empty());
+    assert!(
+        expected_entry_sql.contains(dragged_copy.as_str()),
+        "expected {:?} inside {expected_entry_sql:?}",
+        dragged_copy.as_str()
+    );
+
+    rt.key(KeyEvent {
+        key: Key::Command('a'),
+        mods: cmd_mods,
+    });
+    rt.frame(0.0);
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: cmd_mods,
+    });
+    rt.frame(0.0);
+    let all_copied = clipboard.text().expect("copied all console entries");
+    let entries = &rt.state.active_session().expect("session").console_entries;
+    let first_meta = format!("-- {} ({} ms)", entries[0].timestamp, entries[0].duration_ms);
+    let second_meta = format!("-- {} ({} ms)", entries[1].timestamp, entries[1].duration_ms);
+    assert!(all_copied.contains(&first_meta), "missing first meta in {all_copied:?}");
+    assert!(all_copied.contains(&entries[0].sql), "missing first sql in {all_copied:?}");
+    assert!(
+        all_copied.contains(&format!("\n\n{second_meta}")),
+        "missing blank-line separator before second entry in {all_copied:?}"
+    );
+    assert!(
+        all_copied.contains("ERROR: relation \"greendale_missing\" does not exist"),
+        "missing error text in {all_copied:?}"
+    );
+
+    let (fx, fy) = rt.find("table-filter-input").expect("filter input");
+    rt.pointer_down(fx, fy);
+    rt.pointer_up(fx, fy);
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Text("gpa > 3.0".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent {
+        key: Key::Command('a'),
+        mods: cmd_mods,
+    });
+    rt.frame(0.0);
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: cmd_mods,
+    });
+    rt.frame(0.0);
+    assert_eq!(clipboard.text().as_deref().map(String::as_str), Some("gpa > 3.0"));
+
+    let (after_idx, visible_sql_rect) = visible_console_sql(&rt);
+    let after_expected_sql = rt
+        .state
+        .active_session()
+        .expect("session")
+        .console_entries[after_idx]
+        .sql
+        .clone();
+    drag_select_sql_line(&mut rt, visible_sql_rect);
+    rt.key(KeyEvent {
+        key: Key::Command('c'),
+        mods: cmd_mods,
+    });
+    rt.frame(0.0);
+    let after_focus_copy = clipboard.text().expect("copied console selection after input focus");
+    assert_ne!(after_focus_copy.as_str(), "gpa > 3.0");
+    assert!(!after_focus_copy.is_empty());
+    assert!(
+        after_expected_sql.contains(after_focus_copy.as_str()),
+        "expected {:?} inside {after_expected_sql:?}",
+        after_focus_copy.as_str()
+    );
 }

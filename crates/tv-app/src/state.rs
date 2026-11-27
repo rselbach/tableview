@@ -490,6 +490,10 @@ pub enum OverlayState {
     Settings,
 }
 
+pub const CONSOLE_DEFAULT_HEIGHT: f32 = 184.0;
+pub const CONSOLE_MIN_HEIGHT: f32 = 96.0;
+pub const CONSOLE_MIN_STAGE_HEIGHT: f32 = 320.0;
+
 /// One SQL query entry recorded in a workspace session's bottom console log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsoleLogEntry {
@@ -1077,6 +1081,8 @@ pub struct SessionState {
     pub sidebar_search: TextEdit,
     pub show_system_schemas: bool,
     pub console_open: bool,
+    pub console_height: f32,
+    console_drag_saved_height: Option<f32>,
     pub console_entries: Vec<ConsoleLogEntry>,
     pub schema_dropdown_open: bool,
     pub sidebar_pane: PaneState,
@@ -1104,6 +1110,8 @@ impl SessionState {
             sidebar_search: TextEdit::new(""),
             show_system_schemas: false,
             console_open: true,
+            console_height: CONSOLE_DEFAULT_HEIGHT,
+            console_drag_saved_height: None,
             console_entries: Vec::new(),
             schema_dropdown_open: false,
             sidebar_pane: PaneState::new(260.0).range(180.0, 440.0),
@@ -1141,6 +1149,44 @@ impl SessionState {
         }
     }
 
+    pub fn console_max_height(container_h: f32) -> f32 {
+        (container_h - CONSOLE_MIN_STAGE_HEIGHT).max(CONSOLE_MIN_HEIGHT)
+    }
+
+    pub fn clamped_console_height(&self, container_h: f32) -> f32 {
+        let max_h = Self::console_max_height(container_h);
+        if self.console_height.is_finite() {
+            self.console_height.round().clamp(CONSOLE_MIN_HEIGHT, max_h)
+        } else {
+            CONSOLE_DEFAULT_HEIGHT.clamp(CONSOLE_MIN_HEIGHT, max_h)
+        }
+    }
+
+    pub fn begin_console_drag(&mut self) {
+        self.console_drag_saved_height = Some(self.console_height);
+    }
+
+    pub fn cancel_console_drag(&mut self) {
+        if let Some(saved) = self.console_drag_saved_height.take() {
+            self.console_height = saved;
+        }
+    }
+
+    pub fn finish_console_drag(&mut self) {
+        self.console_drag_saved_height = None;
+    }
+
+    pub fn set_console_height(&mut self, height: f32, container_h: f32) {
+        if height.is_finite() {
+            let max_h = Self::console_max_height(container_h);
+            self.console_height = height.round().clamp(CONSOLE_MIN_HEIGHT, max_h);
+        }
+    }
+
+    pub fn reset_console_height(&mut self) {
+        self.console_height = CONSOLE_DEFAULT_HEIGHT;
+        self.console_drag_saved_height = None;
+    }
     pub fn active_tab(&self) -> Option<&WorkspaceTab> {
         let active = self.active_tab?;
         self.tabs.iter().find(|t| t.id == active)
@@ -1555,6 +1601,45 @@ impl AppState {
             &mut session.inspector_pane
         } else {
             &mut self.fallback_pane
+        }
+    }
+
+    pub fn begin_console_drag(&mut self, id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.begin_console_drag();
+        }
+    }
+
+    pub fn cancel_console_drag(&mut self, id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.cancel_console_drag();
+        }
+    }
+
+    pub fn finish_console_drag(&mut self, id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.finish_console_drag();
+        }
+    }
+
+    pub fn set_console_height(&mut self, id: SessionId, height: f32, container_h: f32) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.set_console_height(height, container_h);
+        }
+    }
+
+    pub fn step_console_height(&mut self, id: SessionId, delta: f32, container_h: f32) {
+        if delta.is_finite()
+            && let Some(session) = self.sessions.get_mut(&id)
+        {
+            let next = session.clamped_console_height(container_h) + delta;
+            session.set_console_height(next, container_h);
+        }
+    }
+
+    pub fn reset_console_height(&mut self, id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.reset_console_height();
         }
     }
 
