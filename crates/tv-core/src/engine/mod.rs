@@ -1,5 +1,10 @@
+pub mod mysql;
 pub mod postgres;
+pub mod sqlite;
 
+use std::sync::Arc;
+
+use crate::connection::{ConnectionProfile, DbEngine};
 use crate::explain::ExplainPlan;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -497,6 +502,7 @@ pub struct FkPeekRow {
 /// Engine-agnostic database session contract used by the workspace worker.
 #[async_trait]
 pub trait DbSession: Send + Sync {
+    fn engine(&self) -> DbEngine;
     fn server_info(&self) -> &ServerInfo;
     async fn list_databases(&self) -> Result<(Vec<DatabaseInfo>, ExecutedSql), DbError>;
     async fn list_schemas(&self) -> Result<(Vec<SchemaInfo>, ExecutedSql), DbError>;
@@ -522,4 +528,35 @@ pub trait DbSession: Send + Sync {
     ) -> Result<(FkPeekRow, ExecutedSql), DbError>;
     async fn cancel_running_query(&self) -> Result<(), DbError>;
     async fn ping(&self) -> Result<(), DbError>;
+}
+
+/// Connects to the engine configured in `profile` and returns an active [`DbSession`].
+pub async fn connect_session(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    database_override: Option<&str>,
+) -> Result<(Arc<dyn DbSession>, Vec<ExecutedSql>), DbError> {
+    match profile.engine {
+        DbEngine::Postgres => {
+            let (session, logs) = postgres::PostgresSession::connect(profile, password, database_override).await?;
+            Ok((Arc::new(session), logs))
+        }
+        DbEngine::Mysql => {
+            let (session, logs) = mysql::MysqlSession::connect(profile, password, database_override).await?;
+            Ok((Arc::new(session), logs))
+        }
+        DbEngine::Sqlite => {
+            let (session, logs) = sqlite::SqliteSession::connect(profile, password, database_override).await?;
+            Ok((Arc::new(session), logs))
+        }
+    }
+}
+
+/// Tests connectivity against the engine configured in `profile` without retaining a session.
+pub async fn test_connection(profile: &ConnectionProfile, password: Option<&str>) -> Result<ServerInfo, DbError> {
+    match profile.engine {
+        DbEngine::Postgres => postgres::PostgresSession::test_connection(profile, password).await,
+        DbEngine::Mysql => mysql::MysqlSession::test_connection(profile, password).await,
+        DbEngine::Sqlite => sqlite::SqliteSession::test_connection(profile, password).await,
+    }
 }

@@ -12,23 +12,33 @@ pub mod staging;
 pub mod storage;
 
 pub use connection::{
-    AccentColor, ConnectionProfile, EnvTag, PasswordMode, SafetyPolicy, SslConfig, SslMode, UrlParseError,
+    AccentColor, ConnectionProfile, DbEngine, EnvTag, PasswordMode, SafetyPolicy, SslConfig, SslMode, UrlParseError,
     ValidationError,
 };
 pub use engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
     FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
-    SortSpec, TablePage, TableStats, TableStructure, TransactionOutcome,
+    SortSpec, TablePage, TableStats, TableStructure, TransactionOutcome, connect_session, test_connection,
 };
-pub use explain::{ExplainError, ExplainNode, ExplainPlan, build_explain_sql};
-pub use export::{ExportFormat, default_export_filename, export_csv, export_json, export_rows, export_sql_inserts};
+pub use explain::{ExplainError, ExplainNode, ExplainPlan, build_explain_sql, build_explain_sql_for_engine};
+pub use export::{
+    ExportFormat, default_export_filename, export_csv, export_json, export_rows, export_rows_for_engine,
+    export_sql_inserts, export_sql_inserts_for_engine,
+};
 pub use history::{NewHistoryEntry, QueryHistoryEntry, QueryStore, QueryStoreError, SavedQuery};
 pub use ids::{ConnectionId, RequestId, SavedQueryId, SessionId, TabId};
-pub use safety::{SafetyDecision, StatementInspection, StatementRisk, evaluate_sql_safety, evaluate_staged_commit_safety, inspect_statement};
-pub use sql::{SqlStatement, cursor_line_col, format_sql, split_statements, statement_at_cursor};
+pub use safety::{
+    SafetyDecision, StatementInspection, StatementRisk, evaluate_sql_safety, evaluate_sql_safety_for_engine,
+    evaluate_staged_commit_safety, inspect_statement, inspect_statement_for_engine,
+};
+pub use sql::{
+    SqlStatement, cursor_line_col, format_sql, has_executable_sql, has_executable_sql_for_engine, split_statements,
+    split_statements_for_engine, statement_at_cursor, statement_at_cursor_for_engine,
+};
 pub use staging::{
     DraftRowId, StagedCellValue, StagedChanges, StagedInsertRow, StagedRowUpdate, StagingError, build_fk_where_clause,
-    escape_sql_string, format_pg_cell_literal, format_pg_literal,
+    build_fk_where_clause_for_engine, escape_mysql_string, escape_sql_string, format_cell_literal, format_literal,
+    format_pg_cell_literal, format_pg_literal,
 };
 pub use storage::{
     AppSettings, AppearancePreference, ConnectionStore, SETTINGS_SCHEMA_VERSION, SettingsStore, SortOrder, StorageError,

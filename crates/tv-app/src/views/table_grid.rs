@@ -10,8 +10,8 @@ use rune_kit::{
 };
 use tv_core::engine::encode_hex;
 use tv_core::{
-    CellValue, ColumnMeta, DbObjectKind, ExportFormat, SafetyPolicy, StagedCellValue, TablePage, TableStructure,
-    build_fk_where_clause, export_rows,
+    CellValue, ColumnMeta, DbEngine, DbObjectKind, ExportFormat, SafetyPolicy, StagedCellValue, TablePage,
+    TableStructure, build_fk_where_clause_for_engine, export_rows_for_engine,
 };
 
 use crate::icons;
@@ -780,7 +780,7 @@ fn build_data_grid(
     }
 
     if let Some(ref peek) = tab.fk_peek {
-        mount_fk_peek_popover(peek, k, layer);
+        mount_fk_peek_popover(session.profile.engine, peek, k, layer);
     }
 
     if let Some((col_id, press)) = &tab.header_menu {
@@ -930,14 +930,17 @@ fn build_row_context_menu(
     }
 
     let row_slice = vec![eff_row];
-    let json_text = export_rows(
+    let engine = session.profile.engine;
+    let json_text = export_rows_for_engine(
+        engine,
         ExportFormat::Json,
         Some(&tab.schema),
         &tab.object_name,
         &page.columns,
         &row_slice,
     );
-    let insert_text = export_rows(
+    let insert_text = export_rows_for_engine(
+        engine,
         ExportFormat::SqlInsert,
         Some(&tab.schema),
         &tab.object_name,
@@ -965,7 +968,7 @@ fn build_row_context_menu(
         .min_h(0.0)
 }
 
-fn mount_fk_peek_popover(peek: &FkPeekState, k: &Kit, layer: &mut Vec<El>) {
+fn mount_fk_peek_popover(engine: DbEngine, peek: &FkPeekState, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     let fk_jump = peek.fk.clone();
     let val_jump = peek.value.clone();
@@ -1061,7 +1064,9 @@ fn mount_fk_peek_popover(peek: &FkPeekState, k: &Kit, layer: &mut Vec<El>) {
         }
     }
 
-    if let Some(filter_sql) = build_fk_where_clause(&peek.fk.target_column, &peek.value, &peek.source_col) {
+    if let Some(filter_sql) =
+        build_fk_where_clause_for_engine(engine, &peek.fk.target_column, &peek.value, &peek.source_col)
+    {
         let _ = filter_sql;
         card = card.child(
             row()

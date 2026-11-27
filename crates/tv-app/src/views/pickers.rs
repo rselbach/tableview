@@ -181,11 +181,16 @@ fn collect_entries(s: &AppState, picker: &PickerState, dark: bool) -> Vec<Picker
             .filter(|conn| {
                 q.is_empty()
                     || conn.name.to_ascii_lowercase().contains(&q)
+                    || conn.engine.label().to_ascii_lowercase().contains(&q)
                     || conn.host.to_ascii_lowercase().contains(&q)
                     || conn
                         .database
                         .as_deref()
                         .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
+                    || conn
+                        .file_path
+                        .as_ref()
+                        .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(&q))
             })
             .map(|conn| PickerEntry::Connection {
                 id: conn.id,

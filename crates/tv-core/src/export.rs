@@ -1,8 +1,8 @@
 use serde_json::{Map, Number, Value};
 
-use crate::engine::postgres::quote_ident;
+use crate::connection::DbEngine;
 use crate::engine::{CellValue, ColumnMeta};
-use crate::staging::format_pg_cell_literal;
+use crate::staging::format_cell_literal;
 
 /// Supported data export formats for table pages and SQL result sets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,10 +82,22 @@ pub fn export_rows(
     columns: &[ColumnMeta],
     rows: &[Vec<CellValue>],
 ) -> String {
+    export_rows_for_engine(DbEngine::Postgres, format, schema, table_name, columns, rows)
+}
+
+/// Exports tabular rows into CSV, JSON, or dialect-appropriate SQL `INSERT` statements.
+pub fn export_rows_for_engine(
+    engine: DbEngine,
+    format: ExportFormat,
+    schema: Option<&str>,
+    table_name: &str,
+    columns: &[ColumnMeta],
+    rows: &[Vec<CellValue>],
+) -> String {
     match format {
         ExportFormat::Csv => export_csv(columns, rows),
         ExportFormat::Json => export_json(columns, rows),
-        ExportFormat::SqlInsert => export_sql_inserts(schema, table_name, columns, rows),
+        ExportFormat::SqlInsert => export_sql_inserts_for_engine(engine, schema, table_name, columns, rows),
     }
 }
 
@@ -179,6 +191,17 @@ pub fn export_sql_inserts(
     columns: &[ColumnMeta],
     rows: &[Vec<CellValue>],
 ) -> String {
+    export_sql_inserts_for_engine(DbEngine::Postgres, schema, table_name, columns, rows)
+}
+
+/// Encodes rows as deterministic SQL `INSERT INTO ... VALUES (...);` statements for the given engine.
+pub fn export_sql_inserts_for_engine(
+    engine: DbEngine,
+    schema: Option<&str>,
+    table_name: &str,
+    columns: &[ColumnMeta],
+    rows: &[Vec<CellValue>],
+) -> String {
     if columns.is_empty() || rows.is_empty() {
         return String::new();
     }
@@ -188,12 +211,12 @@ pub fn export_sql_inserts(
         table_name.trim()
     };
     let target = match schema.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(sc) => format!("{}.{}", quote_ident(sc), quote_ident(clean_table)),
-        None => quote_ident(clean_table),
+        Some(sc) => engine.qualify_ident(sc, clean_table),
+        None => engine.quote_ident(clean_table),
     };
     let col_list: String = columns
         .iter()
-        .map(|c| quote_ident(&c.name))
+        .map(|c| engine.quote_ident(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -204,11 +227,79 @@ pub fn export_sql_inserts(
             .enumerate()
             .map(|(idx, col)| {
                 let cell = row.get(idx).unwrap_or(&CellValue::Null);
-                format_pg_cell_literal(col, cell)
+                format_cell_literal(engine, col, cell)
             })
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!("INSERT INTO {target} ({col_list}) VALUES ({vals});\n"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_sql_inserts_respects_mysql_and_sqlite_dialects() {
+        let cols = vec![
+            ColumnMeta {
+                name: "id".to_owned(),
+                data_type: "int".to_owned(),
+                udt_name: "int".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "ok".to_owned(),
+                data_type: "tinyint(1)".to_owned(),
+                udt_name: "tinyint(1)".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "payload".to_owned(),
+                data_type: "blob".to_owned(),
+                udt_name: "blob".to_owned(),
+                nullable: true,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ];
+        let rows = vec![vec![
+            CellValue::Int(7),
+            CellValue::Bool(true),
+            CellValue::Bytes(vec![0xab, 0xcd]),
+        ]];
+
+        let mysql_sql = export_rows_for_engine(
+            DbEngine::Mysql,
+            ExportFormat::SqlInsert,
+            Some("greendale"),
+            "notes",
+            &cols,
+            &rows,
+        );
+        assert_eq!(
+            mysql_sql,
+            "INSERT INTO `greendale`.`notes` (`id`, `ok`, `payload`) VALUES (7, TRUE, X'abcd');\n"
+        );
+
+        let sqlite_sql = export_sql_inserts_for_engine(DbEngine::Sqlite, None, "notes", &cols, &rows);
+        assert_eq!(
+            sqlite_sql,
+            "INSERT INTO \"notes\" (\"id\", \"ok\", \"payload\") VALUES (7, 1, X'abcd');\n"
+        );
+    }
 }

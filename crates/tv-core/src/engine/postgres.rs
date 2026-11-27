@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::connection::{ConnectionProfile, PasswordMode, SslConfig, SslMode};
+use crate::connection::{ConnectionProfile, DbEngine, PasswordMode, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
     FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
@@ -230,6 +230,10 @@ impl PostgresSession {
 
 #[async_trait]
 impl DbSession for PostgresSession {
+    fn engine(&self) -> DbEngine {
+        DbEngine::Postgres
+    }
+
     fn server_info(&self) -> &ServerInfo {
         &self.server_info
     }
@@ -1175,7 +1179,7 @@ where
     (handle, disconnected)
 }
 
-fn build_rustls_config(ssl: &SslConfig) -> Result<ClientConfig, DbError> {
+pub(crate) fn build_rustls_config(ssl: &SslConfig) -> Result<ClientConfig, DbError> {
     ensure_crypto_provider();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 

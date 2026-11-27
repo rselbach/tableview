@@ -19,7 +19,7 @@ use crate::views::table_grid::{initial_col_width, is_numeric_udt, render_cell_va
 /// draggable vertical splitter, and multi-statement result grids.
 pub fn build_query_tab(
     s: &AppState,
-    _session: &SessionState,
+    session: &SessionState,
     tab: &QueryTabState,
     k: &Kit,
     cx: &Cx<AppState>,
@@ -34,7 +34,7 @@ pub fn build_query_tab(
 
     let editor_pane = build_editor_pane(tab, editor_h, k);
     let splitter = build_split_handle(total_h, k);
-    let results_pane = build_results_pane(s, tab, k);
+    let results_pane = build_results_pane(s, session, tab, k);
 
     let split_body = col()
         .key(split_key)
@@ -264,7 +264,7 @@ fn build_editor_pane(tab: &QueryTabState, editor_h: f32, k: &Kit) -> El {
         .min_h((editor_h - 22.0).max(80.0))
         .color(c.text_base)
         .caret(c.text_accent, c.text_accent.alpha(0.24))
-        .placeholder("-- Write PostgreSQL SQL here (⌘↩ Run Current, ⇧⌘↩ Run All)", c.text_faint)
+        .placeholder("-- Write SQL here (⌘↩ Run Current, ⇧⌘↩ Run All)", c.text_faint)
         .decorations(spans)
         .line_home_end(true)
         .reveal_caret_on_focus(true)
@@ -337,12 +337,12 @@ fn build_split_handle(total_h: f32, k: &Kit) -> El {
         .child(el().size(36.0, 2.0).radius(1.0).fill(c.border_strong))
 }
 
-fn build_results_pane(s: &AppState, tab: &QueryTabState, k: &Kit) -> El {
+fn build_results_pane(s: &AppState, session: &SessionState, tab: &QueryTabState, k: &Kit) -> El {
     let c = &k.c;
     let header = build_results_header(tab, k);
 
     let body = if tab.show_explain {
-        explain_view::build_explain_pane(tab, k)
+        explain_view::build_explain_pane(tab, session.profile.engine.supports_explain_analyze(), k)
     } else if let Some(err) = &tab.batch_error
         && tab.results.is_empty()
     {

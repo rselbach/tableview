@@ -1,16 +1,21 @@
 #![allow(clippy::expect_used)]
 
+use std::path::PathBuf;
+
 use chrono::{Datelike, Utc};
 use tempfile::tempdir;
 use tv_core::engine::postgres::{quote_ident, synthesize_table_ddl};
 use tv_core::{
     AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ConnectionId, ConnectionProfile,
-    ConnectionStore, EnvTag, ExplainPlan, ExportFormat, ForeignKeyRef, IndexInfo, NewHistoryEntry, PasswordMode,
-    QueryStatementResult, QueryStore, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SettingsStore, SortOrder,
-    SslMode, StagedCellValue, StagedChanges, StagingError, StatementRisk, StoreData, UrlParseError, ValidationError,
-    build_explain_sql, build_fk_where_clause, cursor_line_col, evaluate_sql_safety, evaluate_staged_commit_safety,
-    export_csv, export_json, export_rows, export_sql_inserts, format_sql, inspect_statement, split_statements,
-    statement_at_cursor,
+    ConnectionStore, DbEngine, EnvTag, ExplainError, ExplainPlan, ExportFormat, ForeignKeyRef, IndexInfo,
+    NewHistoryEntry, PasswordMode, QueryStatementResult, QueryStore, SafetyDecision, SafetyPolicy, SavedQuery,
+    SavedQueryId, SettingsStore, SortOrder, SslMode, StagedCellValue, StagedChanges, StagingError, StatementRisk,
+    StoreData, UrlParseError, ValidationError, build_explain_sql, build_explain_sql_for_engine, build_fk_where_clause,
+    build_fk_where_clause_for_engine, cursor_line_col, evaluate_sql_safety, evaluate_sql_safety_for_engine,
+    evaluate_staged_commit_safety, export_csv, export_json, export_rows, export_rows_for_engine, export_sql_inserts,
+    export_sql_inserts_for_engine, format_sql, has_executable_sql_for_engine, inspect_statement,
+    inspect_statement_for_engine, split_statements, split_statements_for_engine, statement_at_cursor,
+    statement_at_cursor_for_engine,
 };
 
 #[test]
@@ -698,4 +703,879 @@ fn export_formats_csv_json_and_sql_inserts_with_proper_escaping() {
 
     let via_dispatch = export_rows(ExportFormat::SqlInsert, None, "custom_query", &cols, &rows);
     assert!(via_dispatch.starts_with("INSERT INTO \"custom_query\""));
+}
+
+#[test]
+fn db_engine_properties_and_serde_backward_compatibility() {
+    assert_eq!(DbEngine::ALL, [DbEngine::Postgres, DbEngine::Mysql, DbEngine::Sqlite]);
+    assert_eq!(DbEngine::default(), DbEngine::Postgres);
+
+    assert_eq!(DbEngine::Postgres.label(), "PostgreSQL");
+    assert_eq!(DbEngine::Mysql.label(), "MySQL");
+    assert_eq!(DbEngine::Sqlite.label(), "SQLite");
+
+    assert_eq!(DbEngine::Postgres.short_badge(), "PG");
+    assert_eq!(DbEngine::Mysql.short_badge(), "MY");
+    assert_eq!(DbEngine::Sqlite.short_badge(), "SL");
+
+    assert_eq!(DbEngine::Postgres.default_port(), 5432);
+    assert_eq!(DbEngine::Mysql.default_port(), 3306);
+    assert_eq!(DbEngine::Sqlite.default_port(), 0);
+
+    assert_eq!(DbEngine::Postgres.default_user(), "postgres");
+    assert_eq!(DbEngine::Mysql.default_user(), "root");
+    assert_eq!(DbEngine::Sqlite.default_user(), "");
+
+    assert_eq!(DbEngine::from_label("PostgreSQL"), Some(DbEngine::Postgres));
+    assert_eq!(DbEngine::from_label("postgres"), Some(DbEngine::Postgres));
+    assert_eq!(DbEngine::from_label("PG"), Some(DbEngine::Postgres));
+    assert_eq!(DbEngine::from_label("mysql"), Some(DbEngine::Mysql));
+    assert_eq!(DbEngine::from_label("my"), Some(DbEngine::Mysql));
+    assert_eq!(DbEngine::from_label("SQLite"), Some(DbEngine::Sqlite));
+    assert_eq!(DbEngine::from_label("sl"), Some(DbEngine::Sqlite));
+    assert_eq!(DbEngine::from_label("greendale"), None);
+
+    assert!(DbEngine::Postgres.uses_schemas());
+    assert!(!DbEngine::Mysql.uses_schemas());
+    assert!(!DbEngine::Sqlite.uses_schemas());
+
+    assert!(DbEngine::Postgres.supports_multi_database());
+    assert!(DbEngine::Mysql.supports_multi_database());
+    assert!(!DbEngine::Sqlite.supports_multi_database());
+
+    assert!(DbEngine::Postgres.supports_explain_analyze());
+    assert!(DbEngine::Mysql.supports_explain_analyze());
+    assert!(!DbEngine::Sqlite.supports_explain_analyze());
+
+    assert_eq!(DbEngine::Postgres.quote_ident("weird\"col"), "\"weird\"\"col\"");
+    assert_eq!(DbEngine::Sqlite.quote_ident("weird\"col"), "\"weird\"\"col\"");
+    assert_eq!(DbEngine::Mysql.quote_ident("weird`col"), "`weird``col`");
+
+    assert_eq!(
+        DbEngine::Postgres.qualify_ident("public", "students"),
+        "\"public\".\"students\""
+    );
+    assert_eq!(
+        DbEngine::Mysql.qualify_ident("greendale", "students"),
+        "`greendale`.`students`"
+    );
+    assert_eq!(DbEngine::Mysql.qualify_ident("", "students"), "`students`");
+    assert_eq!(DbEngine::Sqlite.qualify_ident("main", "students"), "\"main\".\"students\"");
+    assert_eq!(DbEngine::Sqlite.qualify_ident("  ", "students"), "\"students\"");
+
+    // Legacy ConnectionProfile JSON without `engine` or `file_path` defaults to Postgres.
+    let legacy_json = r#"{
+        "id": "11111111-1111-1111-1111-111111111111",
+        "name": "Greendale Legacy PG",
+        "host": "db.greendale.edu",
+        "port": 5432,
+        "user": "dean_pelton",
+        "database": "study_room",
+        "created_at": "2026-11-19T12:00:00Z"
+    }"#;
+    let legacy: ConnectionProfile = serde_json::from_str(legacy_json).expect("deserialize legacy profile");
+    assert_eq!(legacy.engine, DbEngine::Postgres);
+    assert_eq!(legacy.file_path, None);
+    assert_eq!(legacy.name, "Greendale Legacy PG");
+
+    // StoreData round-trip preserves mixed engines and omits `file_path` when None.
+    let mysql = ConnectionProfile::new_mysql("Greendale MySQL", "127.0.0.1", "troy_barnes");
+    let sqlite = ConnectionProfile::new_sqlite("Study Room SQLite", "/tmp/greendale.db");
+    let mut store = StoreData::default();
+    store.upsert(legacy);
+    store.upsert(mysql);
+    store.upsert(sqlite);
+    let serialized = store.export_json().expect("serialize store");
+    let mut reloaded = StoreData::default();
+    let count = reloaded.import_json(&serialized).expect("reload store");
+    assert_eq!(count, 3);
+    assert_eq!(reloaded.connections[0].engine, DbEngine::Postgres);
+    assert_eq!(reloaded.connections[1].engine, DbEngine::Mysql);
+    assert_eq!(reloaded.connections[2].engine, DbEngine::Sqlite);
+    assert_eq!(
+        reloaded.connections[2].file_path,
+        Some(PathBuf::from("/tmp/greendale.db"))
+    );
+}
+
+#[test]
+fn mysql_and_sqlite_profiles_validate_all_constraints() {
+    let mut mysql = ConnectionProfile::new_mysql("Greendale Registrar", "mysql.greendale.edu", "annie_edison");
+    assert_eq!(mysql.engine, DbEngine::Mysql);
+    assert_eq!(mysql.port, 3306);
+    assert_eq!(mysql.file_path, None);
+    assert_eq!(mysql.password_mode, PasswordMode::Keychain);
+    assert!(mysql.validate().is_ok());
+    assert_eq!(mysql.endpoint_summary(), "mysql.greendale.edu");
+
+    mysql.port = 3307;
+    mysql.database = Some("study_room_f".to_owned());
+    assert_eq!(mysql.endpoint_summary(), "mysql.greendale.edu:3307 : study_room_f");
+
+    mysql.name = "  ".to_owned();
+    assert_eq!(mysql.validate(), Err(ValidationError::EmptyField("name")));
+
+    mysql.name = "Greendale Registrar".to_owned();
+    mysql.host = "   ".to_owned();
+    assert_eq!(mysql.validate(), Err(ValidationError::EmptyField("host")));
+
+    mysql.host = "mysql.greendale.edu".to_owned();
+    mysql.port = 0;
+    assert_eq!(mysql.validate(), Err(ValidationError::InvalidPort));
+
+    // Unix socket paths are permitted even with port 0.
+    mysql.host = "/tmp/mysql.sock".to_owned();
+    assert!(mysql.validate().is_ok());
+    assert_eq!(mysql.endpoint_summary(), "/tmp/mysql.sock : study_room_f");
+
+    mysql.user = String::new();
+    assert_eq!(mysql.validate(), Err(ValidationError::EmptyField("user")));
+
+    mysql.user = "annie_edison".to_owned();
+    mysql.ssl.mode = SslMode::VerifyFull;
+    mysql.ssl.ca_cert_path = Some(PathBuf::from("/nonexistent/greendale-ca.pem"));
+    assert_eq!(
+        mysql.validate(),
+        Err(ValidationError::MissingFile(
+            "CA certificate",
+            PathBuf::from("/nonexistent/greendale-ca.pem")
+        ))
+    );
+
+    let mut sqlite = ConnectionProfile::new_sqlite("Abed Local DB", "/tmp/greendale_campus.sqlite3");
+    assert_eq!(sqlite.engine, DbEngine::Sqlite);
+    assert_eq!(sqlite.host, "");
+    assert_eq!(sqlite.port, 0);
+    assert_eq!(sqlite.user, "");
+    assert_eq!(sqlite.password_mode, PasswordMode::None);
+    assert_eq!(sqlite.ssl.mode, SslMode::Disable);
+    assert_eq!(sqlite.env, EnvTag::Local);
+    assert_eq!(sqlite.color, AccentColor::Green);
+    assert!(sqlite.validate().is_ok());
+    assert_eq!(sqlite.endpoint_summary(), "/tmp/greendale_campus.sqlite3");
+
+    let mem_sqlite = ConnectionProfile::new_sqlite("In-Memory Study", ":memory:");
+    assert!(mem_sqlite.validate().is_ok());
+    assert_eq!(mem_sqlite.endpoint_summary(), ":memory:");
+
+    sqlite.file_path = Some(PathBuf::new());
+    assert_eq!(
+        sqlite.validate(),
+        Err(ValidationError::EmptyField("database file path"))
+    );
+
+    sqlite.file_path = None;
+    assert_eq!(
+        sqlite.validate(),
+        Err(ValidationError::EmptyField("database file path"))
+    );
+
+    sqlite.file_path = Some(PathBuf::from(":memory:"));
+    sqlite.name = String::new();
+    assert_eq!(sqlite.validate(), Err(ValidationError::EmptyField("name")));
+}
+
+#[test]
+fn url_parse_and_export_roundtrip_for_postgres_mysql_and_sqlite() {
+    // PostgreSQL via unified from_url / to_url
+    let (pg, pg_pw) =
+        ConnectionProfile::from_url("postgresql://jeff_winger:lawyer%20up@db.greendale.edu:5432/campus?sslmode=require")
+            .expect("parse postgresql url");
+    assert_eq!(pg.engine, DbEngine::Postgres);
+    assert_eq!(pg_pw.as_deref(), Some("lawyer up"));
+    assert_eq!(pg.port, 5432);
+    assert_eq!(pg.ssl.mode, SslMode::Require);
+    let pg_masked = pg.to_url(true);
+    assert!(pg_masked.starts_with("postgresql://jeff_winger:********@db.greendale.edu:5432/campus"));
+    assert!(pg_masked.contains("sslmode=require"));
+    assert!(!pg.to_url(false).contains("********"));
+
+    // MySQL with credentials, custom ssl-mode, and default port 3306
+    let (my_full, my_pw) = ConnectionProfile::from_url(
+        "mysql://abed_nadir:cool%20cool%20cool@mysql.greendale.edu/film_club?ssl-mode=verify_identity",
+    )
+    .expect("parse mysql url");
+    assert_eq!(my_full.engine, DbEngine::Mysql);
+    assert_eq!(my_full.user, "abed_nadir");
+    assert_eq!(my_pw.as_deref(), Some("cool cool cool"));
+    assert_eq!(my_full.host, "mysql.greendale.edu");
+    assert_eq!(my_full.port, 3306);
+    assert_eq!(my_full.database.as_deref(), Some("film_club"));
+    assert_eq!(my_full.ssl.mode, SslMode::VerifyFull);
+    assert_eq!(my_full.password_mode, PasswordMode::Keychain);
+
+    let my_masked = my_full.to_url(true);
+    assert!(!my_masked.contains("cool"));
+    assert_eq!(
+        my_masked,
+        "mysql://abed_nadir:********@mysql.greendale.edu:3306/film_club?ssl-mode=verify_identity"
+    );
+    let my_unmasked = my_full.to_url(false);
+    assert_eq!(
+        my_unmasked,
+        "mysql://abed_nadir@mysql.greendale.edu:3306/film_club?ssl-mode=verify_identity"
+    );
+
+    // MySQL without credentials defaults to root / 3306 / PasswordMode::None
+    let (my_anon, my_anon_pw) =
+        ConnectionProfile::from_url("mysql2://127.0.0.1/air_conditioning").expect("parse mysql2 url");
+    assert_eq!(my_anon.engine, DbEngine::Mysql);
+    assert_eq!(my_anon.user, "root");
+    assert_eq!(my_anon.port, 3306);
+    assert_eq!(my_anon_pw, None);
+    assert_eq!(my_anon.password_mode, PasswordMode::None);
+    assert!(!my_anon.to_url(true).contains("********"));
+
+    // MySQL Unix socket via query parameter
+    let (my_sock, _) =
+        ConnectionProfile::from_url("mysql://troy_barnes@localhost/plumbing?socket=%2Ftmp%2Fmysql.sock")
+            .expect("parse mysql socket url");
+    assert_eq!(my_sock.host, "/tmp/mysql.sock");
+    assert!(my_sock.validate().is_ok());
+    assert!(my_sock.to_url(false).contains("socket=%2Ftmp%2Fmysql.sock"));
+
+    assert!(matches!(
+        ConnectionProfile::from_url("mysql://127.0.0.1/db?ssl-mode=imaginary"),
+        Err(UrlParseError::InvalidSslMode(_))
+    ));
+
+    // SQLite :memory:
+    let (sl_mem, sl_mem_pw) = ConnectionProfile::from_url("sqlite://:memory:").expect("parse sqlite memory");
+    assert_eq!(sl_mem.engine, DbEngine::Sqlite);
+    assert_eq!(sl_mem.name, "SQLite (memory)");
+    assert_eq!(sl_mem.file_path, Some(PathBuf::from(":memory:")));
+    assert_eq!(sl_mem_pw, None);
+    assert_eq!(sl_mem.to_url(true), "sqlite://:memory:");
+
+    // SQLite percent-encoded file path
+    let (sl_encoded, _) =
+        ConnectionProfile::from_url("sqlite:///tmp/greendale%20study%20room.db").expect("parse sqlite encoded path");
+    assert_eq!(sl_encoded.engine, DbEngine::Sqlite);
+    assert_eq!(sl_encoded.name, "greendale study room");
+    assert_eq!(
+        sl_encoded.file_path,
+        Some(PathBuf::from("/tmp/greendale study room.db"))
+    );
+    assert_eq!(sl_encoded.to_url(false), "sqlite:///tmp/greendale%20study%20room.db");
+
+    // sqlite3:// and file: schemes
+    let (sl3, _) = ConnectionProfile::from_url("sqlite3:///var/lib/greendale/registrar.sqlite3")
+        .expect("parse sqlite3 url");
+    assert_eq!(sl3.engine, DbEngine::Sqlite);
+    assert_eq!(sl3.name, "registrar");
+    assert_eq!(
+        sl3.file_path,
+        Some(PathBuf::from("/var/lib/greendale/registrar.sqlite3"))
+    );
+    assert_eq!(sl3.to_url(true), "sqlite:///var/lib/greendale/registrar.sqlite3");
+
+    let (sl_file, _) = ConnectionProfile::from_url("file:/tmp/troy_and_abed.db?mode=ro").expect("parse file url");
+    assert_eq!(sl_file.engine, DbEngine::Sqlite);
+    assert_eq!(sl_file.file_path, Some(PathBuf::from("/tmp/troy_and_abed.db")));
+
+    assert!(matches!(
+        ConnectionProfile::from_url("sqlite://"),
+        Err(UrlParseError::InvalidUrl(_))
+    ));
+    assert!(matches!(
+        ConnectionProfile::from_url("ftp://greendale.edu/db"),
+        Err(UrlParseError::UnsupportedScheme(_))
+    ));
+}
+
+fn sample_multi_engine_columns() -> Vec<ColumnMeta> {
+    vec![
+        ColumnMeta {
+            name: "student_id".to_owned(),
+            data_type: "int".to_owned(),
+            udt_name: "int".to_owned(),
+            nullable: false,
+            default_expr: Some("auto_increment".to_owned()),
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "full_name".to_owned(),
+            data_type: "varchar(255)".to_owned(),
+            udt_name: "varchar".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "enrolled".to_owned(),
+            data_type: "tinyint(1)".to_owned(),
+            udt_name: "tinyint(1)".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "gpa".to_owned(),
+            data_type: "decimal(4,2)".to_owned(),
+            udt_name: "decimal".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "badge".to_owned(),
+            data_type: "blob".to_owned(),
+            udt_name: "blob".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+        ColumnMeta {
+            name: "metadata".to_owned(),
+            data_type: "json".to_owned(),
+            udt_name: "json".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        },
+    ]
+}
+
+#[test]
+fn staged_changes_build_statements_and_transactions_for_mysql_and_sqlite() {
+    let cols = sample_multi_engine_columns();
+    let row0 = vec![
+        CellValue::Int(1),
+        CellValue::Text("Britta Perry".to_owned()),
+        CellValue::Bool(true),
+        CellValue::Numeric("2.85".to_owned()),
+        CellValue::Bytes(vec![0xab, 0xcd]),
+        CellValue::Json(r#"{"major":"psych"}"#.to_owned()),
+    ];
+    let row1 = vec![
+        CellValue::Int(2),
+        CellValue::Text("Pierce Hawthorne".to_owned()),
+        CellValue::Bool(false),
+        CellValue::Null,
+        CellValue::Null,
+        CellValue::Null,
+    ];
+
+    let mut staged = StagedChanges::new();
+    staged.stage_cell_edit(0, &row0, 1, StagedCellValue::Literal(r"Britta's \protest".to_owned()));
+    staged.stage_cell_edit(0, &row0, 2, StagedCellValue::Literal("false".to_owned()));
+    staged.stage_cell_edit(0, &row0, 4, StagedCellValue::Literal("0xcafe".to_owned()));
+    staged.stage_cell_edit(0, &row0, 5, StagedCellValue::Literal(r#"{"note":"a'b\c"}"#.to_owned()));
+
+    let draft_id = staged.stage_insert_row(&cols);
+    staged.stage_insert_cell_edit(draft_id, 1, StagedCellValue::Literal("Shirley Bennett".to_owned()));
+    staged.stage_insert_cell_edit(draft_id, 2, StagedCellValue::Literal("true".to_owned()));
+    staged.stage_insert_cell_edit(draft_id, 3, StagedCellValue::Literal("3.88".to_owned()));
+    staged.stage_insert_cell_edit(draft_id, 4, StagedCellValue::Literal("beef".to_owned()));
+    staged.stage_insert_cell_edit(draft_id, 5, StagedCellValue::Literal(r#"{"club":"baking"}"#.to_owned()));
+
+    staged.toggle_delete_row(1, &row1);
+
+    // MySQL dialect
+    let my_stmts = staged
+        .build_statements_for_engine(DbEngine::Mysql, "greendale", "students", &cols)
+        .expect("mysql statements");
+    assert_eq!(my_stmts.len(), 3);
+    assert_eq!(
+        my_stmts[0],
+        "UPDATE `greendale`.`students` SET `full_name` = 'Britta''s \\\\protest', `enrolled` = FALSE, `badge` = X'cafe', `metadata` = '{\"note\":\"a''b\\\\c\"}' WHERE `student_id` = 1;"
+    );
+    assert_eq!(
+        my_stmts[1],
+        "INSERT INTO `greendale`.`students` (`full_name`, `enrolled`, `gpa`, `badge`, `metadata`) VALUES ('Shirley Bennett', TRUE, 3.88, X'beef', '{\"club\":\"baking\"}');"
+    );
+    assert_eq!(my_stmts[2], "DELETE FROM `greendale`.`students` WHERE `student_id` = 2;");
+
+    let my_tx = staged
+        .build_transaction_sql_for_engine(DbEngine::Mysql, "greendale", "students", &cols)
+        .expect("mysql tx sql");
+    assert!(my_tx.starts_with("START TRANSACTION;\n\n"));
+    assert!(my_tx.ends_with("\n\nCOMMIT;\n"));
+
+    // SQLite dialect (double-quoted identifiers, 1/0 bools, X'...' bytes, no `::` casts)
+    let sl_stmts = staged
+        .build_statements_for_engine(DbEngine::Sqlite, "", "students", &cols)
+        .expect("sqlite statements");
+    assert_eq!(sl_stmts.len(), 3);
+    assert_eq!(
+        sl_stmts[0],
+        "UPDATE \"students\" SET \"full_name\" = 'Britta''s \\protest', \"enrolled\" = 0, \"badge\" = X'cafe', \"metadata\" = '{\"note\":\"a''b\\c\"}' WHERE \"student_id\" = 1;"
+    );
+    assert_eq!(
+        sl_stmts[1],
+        "INSERT INTO \"students\" (\"full_name\", \"enrolled\", \"gpa\", \"badge\", \"metadata\") VALUES ('Shirley Bennett', 1, 3.88, X'beef', '{\"club\":\"baking\"}');"
+    );
+    assert_eq!(sl_stmts[2], "DELETE FROM \"students\" WHERE \"student_id\" = 2;");
+    for stmt in &sl_stmts {
+        assert!(!stmt.contains("::"), "sqlite SQL must not contain :: casts: {stmt}");
+    }
+
+    let sl_tx = staged
+        .build_transaction_sql_for_engine(DbEngine::Sqlite, "", "students", &cols)
+        .expect("sqlite tx sql");
+    assert!(sl_tx.starts_with("BEGIN;\n\n"));
+    assert!(sl_tx.ends_with("\n\nCOMMIT;\n"));
+
+    // All-default empty insert syntax differs between MySQL and SQLite
+    let default_cols = vec![cols[0].clone()];
+    let mut default_only = StagedChanges::new();
+    default_only.stage_insert_row(&default_cols);
+    assert_eq!(
+        default_only
+            .build_statements_for_engine(DbEngine::Mysql, "greendale", "students", &default_cols)
+            .expect("mysql empty insert"),
+        vec!["INSERT INTO `greendale`.`students` () VALUES ();"]
+    );
+    assert_eq!(
+        default_only
+            .build_statements_for_engine(DbEngine::Sqlite, "", "students", &default_cols)
+            .expect("sqlite empty insert"),
+        vec!["INSERT INTO \"students\" DEFAULT VALUES;"]
+    );
+
+    // FK WHERE helper respects dialect quoting and literal formatting
+    assert_eq!(
+        build_fk_where_clause_for_engine(
+            DbEngine::Mysql,
+            "full_name",
+            &CellValue::Text(r"Troy's \Fort".to_owned()),
+            &cols[1],
+        ),
+        Some("`full_name` = 'Troy''s \\\\Fort'".to_owned())
+    );
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, "enrolled", &CellValue::Bool(true), &cols[2]),
+        Some("\"enrolled\" = 1".to_owned())
+    );
+}
+
+#[test]
+fn export_rows_and_sql_inserts_support_mysql_and_sqlite() {
+    let cols = sample_multi_engine_columns();
+    let rows = vec![vec![
+        CellValue::Int(1),
+        CellValue::Text(r"Troy 'T-Bone' \Barnes".to_owned()),
+        CellValue::Bool(true),
+        CellValue::Numeric("3.45".to_owned()),
+        CellValue::Bytes(vec![0xca, 0xfe]),
+        CellValue::Json(r#"{"campus":"Greendale"}"#.to_owned()),
+    ]];
+
+    let mysql_inserts = export_sql_inserts_for_engine(DbEngine::Mysql, Some("greendale"), "students", &cols, &rows);
+    assert_eq!(
+        mysql_inserts,
+        "INSERT INTO `greendale`.`students` (`student_id`, `full_name`, `enrolled`, `gpa`, `badge`, `metadata`) VALUES (1, 'Troy ''T-Bone'' \\\\Barnes', TRUE, 3.45, X'cafe', '{\"campus\":\"Greendale\"}');\n"
+    );
+    assert_eq!(
+        export_rows_for_engine(
+            DbEngine::Mysql,
+            ExportFormat::SqlInsert,
+            Some("greendale"),
+            "students",
+            &cols,
+            &rows
+        ),
+        mysql_inserts
+    );
+
+    let sqlite_inserts = export_sql_inserts_for_engine(DbEngine::Sqlite, None, "students", &cols, &rows);
+    assert_eq!(
+        sqlite_inserts,
+        "INSERT INTO \"students\" (\"student_id\", \"full_name\", \"enrolled\", \"gpa\", \"badge\", \"metadata\") VALUES (1, 'Troy ''T-Bone'' \\Barnes', 1, 3.45, X'cafe', '{\"campus\":\"Greendale\"}');\n"
+    );
+    assert!(!sqlite_inserts.contains("::"));
+    assert_eq!(
+        export_rows_for_engine(DbEngine::Sqlite, ExportFormat::SqlInsert, None, "students", &cols, &rows),
+        sqlite_inserts
+    );
+
+    // CSV & JSON export remain identical across engines
+    assert_eq!(
+        export_rows_for_engine(DbEngine::Mysql, ExportFormat::Csv, None, "students", &cols, &rows),
+        export_csv(&cols, &rows)
+    );
+    assert_eq!(
+        export_rows_for_engine(DbEngine::Sqlite, ExportFormat::Json, None, "students", &cols, &rows),
+        export_json(&cols, &rows)
+    );
+}
+
+#[test]
+fn sql_splitter_and_cursor_respect_mysql_sqlite_and_pg_jsonb_operators() {
+    // MySQL: backtick identifiers, \' escapes inside single quotes, and # line comments
+    let mysql_sql = concat!(
+        "SELECT `study;room`, `weird``;col` FROM `greendale`;\n",
+        "SELECT 'Troy\\'s ; blanket fort' FROM students;\n",
+        "# Dean Pelton; reminder\n",
+        "SELECT 'Abed' FROM students;"
+    );
+    let my_stmts = split_statements_for_engine(mysql_sql, DbEngine::Mysql);
+    assert_eq!(my_stmts.len(), 3);
+    assert_eq!(my_stmts[0].sql, "SELECT `study;room`, `weird``;col` FROM `greendale`");
+    assert_eq!(my_stmts[1].sql, "SELECT 'Troy\\'s ; blanket fort' FROM students");
+    assert!(my_stmts[2].sql.ends_with("SELECT 'Abed' FROM students"));
+
+    let fort_pos = mysql_sql.find("blanket fort").expect("find blanket fort");
+    let at_fort = statement_at_cursor_for_engine(mysql_sql, fort_pos, fort_pos, DbEngine::Mysql)
+        .expect("statement inside escaped quote");
+    assert_eq!(at_fort.sql, "SELECT 'Troy\\'s ; blanket fort' FROM students");
+
+    let abed_pos = mysql_sql.find("'Abed'").expect("find Abed");
+    let at_abed = statement_at_cursor_for_engine(mysql_sql, abed_pos, abed_pos, DbEngine::Mysql)
+        .expect("statement after hash comment");
+    assert!(at_abed.sql.ends_with("SELECT 'Abed' FROM students"));
+    assert!(!has_executable_sql_for_engine("# just a mysql comment", DbEngine::Mysql));
+
+    // SQLite: backtick and double-quoted identifiers plus doubled single quotes
+    let sqlite_sql = "SELECT `my``;col`, \"other\"\";col\" FROM `study;table`;\nSELECT 'Annie''s ; pen';";
+    let sl_stmts = split_statements_for_engine(sqlite_sql, DbEngine::Sqlite);
+    assert_eq!(sl_stmts.len(), 2);
+    assert_eq!(sl_stmts[0].sql, "SELECT `my``;col`, \"other\"\";col\" FROM `study;table`");
+    assert_eq!(sl_stmts[1].sql, "SELECT 'Annie''s ; pen'");
+
+    let pen_pos = sqlite_sql.find("pen").expect("find pen");
+    let at_pen = statement_at_cursor_for_engine(sqlite_sql, pen_pos, pen_pos, DbEngine::Sqlite)
+        .expect("sqlite statement at cursor");
+    assert_eq!(at_pen.sql, "SELECT 'Annie''s ; pen'");
+
+    // PostgreSQL: `#>` and `#>>` JSONB operators MUST NOT be treated as line comments
+    let pg_sql = "SELECT profile #> '{campus,room}' FROM students;\nSELECT profile #>> '{campus,dean}' FROM students;";
+    let pg_stmts = split_statements_for_engine(pg_sql, DbEngine::Postgres);
+    assert_eq!(pg_stmts.len(), 2);
+    assert_eq!(pg_stmts[0].sql, "SELECT profile #> '{campus,room}' FROM students");
+    assert_eq!(pg_stmts[1].sql, "SELECT profile #>> '{campus,dean}' FROM students");
+    assert!(has_executable_sql_for_engine("#> '{campus}'", DbEngine::Postgres));
+
+    let jsonb_pos = pg_sql.find("#>").expect("find jsonb operator");
+    let at_jsonb = statement_at_cursor_for_engine(pg_sql, jsonb_pos, jsonb_pos, DbEngine::Postgres)
+        .expect("pg jsonb statement");
+    assert_eq!(at_jsonb.sql, "SELECT profile #> '{campus,room}' FROM students");
+}
+
+#[test]
+fn safety_guardrails_handle_mysql_and_sqlite_specific_statements() {
+    // MySQL-specific classification
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Mysql, "SHOW TABLES").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Mysql, "DESCRIBE students").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Mysql, "REPLACE INTO students (student_id, full_name) VALUES (1, 'Troy')")
+            .risk,
+        StatementRisk::WriteDml
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Mysql, "DELETE FROM students").risk,
+        StatementRisk::Destructive
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Mysql, "DELETE FROM students WHERE student_id = 1").risk,
+        StatementRisk::WriteDml
+    );
+
+    // SQLite-specific classification
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA table_info(students)").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA foreign_keys = OFF").risk,
+        StatementRisk::WriteDdl
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "EXPLAIN QUERY PLAN SELECT * FROM students").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "VACUUM").risk,
+        StatementRisk::WriteDdl
+    );
+
+    // Policy evaluation for MySQL
+    let mysql_reads = vec!["SHOW TABLES".to_owned(), "DESCRIBE students".to_owned()];
+    let mysql_replace = vec!["REPLACE INTO students VALUES (1, 'Abed')".to_owned()];
+    let mysql_delete_all = vec!["DELETE FROM students".to_owned()];
+
+    assert_eq!(
+        evaluate_sql_safety_for_engine(DbEngine::Mysql, SafetyPolicy::ReadOnly, EnvTag::Local, &mysql_reads),
+        SafetyDecision::Allow
+    );
+    assert!(matches!(
+        evaluate_sql_safety_for_engine(DbEngine::Mysql, SafetyPolicy::ReadOnly, EnvTag::Local, &mysql_replace),
+        SafetyDecision::Block { .. }
+    ));
+    assert!(matches!(
+        evaluate_sql_safety_for_engine(
+            DbEngine::Mysql,
+            SafetyPolicy::ConfirmWrites,
+            EnvTag::Development,
+            &mysql_delete_all
+        ),
+        SafetyDecision::RequireConfirmation {
+            is_destructive: true,
+            ..
+        }
+    ));
+
+    // Policy evaluation for SQLite
+    let sqlite_reads = vec![
+        "PRAGMA table_info(students)".to_owned(),
+        "EXPLAIN QUERY PLAN SELECT * FROM students".to_owned(),
+    ];
+    let sqlite_ddl = vec!["PRAGMA foreign_keys = OFF".to_owned(), "VACUUM".to_owned()];
+
+    assert_eq!(
+        evaluate_sql_safety_for_engine(DbEngine::Sqlite, SafetyPolicy::ReadOnly, EnvTag::Local, &sqlite_reads),
+        SafetyDecision::Allow
+    );
+    assert!(matches!(
+        evaluate_sql_safety_for_engine(DbEngine::Sqlite, SafetyPolicy::ReadOnly, EnvTag::Local, &sqlite_ddl),
+        SafetyDecision::Block { .. }
+    ));
+    assert!(matches!(
+        evaluate_sql_safety_for_engine(
+            DbEngine::Sqlite,
+            SafetyPolicy::ConfirmWrites,
+            EnvTag::Local,
+            &sqlite_ddl
+        ),
+        SafetyDecision::RequireConfirmation {
+            is_destructive: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn explain_parsers_handle_mysql_json_analyze_tree_sqlite_plan_and_result_extraction() {
+    assert_eq!(
+        build_explain_sql_for_engine(DbEngine::Mysql, "SELECT * FROM students;", false),
+        "EXPLAIN FORMAT=JSON SELECT * FROM students"
+    );
+    assert_eq!(
+        build_explain_sql_for_engine(DbEngine::Mysql, "SELECT * FROM students;", true),
+        "EXPLAIN ANALYZE SELECT * FROM students"
+    );
+    assert_eq!(
+        build_explain_sql_for_engine(DbEngine::Sqlite, "SELECT * FROM students;", false),
+        "EXPLAIN QUERY PLAN SELECT * FROM students"
+    );
+    assert_eq!(
+        build_explain_sql_for_engine(DbEngine::Sqlite, "SELECT * FROM students;", true),
+        "EXPLAIN QUERY PLAN SELECT * FROM students"
+    );
+
+    // 1. MySQL EXPLAIN FORMAT=JSON
+    let mysql_json = r#"{
+      "query_block": {
+        "select_id": 1,
+        "cost_info": { "query_cost": "12.40" },
+        "ordering_operation": {
+          "using_filesort": true,
+          "nested_loop": [
+            {
+              "table": {
+                "table_name": "students",
+                "access_type": "ALL",
+                "rows_examined_per_scan": 120,
+                "cost_info": { "prefix_cost": "4.20" },
+                "attached_condition": "(students.gpa >= 3.0)"
+              }
+            },
+            {
+              "table": {
+                "table_name": "study_groups",
+                "access_type": "eq_ref",
+                "key": "PRIMARY",
+                "ref": ["greendale.students.group_id"],
+                "rows_examined_per_scan": 1,
+                "cost_info": { "prefix_cost": "12.40" }
+              }
+            }
+          ]
+        }
+      }
+    }"#;
+    let my_plan = ExplainPlan::parse_mysql_json("SELECT * FROM students".to_owned(), mysql_json)
+        .expect("parse mysql json plan");
+    assert!(!my_plan.analyzed);
+    assert_eq!(my_plan.root.node_type, "Sort / Ordering (filesort)");
+    assert!((my_plan.total_cost() - 12.40).abs() < 0.001);
+    assert_eq!(my_plan.node_count(), 4);
+    let nested = &my_plan.root.children[0];
+    assert_eq!(nested.node_type, "Nested Loop");
+    assert_eq!(nested.children[0].node_type, "Table Scan (ALL)");
+    assert_eq!(nested.children[0].relation_name.as_deref(), Some("students"));
+    assert_eq!(nested.children[0].filter.as_deref(), Some("(students.gpa >= 3.0)"));
+    assert_eq!(nested.children[1].node_type, "Unique Index Lookup (eq_ref)");
+    assert_eq!(nested.children[1].index_name.as_deref(), Some("PRIMARY"));
+
+    assert!(matches!(
+        ExplainPlan::parse_mysql_json("SELECT 1".to_owned(), "{bad json"),
+        Err(ExplainError::InvalidJson(_))
+    ));
+    assert!(matches!(
+        ExplainPlan::parse_mysql_json("SELECT 1".to_owned(), r#"{"unrelated": 1}"#),
+        Err(ExplainError::MissingPlanRoot)
+    ));
+
+    // 2. MySQL EXPLAIN ANALYZE tree
+    let analyze_tree = "\
+-> Nested loop inner join  (cost=4.80 rows=8) (actual time=0.110..0.420 rows=8 loops=1)
+    -> Table scan on s  (cost=1.20 rows=8) (actual time=0.040..0.090 rows=8 loops=1)
+    -> Filter: (g.active = 1)  (cost=0.45 rows=1) (actual time=0.015..0.030 rows=1 loops=8)
+        -> Single-row index lookup on g using PRIMARY (group_id=s.group_id)  (cost=0.35 rows=1) (actual time=0.010..0.020 rows=1 loops=8)
+    -> Table scan on archived_notes  (cost=0.25 rows=1) (never executed)";
+    let analyzed = ExplainPlan::parse_mysql_analyze_tree("SELECT ...".to_owned(), analyze_tree)
+        .expect("parse mysql analyze tree");
+    assert!(analyzed.analyzed);
+    assert_eq!(analyzed.node_count(), 5);
+    assert!((analyzed.total_runtime_ms().expect("runtime") - 0.420).abs() < 0.001);
+    assert_eq!(analyzed.root.children[1].node_type, "Filter");
+    assert_eq!(analyzed.root.children[1].filter.as_deref(), Some("(g.active = 1)"));
+    assert_eq!(analyzed.root.children[1].children[0].index_name.as_deref(), Some("PRIMARY"));
+    assert_eq!(analyzed.root.children[2].actual_rows, Some(0));
+    assert_eq!(analyzed.root.children[2].actual_loops, Some(0.0));
+    assert!(analyzed.root.exclusive_time_ms().expect("excl") > 0.0);
+
+    assert!(matches!(
+        ExplainPlan::parse_mysql_analyze_tree("SELECT 1".to_owned(), "no tree arrows here"),
+        Err(ExplainError::MissingPlanRoot)
+    ));
+
+    // 3. SQLite EXPLAIN QUERY PLAN (SCAN, SEARCH ... USING INDEX ..., hierarchy, empty error)
+    let sqlite_rows = vec![
+        (2, 0, "SCAN students".to_owned()),
+        (5, 2, "SEARCH study_groups USING INDEX idx_group_name (name=?)".to_owned()),
+        (8, 0, "USE TEMP B-TREE FOR ORDER BY".to_owned()),
+    ];
+    let sl_plan = ExplainPlan::parse_sqlite_query_plan(
+        "SELECT * FROM students JOIN study_groups USING (group_id) ORDER BY students.full_name".to_owned(),
+        &sqlite_rows,
+    )
+    .expect("parse sqlite plan");
+    assert!(!sl_plan.analyzed);
+    assert_eq!(sl_plan.root.node_type, "QUERY PLAN");
+    assert_eq!(sl_plan.root.children.len(), 2);
+    assert_eq!(sl_plan.root.children[0].node_type, "SCAN");
+    assert_eq!(sl_plan.root.children[0].relation_name.as_deref(), Some("students"));
+    assert_eq!(sl_plan.root.children[0].index_name, None);
+    assert_eq!(sl_plan.root.children[0].children[0].node_type, "SEARCH");
+    assert_eq!(
+        sl_plan.root.children[0].children[0].relation_name.as_deref(),
+        Some("study_groups")
+    );
+    assert_eq!(
+        sl_plan.root.children[0].children[0].index_name.as_deref(),
+        Some("idx_group_name")
+    );
+    assert_eq!(
+        sl_plan.root.children[0].children[0].index_cond.as_deref(),
+        Some("(name=?)")
+    );
+    assert_eq!(sl_plan.root.children[1].node_type, "USE TEMP B-TREE");
+
+    assert!(matches!(
+        ExplainPlan::parse_sqlite_query_plan("SELECT 1".to_owned(), &[]),
+        Err(ExplainError::EmptyPlan)
+    ));
+
+    // 4. ExplainPlan::try_extract_from_result for MySQL JSON, MySQL Analyze, SQLite, and non-explain
+    let text_col = |name: &str| ColumnMeta {
+        name: name.to_owned(),
+        data_type: "text".to_owned(),
+        udt_name: "text".to_owned(),
+        nullable: true,
+        default_expr: None,
+        is_primary_key: false,
+        is_unique: false,
+        comment: None,
+        foreign_key: None,
+    };
+
+    let mysql_json_res = QueryStatementResult {
+        sql: "EXPLAIN FORMAT=JSON SELECT * FROM students".to_owned(),
+        columns: vec![text_col("EXPLAIN")],
+        rows: vec![vec![CellValue::Text(mysql_json.to_owned())]],
+        rows_affected: None,
+        truncated: false,
+        total_rows_seen: 1,
+        elapsed_ms: 2,
+        error: None,
+    };
+    let extracted_my_json = ExplainPlan::try_extract_from_result(&mysql_json_res).expect("extract mysql json");
+    assert_eq!(extracted_my_json.root.node_type, "Sort / Ordering (filesort)");
+
+    let mysql_analyze_res = QueryStatementResult {
+        sql: "EXPLAIN ANALYZE SELECT * FROM students".to_owned(),
+        columns: vec![text_col("EXPLAIN")],
+        rows: vec![vec![CellValue::Text(analyze_tree.to_owned())]],
+        rows_affected: None,
+        truncated: false,
+        total_rows_seen: 1,
+        elapsed_ms: 3,
+        error: None,
+    };
+    let extracted_my_tree = ExplainPlan::try_extract_from_result(&mysql_analyze_res).expect("extract mysql analyze");
+    assert!(extracted_my_tree.analyzed);
+    assert_eq!(extracted_my_tree.node_count(), 5);
+
+    let sqlite_res = QueryStatementResult {
+        sql: "EXPLAIN QUERY PLAN SELECT * FROM students".to_owned(),
+        columns: vec![
+            text_col("id"),
+            text_col("parent"),
+            text_col("notused"),
+            text_col("detail"),
+        ],
+        rows: vec![vec![
+            CellValue::Int(2),
+            CellValue::Int(0),
+            CellValue::Int(0),
+            CellValue::Text("SEARCH students USING INDEX idx_gpa (gpa>?)".to_owned()),
+        ]],
+        rows_affected: None,
+        truncated: false,
+        total_rows_seen: 1,
+        elapsed_ms: 1,
+        error: None,
+    };
+    let extracted_sl = ExplainPlan::try_extract_from_result(&sqlite_res).expect("extract sqlite eqp");
+    assert_eq!(extracted_sl.root.node_type, "SEARCH");
+    assert_eq!(extracted_sl.root.relation_name.as_deref(), Some("students"));
+    assert_eq!(extracted_sl.root.index_name.as_deref(), Some("idx_gpa"));
+
+    let normal_res = QueryStatementResult {
+        sql: "SELECT full_name FROM students".to_owned(),
+        columns: vec![text_col("full_name")],
+        rows: vec![vec![CellValue::Text("Troy Barnes".to_owned())]],
+        rows_affected: None,
+        truncated: false,
+        total_rows_seen: 1,
+        elapsed_ms: 1,
+        error: None,
+    };
+    assert!(ExplainPlan::try_extract_from_result(&normal_res).is_none());
 }

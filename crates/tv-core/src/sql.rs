@@ -1,3 +1,5 @@
+use crate::connection::DbEngine;
+
 /// A single non-empty SQL statement slice with byte offsets into its source editor buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlStatement {
@@ -11,6 +13,7 @@ enum ScanState {
     Normal,
     SingleQuote,
     DoubleQuote,
+    BacktickQuote,
     LineComment,
     BlockComment(usize),
 }
@@ -18,6 +21,11 @@ enum ScanState {
 /// Splits PostgreSQL SQL text on top-level `;` while respecting quotes, `--` comments,
 /// nested `/* ... */` comments, and `$tag$...$tag$` dollar-quoted blocks.
 pub fn split_statements(input: &str) -> Vec<SqlStatement> {
+    split_statements_for_engine(input, DbEngine::Postgres)
+}
+
+/// Splits SQL text on top-level `;` using dialect-specific quoting and comment rules.
+pub fn split_statements_for_engine(input: &str, engine: DbEngine) -> Vec<SqlStatement> {
     let bytes = input.as_bytes();
     let len = bytes.len();
     let mut out = Vec::new();
@@ -25,6 +33,11 @@ pub fn split_statements(input: &str) -> Vec<SqlStatement> {
     let mut i = 0usize;
     let mut state = ScanState::Normal;
     let mut dollar_tag: Option<String> = None;
+
+    let allow_backtick = matches!(engine, DbEngine::Mysql | DbEngine::Sqlite);
+    let allow_hash_comment = engine == DbEngine::Mysql;
+    let allow_backslash_escape = engine == DbEngine::Mysql;
+    let allow_dollar_quote = engine == DbEngine::Postgres;
 
     while i < len {
         if let Some(ref tag) = dollar_tag {
@@ -45,19 +58,26 @@ pub fn split_statements(input: &str) -> Vec<SqlStatement> {
                 } else if bytes[i] == b'"' {
                     state = ScanState::DoubleQuote;
                     i += 1;
+                } else if allow_backtick && bytes[i] == b'`' {
+                    state = ScanState::BacktickQuote;
+                    i += 1;
                 } else if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
                     state = ScanState::LineComment;
                     i += 2;
+                } else if allow_hash_comment && bytes[i] == b'#' {
+                    state = ScanState::LineComment;
+                    i += 1;
                 } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
                     state = ScanState::BlockComment(1);
                     i += 2;
-                } else if bytes[i] == b'$'
+                } else if allow_dollar_quote
+                    && bytes[i] == b'$'
                     && let Some(tag) = parse_dollar_tag(&input[i..])
                 {
                     i += tag.len();
                     dollar_tag = Some(tag.to_owned());
                 } else if bytes[i] == b';' {
-                    push_trimmed_statement(input, stmt_start, i, &mut out);
+                    push_trimmed_statement(input, stmt_start, i, engine, &mut out);
                     i += 1;
                     stmt_start = i;
                 } else {
@@ -65,7 +85,9 @@ pub fn split_statements(input: &str) -> Vec<SqlStatement> {
                 }
             }
             ScanState::SingleQuote => {
-                if bytes[i] == b'\'' {
+                if allow_backslash_escape && bytes[i] == b'\\' {
+                    i += if i + 1 < len { 2 } else { 1 };
+                } else if bytes[i] == b'\'' {
                     if i + 1 < len && bytes[i + 1] == b'\'' {
                         i += 2;
                     } else {
@@ -79,6 +101,18 @@ pub fn split_statements(input: &str) -> Vec<SqlStatement> {
             ScanState::DoubleQuote => {
                 if bytes[i] == b'"' {
                     if i + 1 < len && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        state = ScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += char_len_at(input, i);
+                }
+            }
+            ScanState::BacktickQuote => {
+                if bytes[i] == b'`' {
+                    if i + 1 < len && bytes[i + 1] == b'`' {
                         i += 2;
                     } else {
                         state = ScanState::Normal;
@@ -113,7 +147,7 @@ pub fn split_statements(input: &str) -> Vec<SqlStatement> {
     }
 
     if stmt_start < len {
-        push_trimmed_statement(input, stmt_start, len, &mut out);
+        push_trimmed_statement(input, stmt_start, len, engine, &mut out);
     }
 
     out
@@ -121,13 +155,23 @@ pub fn split_statements(input: &str) -> Vec<SqlStatement> {
 
 /// Returns the active selection if non-empty, or the PostgreSQL statement containing the caret.
 pub fn statement_at_cursor(input: &str, anchor: usize, focus: usize) -> Option<SqlStatement> {
+    statement_at_cursor_for_engine(input, anchor, focus, DbEngine::Postgres)
+}
+
+/// Returns the active selection if non-empty, or the dialect-aware statement containing the caret.
+pub fn statement_at_cursor_for_engine(
+    input: &str,
+    anchor: usize,
+    focus: usize,
+    engine: DbEngine,
+) -> Option<SqlStatement> {
     let a = clamp_char_boundary(input, anchor);
     let b = clamp_char_boundary(input, focus);
     if a != b {
         let lo = a.min(b);
         let hi = a.max(b);
         let (start_byte, end_byte, trimmed) = trim_span(input, lo, hi);
-        if has_executable_sql(trimmed) {
+        if has_executable_sql_for_engine(trimmed, engine) {
             return Some(SqlStatement {
                 sql: trimmed.to_owned(),
                 start_byte,
@@ -137,7 +181,7 @@ pub fn statement_at_cursor(input: &str, anchor: usize, focus: usize) -> Option<S
         return None;
     }
 
-    let stmts = split_statements(input);
+    let stmts = split_statements_for_engine(input, engine);
     if stmts.is_empty() {
         return None;
     }
@@ -231,6 +275,22 @@ pub fn format_sql(input: &str) -> String {
             while i < len {
                 if bytes[i] == b'"' {
                     if i + 1 < len && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += char_len_at(trimmed, i);
+                }
+            }
+            toks.push(FormatTok::Raw(trimmed[start..i].to_owned()));
+        } else if ch == '`' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'`' {
+                    if i + 1 < len && bytes[i + 1] == b'`' {
                         i += 2;
                     } else {
                         i += 1;
@@ -450,14 +510,14 @@ impl WordInspect for FormatTok {
 
 fn is_sql_keyword(word: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "ALL", "ALTER", "ANALYZE", "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "CASE", "CAST", "COALESCE",
-        "COMMIT", "CONFLICT", "CONSTRAINT", "CREATE", "CROSS", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DO",
-        "DROP", "ELSE", "END", "EXCEPT", "EXISTS", "EXPLAIN", "FALSE", "FETCH", "FIRST", "FOREIGN", "FROM",
-        "FULL", "GROUP", "HAVING", "ILIKE", "IN", "INDEX", "INNER", "INSERT", "INTERSECT", "INTO", "IS",
-        "JOIN", "KEY", "LAST", "LEFT", "LIKE", "LIMIT", "MATERIALIZED", "NOT", "NULL", "NULLS", "OFFSET",
-        "ON", "ONLY", "OR", "ORDER", "OUTER", "OVER", "PARTITION", "PRIMARY", "REFERENCES", "RETURNING",
-        "RIGHT", "ROLLBACK", "SELECT", "SET", "SHOW", "TABLE", "THEN", "TRUE", "UNION", "UNIQUE", "UPDATE",
-        "USING", "VALUES", "VIEW", "WHEN", "WHERE", "WITH",
+        "ALL", "ALTER", "ANALYZE", "AND", "AS", "ASC", "ATTACH", "BEGIN", "BETWEEN", "BY", "CASE", "CAST",
+        "COALESCE", "COMMIT", "CONFLICT", "CONSTRAINT", "CREATE", "CROSS", "DEFAULT", "DELETE", "DESC",
+        "DESCRIBE", "DETACH", "DISTINCT", "DO", "DROP", "ELSE", "END", "EXCEPT", "EXISTS", "EXPLAIN", "FALSE",
+        "FETCH", "FIRST", "FOREIGN", "FROM", "FULL", "GROUP", "HAVING", "ILIKE", "IN", "INDEX", "INNER",
+        "INSERT", "INTERSECT", "INTO", "IS", "JOIN", "KEY", "LAST", "LEFT", "LIKE", "LIMIT", "MATERIALIZED",
+        "NOT", "NULL", "NULLS", "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER", "OVER", "PARTITION", "PRAGMA",
+        "PRIMARY", "REFERENCES", "REPLACE", "RETURNING", "RIGHT", "ROLLBACK", "SELECT", "SET", "SHOW", "TABLE",
+        "THEN", "TRUE", "UNION", "UNIQUE", "UPDATE", "USE", "USING", "VALUES", "VIEW", "WHEN", "WHERE", "WITH",
     ];
     KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(word))
 }
@@ -475,9 +535,15 @@ fn parse_dollar_tag(slice: &str) -> Option<&str> {
     None
 }
 
-fn push_trimmed_statement(input: &str, raw_start: usize, raw_end: usize, out: &mut Vec<SqlStatement>) {
+fn push_trimmed_statement(
+    input: &str,
+    raw_start: usize,
+    raw_end: usize,
+    engine: DbEngine,
+    out: &mut Vec<SqlStatement>,
+) {
     let (start_byte, end_byte, trimmed) = trim_span(input, raw_start, raw_end);
-    if has_executable_sql(trimmed) {
+    if has_executable_sql_for_engine(trimmed, engine) {
         out.push(SqlStatement {
             sql: trimmed.to_owned(),
             start_byte,
@@ -506,8 +572,14 @@ fn trim_span(input: &str, mut start: usize, mut end: usize) -> (usize, usize, &s
 
 /// Returns `true` if `sql` contains at least one non-whitespace token outside comments.
 pub fn has_executable_sql(sql: &str) -> bool {
+    has_executable_sql_for_engine(sql, DbEngine::Postgres)
+}
+
+/// Returns `true` if `sql` contains at least one non-whitespace token outside dialect comments.
+pub fn has_executable_sql_for_engine(sql: &str, engine: DbEngine) -> bool {
     let bytes = sql.as_bytes();
     let len = bytes.len();
+    let allow_hash = engine == DbEngine::Mysql;
     let mut i = 0usize;
     while i < len {
         let ch = sql[i..].chars().next().unwrap_or('\0');
@@ -515,6 +587,11 @@ pub fn has_executable_sql(sql: &str) -> bool {
             i += ch.len_utf8();
         } else if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
             i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += char_len_at(sql, i);
+            }
+        } else if allow_hash && bytes[i] == b'#' {
+            i += 1;
             while i < len && bytes[i] != b'\n' {
                 i += char_len_at(sql, i);
             }
@@ -549,4 +626,32 @@ fn clamp_char_boundary(s: &str, idx: usize) -> usize {
         pos -= 1;
     }
     pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitter_handles_mysql_and_sqlite_dialects() {
+        let mysql_sql = "SELECT 'a\\';b', `col;1` FROM `tbl`; # hash ; comment\nSELECT 2;";
+        let stmts = split_statements_for_engine(mysql_sql, DbEngine::Mysql);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].sql, "SELECT 'a\\';b', `col;1` FROM `tbl`");
+        assert!(stmts[1].sql.ends_with("SELECT 2"));
+
+        // Postgres must NOT treat \' as an escape inside single quotes or # as a comment.
+        let pg_sql = "SELECT 'a\\' ; SELECT 2;";
+        let pg_stmts = split_statements_for_engine(pg_sql, DbEngine::Postgres);
+        assert_eq!(pg_stmts.len(), 2);
+
+        let sqlite_sql = "PRAGMA table_info(`my``tbl`); SELECT 1;";
+        let sl_stmts = split_statements_for_engine(sqlite_sql, DbEngine::Sqlite);
+        assert_eq!(sl_stmts.len(), 2);
+
+        let formatted = format_sql("pragma table_info(`students`); replace into `students` values (1);");
+        assert!(formatted.contains("PRAGMA"));
+        assert!(formatted.contains("`students`"));
+        assert!(formatted.contains("REPLACE"));
+    }
 }

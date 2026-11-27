@@ -6,7 +6,10 @@ use tv_app::platform::{Action, dispatch_action};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
 use tv_app::state::{AppState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
 use tv_app::views;
-use tv_core::{AppearancePreference, EnvTag, ExportFormat, SafetyPolicy, SettingsStore};
+use tv_core::{
+    AppearancePreference, ConnectionProfile, DbEngine, EnvTag, ExplainPlan, ExportFormat, SafetyPolicy,
+    SettingsStore,
+};
 use tv_update::{UpdateFailure, UpdateStatus};
 
 fn sample_runtime(dark: bool) -> Runtime<AppState> {
@@ -1512,4 +1515,232 @@ fn status_notice_auto_dismisses_unless_hovered_or_clicked() {
     rt.frame(0.1);
     rt.frame(4.5);
     assert!(rt.state.status_notice.is_none(), "replacement notice must auto-dismiss");
+}
+
+#[test]
+fn connection_form_switches_engines_updates_defaults_and_swaps_sqlite_ui() {
+    let mut rt = sample_runtime(true);
+    rt.frame(0.0);
+
+    // Open New Connection form via Cmd+N.
+    rt.key(KeyEvent {
+        key: Key::Command('n'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    assert!(rt.find("form-engine").is_some());
+    assert!(has_text(&rt, "New PostgreSQL Connection"));
+    assert!(rt.find("form-sqlite-path").is_none());
+
+    // Switch to MySQL (segment1) -> default port becomes 3306 and default user becomes root.
+    let (mx, my) = rt.find("form-engine/segment1").expect("MySQL engine segment");
+    rt.pointer_down(mx, my);
+    rt.pointer_up(mx, my);
+    rt.frame(0.1);
+    assert!(has_text(&rt, "New MySQL Connection"));
+    match &rt.state.overlay {
+        OverlayState::ConnectionForm(form) => {
+            assert_eq!(form.engine, DbEngine::Mysql);
+            assert_eq!(form.port.text, "3306");
+            assert_eq!(form.user.text, "root");
+        }
+        other => panic!("expected ConnectionForm, got {other:?}"),
+    }
+
+    // Switch to SQLite (segment2) -> shows file path input + Browse button and hides network fields.
+    let (sx, sy) = rt.find("form-engine/segment2").expect("SQLite engine segment");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.1);
+    assert!(has_text(&rt, "New SQLite Connection"));
+    assert!(rt.find("form-sqlite-path").is_some());
+    assert!(rt.find("form-sqlite-browse").is_some());
+    assert!(rt.find("form-ssl-mode").is_none());
+
+    // Switch back to PostgreSQL (segment0) -> default port/user restored to 5432/postgres.
+    let (px, py) = rt.find("form-engine/segment0").expect("PostgreSQL engine segment");
+    rt.pointer_down(px, py);
+    rt.pointer_up(px, py);
+    rt.frame(0.1);
+    assert!(has_text(&rt, "New PostgreSQL Connection"));
+    assert!(rt.find("form-sqlite-path").is_none());
+    match &rt.state.overlay {
+        OverlayState::ConnectionForm(form) => {
+            assert_eq!(form.engine, DbEngine::Postgres);
+            assert_eq!(form.port.text, "5432");
+            assert_eq!(form.user.text, "postgres");
+        }
+        other => panic!("expected ConnectionForm, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_url_modal_supports_mysql_and_sqlite_urls() {
+    let mut rt = sample_runtime(true);
+    rt.frame(0.0);
+
+    // 1. Import mysql:// URL.
+    rt.key(KeyEvent {
+        key: Key::Command('i'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    assert!(has_text(&rt, "Import Connection URL"));
+    assert!(rt.find("import-url-input").is_some());
+
+    rt.key(KeyEvent::from(Key::Text(
+        "mysql://abed:secret@study-room.greendale.edu:3307/study_db".to_owned(),
+    )));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    match &rt.state.overlay {
+        OverlayState::ConnectionForm(form) => {
+            assert_eq!(form.engine, DbEngine::Mysql);
+            assert_eq!(form.host.text, "study-room.greendale.edu");
+            assert_eq!(form.port.text, "3307");
+            assert_eq!(form.user.text, "abed");
+            assert_eq!(form.database.text, "study_db");
+            assert_eq!(form.password.text, "secret");
+        }
+        other => panic!("expected ConnectionForm after MySQL import, got {other:?}"),
+    }
+    assert!(has_text(&rt, "New MySQL Connection"));
+
+    // 2. Dismiss and import sqlite:// URL.
+    rt.key(KeyEvent::from(Key::Escape));
+    rt.frame(0.1);
+    rt.key(KeyEvent {
+        key: Key::Command('i'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    rt.key(KeyEvent::from(Key::Text("sqlite:///tmp/greendale_notes.db".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    match &rt.state.overlay {
+        OverlayState::ConnectionForm(form) => {
+            assert_eq!(form.engine, DbEngine::Sqlite);
+            assert_eq!(form.name.text, "greendale_notes");
+            assert_eq!(form.file_path.text, "/tmp/greendale_notes.db");
+        }
+        other => panic!("expected ConnectionForm after SQLite import, got {other:?}"),
+    }
+    assert!(has_text(&rt, "New SQLite Connection"));
+    assert!(rt.find("form-sqlite-path").is_some());
+}
+
+#[test]
+fn launcher_displays_engine_badges_and_sqlite_subtitles_for_mixed_connections() {
+    let mut rt = sample_runtime(true);
+    let mysql_prof = ConnectionProfile::new_mysql("greendale_mysql", "127.0.0.1", "troy_barnes");
+    let sqlite_prof = ConnectionProfile::new_sqlite("greendale_sqlite", "/tmp/greendale.sqlite3");
+    let mysql_id = mysql_prof.id;
+    let sqlite_id = sqlite_prof.id;
+    rt.update(|s, _| {
+        s.connections.push(mysql_prof);
+        s.connections.push(sqlite_prof);
+    });
+    rt.frame(0.1);
+
+    assert!(has_text(&rt, "PG"));
+    assert!(has_text(&rt, "MY"));
+    assert!(has_text(&rt, "SL"));
+    assert!(rt.find(&format!("launcher/conn/{mysql_id}/emblem")).is_some());
+    assert!(rt.find(&format!("launcher/conn/{sqlite_id}/emblem")).is_some());
+    assert!(has_text(&rt, "/tmp/greendale.sqlite3"));
+
+    // Search matches SQLite file path and MySQL engine label.
+    rt.update(|s, _| s.launcher_search = rune::TextEdit::new("greendale.sqlite3"));
+    rt.frame(0.0);
+    assert_eq!(rt.state.filtered_connections().len(), 1);
+    assert_eq!(rt.state.filtered_connections()[0].id, sqlite_id);
+
+    rt.update(|s, _| s.launcher_search = rune::TextEdit::new("mysql"));
+    rt.frame(0.0);
+    assert_eq!(rt.state.filtered_connections().len(), 1);
+    assert_eq!(rt.state.filtered_connections()[0].id, mysql_id);
+}
+
+#[test]
+fn sqlite_workspace_hides_schema_dropdown_and_disables_multi_db_switching() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sqlite-dark");
+    rt.frame(0.2);
+
+    // Schema dropdown is hidden when SQLite has a single `main` schema.
+    assert!(rt.find("sidebar-schema").is_none());
+    assert!(has_text(&rt, "2 objects"));
+
+    // Toolbar Open database button is disabled for SQLite and clicking it / Cmd+K does not open DB picker.
+    let open_db_btn = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("toolbar-open-db"))
+        .expect("toolbar-open-db button");
+    assert!(!open_db_btn.focusable);
+    let (ox, oy) = rt.find("toolbar-open-db").expect("toolbar-open-db coords");
+    rt.pointer_down(ox, oy);
+    rt.pointer_up(ox, oy);
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+
+    rt.key(KeyEvent {
+        key: Key::Command('k'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+
+    // Closing the table tab lands on stage-ready without "Switch Database (⌘K)" CTA.
+    rt.key(KeyEvent {
+        key: Key::Command('w'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    assert!(rt.find("stage-ready").is_some());
+    assert!(!has_text(&rt, "Switch Database (⌘K)"));
+
+    // Opening a query tab with a SQLite EXPLAIN plan hides "Run ANALYZE" button.
+    rt.key(KeyEvent {
+        key: Key::Command('t'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    rt.update(|s, _| {
+        let plan = ExplainPlan::parse_sqlite_query_plan(
+            "SELECT * FROM students".to_owned(),
+            &[(2, 0, "SCAN students".to_owned())],
+        )
+        .expect("sqlite plan");
+        if let Some(q) = s.active_session_mut().and_then(|sess| sess.active_query_tab_mut()) {
+            q.explain_plan = Some(plan);
+            q.show_explain = true;
+        }
+    });
+    rt.frame(0.1);
+    assert!(rt.find("explain-pane-root").is_some());
+    assert!(rt.find("explain-copy-btn").is_some());
+    assert!(rt.find("explain-analyze-btn").is_none());
 }

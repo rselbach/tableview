@@ -1,10 +1,10 @@
 use sqlparser::ast::{
     Query, Set, SetExpr, Statement, TransactionAccessMode, TransactionMode, UtilityOption, Value,
 };
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
-use crate::connection::{EnvTag, SafetyPolicy};
+use crate::connection::{DbEngine, EnvTag, SafetyPolicy};
 
 /// Risk classification for a parsed (or fail-closed unparsed) SQL statement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -65,6 +65,11 @@ pub fn evaluate_staged_commit_safety(policy: SafetyPolicy) -> Result<(), String>
 
 /// Inspects a single PostgreSQL statement string via `sqlparser` (`PostgreSqlDialect`).
 pub fn inspect_statement(sql: &str) -> StatementInspection {
+    inspect_statement_for_engine(DbEngine::Postgres, sql)
+}
+
+/// Inspects a single SQL statement string using the dialect matching `engine`.
+pub fn inspect_statement_for_engine(engine: DbEngine, sql: &str) -> StatementInspection {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         return StatementInspection {
@@ -75,13 +80,18 @@ pub fn inspect_statement(sql: &str) -> StatementInspection {
         };
     }
 
-    let dialect = PostgreSqlDialect {};
-    match Parser::parse_sql(&dialect, trimmed) {
+    let parsed = match engine {
+        DbEngine::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, trimmed),
+        DbEngine::Mysql => Parser::parse_sql(&MySqlDialect {}, trimmed),
+        DbEngine::Sqlite => Parser::parse_sql(&SQLiteDialect {}, trimmed),
+    };
+
+    match parsed {
         Ok(stmts) if !stmts.is_empty() => {
             let mut max_risk = StatementRisk::ReadOnly;
             let mut best_summary = "SELECT".to_owned();
             for stmt in &stmts {
-                let (risk, summary) = classify_ast_statement(stmt);
+                let (risk, summary) = classify_ast_statement(engine, stmt, trimmed);
                 if risk > max_risk || max_risk == StatementRisk::ReadOnly {
                     max_risk = risk;
                     best_summary = summary;
@@ -100,37 +110,150 @@ pub fn inspect_statement(sql: &str) -> StatementInspection {
             summary: "Empty statement".to_owned(),
             parsed: true,
         },
-        Err(_) => {
-            let upper = strip_leading_sql_comments(trimmed).to_ascii_uppercase();
-            if upper.starts_with("SHOW ") || upper == "SHOW" || upper.starts_with("VALUES ") {
-                StatementInspection {
+        Err(_) => classify_unparsed_statement(engine, trimmed),
+    }
+}
+
+fn classify_unparsed_statement(engine: DbEngine, trimmed: &str) -> StatementInspection {
+    let stripped = strip_leading_sql_comments(trimmed, engine);
+    let upper = stripped.to_ascii_uppercase();
+
+    if starts_with_keyword(&upper, "SHOW") || starts_with_keyword(&upper, "VALUES") {
+        return StatementInspection {
+            sql: trimmed.to_owned(),
+            risk: StatementRisk::ReadOnly,
+            summary: "SHOW / VALUES".to_owned(),
+            parsed: false,
+        };
+    }
+
+    match engine {
+        DbEngine::Mysql => {
+            if starts_with_keyword(&upper, "DESCRIBE") || starts_with_keyword(&upper, "DESC") {
+                return StatementInspection {
                     sql: trimmed.to_owned(),
                     risk: StatementRisk::ReadOnly,
-                    summary: "SHOW / VALUES".to_owned(),
+                    summary: "DESCRIBE".to_owned(),
                     parsed: false,
-                }
-            } else {
-                // Fail-closed on unparseable PostgreSQL-specific statements so guardrails cannot be bypassed.
-                StatementInspection {
+                };
+            }
+            if starts_with_keyword(&upper, "USE") {
+                return StatementInspection {
+                    sql: trimmed.to_owned(),
+                    risk: StatementRisk::ReadOnly,
+                    summary: "USE".to_owned(),
+                    parsed: false,
+                };
+            }
+            if starts_with_keyword(&upper, "REPLACE") {
+                return StatementInspection {
                     sql: trimmed.to_owned(),
                     risk: StatementRisk::WriteDml,
-                    summary: "Unparsed SQL statement (treated as write for safety)".to_owned(),
+                    summary: "REPLACE".to_owned(),
                     parsed: false,
-                }
+                };
             }
         }
+        DbEngine::Sqlite => {
+            if starts_with_keyword(&upper, "PRAGMA") {
+                if pragma_has_assignment(stripped) {
+                    return StatementInspection {
+                        sql: trimmed.to_owned(),
+                        risk: StatementRisk::WriteDdl,
+                        summary: "PRAGMA".to_owned(),
+                        parsed: false,
+                    };
+                }
+                return StatementInspection {
+                    sql: trimmed.to_owned(),
+                    risk: StatementRisk::ReadOnly,
+                    summary: "PRAGMA".to_owned(),
+                    parsed: false,
+                };
+            }
+            if upper.starts_with("EXPLAIN QUERY PLAN")
+                && upper["EXPLAIN QUERY PLAN".len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+            {
+                return StatementInspection {
+                    sql: trimmed.to_owned(),
+                    risk: StatementRisk::ReadOnly,
+                    summary: "EXPLAIN QUERY PLAN".to_owned(),
+                    parsed: false,
+                };
+            }
+            if starts_with_keyword(&upper, "ATTACH")
+                || starts_with_keyword(&upper, "DETACH")
+                || starts_with_keyword(&upper, "REINDEX")
+                || starts_with_keyword(&upper, "VACUUM")
+            {
+                return StatementInspection {
+                    sql: trimmed.to_owned(),
+                    risk: StatementRisk::WriteDdl,
+                    summary: "SQLite DDL / Utility".to_owned(),
+                    parsed: false,
+                };
+            }
+        }
+        DbEngine::Postgres => {}
     }
+
+    // Fail-closed on unparseable engine-specific statements so guardrails cannot be bypassed.
+    StatementInspection {
+        sql: trimmed.to_owned(),
+        risk: StatementRisk::WriteDml,
+        summary: "Unparsed SQL statement (treated as write for safety)".to_owned(),
+        parsed: false,
+    }
+}
+
+fn starts_with_keyword(upper: &str, kw: &str) -> bool {
+    upper.starts_with(kw)
+        && upper[kw.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c == ';')
+}
+
+fn pragma_has_assignment(sql: &str) -> bool {
+    // `PRAGMA name = val` sets a pragma; `PRAGMA name` or `PRAGMA name(arg)` reads.
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut paren_depth = 0usize;
+    for ch in sql.chars() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' if !in_single && !in_double => paren_depth += 1,
+            ')' if !in_single && !in_double => paren_depth = paren_depth.saturating_sub(1),
+            '=' if !in_single && !in_double && paren_depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Evaluates all SQL statements against the connection's [`SafetyPolicy`] and [`EnvTag`].
 pub fn evaluate_sql_safety(policy: SafetyPolicy, env: EnvTag, statements: &[String]) -> SafetyDecision {
+    evaluate_sql_safety_for_engine(DbEngine::Postgres, policy, env, statements)
+}
+
+/// Evaluates all SQL statements for `engine` against [`SafetyPolicy`] and [`EnvTag`].
+pub fn evaluate_sql_safety_for_engine(
+    engine: DbEngine,
+    policy: SafetyPolicy,
+    env: EnvTag,
+    statements: &[String],
+) -> SafetyDecision {
     let mut mutating = Vec::new();
     for raw in statements {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let insp = inspect_statement(trimmed);
+        let insp = inspect_statement_for_engine(engine, trimmed);
         if insp.risk > StatementRisk::ReadOnly {
             mutating.push(insp);
         }
@@ -182,21 +305,28 @@ pub fn evaluate_sql_safety(policy: SafetyPolicy, env: EnvTag, statements: &[Stri
     }
 }
 
-fn classify_ast_statement(stmt: &Statement) -> (StatementRisk, String) {
+fn classify_ast_statement(engine: DbEngine, stmt: &Statement, raw_sql: &str) -> (StatementRisk, String) {
     match stmt {
-        Statement::Query(query) => classify_query(query),
+        Statement::Query(query) => classify_query(engine, query, raw_sql),
         Statement::Explain {
             analyze,
             statement,
             options,
+            query_plan,
             ..
         } => {
+            if engine == DbEngine::Sqlite || *query_plan {
+                return (
+                    StatementRisk::ReadOnly,
+                    if *query_plan { "EXPLAIN QUERY PLAN" } else { "EXPLAIN" }.to_owned(),
+                );
+            }
             let runs_query = *analyze
                 || options
                     .as_ref()
                     .is_some_and(|opts| opts.iter().any(is_truthy_analyze_option));
             if runs_query {
-                let (inner_risk, inner_summary) = classify_ast_statement(statement);
+                let (inner_risk, inner_summary) = classify_ast_statement(engine, statement, raw_sql);
                 if inner_risk == StatementRisk::ReadOnly {
                     (StatementRisk::ReadOnly, format!("EXPLAIN ANALYZE ({inner_summary})"))
                 } else {
@@ -204,6 +334,15 @@ fn classify_ast_statement(stmt: &Statement) -> (StatementRisk, String) {
                 }
             } else {
                 (StatementRisk::ReadOnly, "EXPLAIN".to_owned())
+            }
+        }
+        Statement::ExplainTable { .. } => (StatementRisk::ReadOnly, "DESCRIBE".to_owned()),
+        Statement::Use(_) => (StatementRisk::ReadOnly, "USE".to_owned()),
+        Statement::Pragma { is_eq, value, .. } => {
+            if *is_eq || (value.is_some() && pragma_has_assignment(raw_sql)) {
+                (StatementRisk::WriteDdl, "PRAGMA".to_owned())
+            } else {
+                (StatementRisk::ReadOnly, "PRAGMA".to_owned())
             }
         }
         Statement::ShowFunctions { .. }
@@ -221,7 +360,13 @@ fn classify_ast_statement(stmt: &Statement) -> (StatementRisk, String) {
         | Statement::ShowTables { .. }
         | Statement::ShowViews { .. }
         | Statement::ShowCollation { .. } => (StatementRisk::ReadOnly, "SHOW".to_owned()),
-        Statement::Insert(_) => (StatementRisk::WriteDml, "INSERT".to_owned()),
+        Statement::Insert(ins) => {
+            if ins.replace_into {
+                (StatementRisk::WriteDml, "REPLACE".to_owned())
+            } else {
+                (StatementRisk::WriteDml, "INSERT".to_owned())
+            }
+        }
         Statement::Merge(_) => (StatementRisk::WriteDml, "MERGE".to_owned()),
         Statement::Update(upd) => {
             if upd.selection.is_none() {
@@ -298,18 +443,21 @@ fn classify_ast_statement(stmt: &Statement) -> (StatementRisk, String) {
         | Statement::Comment { .. }
         | Statement::Vacuum(_)
         | Statement::Analyze(_)
+        | Statement::AttachDatabase { .. }
+        | Statement::AttachDuckDBDatabase { .. }
+        | Statement::DetachDuckDBDatabase { .. }
         | Statement::Discard { .. } => (StatementRisk::WriteDdl, "DDL / Utility".to_owned()),
         _ => (StatementRisk::WriteDdl, "SQL Command".to_owned()),
     }
 }
 
-fn classify_query(query: &Query) -> (StatementRisk, String) {
+fn classify_query(engine: DbEngine, query: &Query, raw_sql: &str) -> (StatementRisk, String) {
     let mut worst_risk = StatementRisk::ReadOnly;
     let mut best_summary = "SELECT".to_owned();
 
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let (risk, summary) = classify_query(&cte.query);
+            let (risk, summary) = classify_query(engine, &cte.query, raw_sql);
             if risk > worst_risk {
                 worst_risk = risk;
                 best_summary = format!("WITH CTE ({summary})");
@@ -317,7 +465,7 @@ fn classify_query(query: &Query) -> (StatementRisk, String) {
         }
     }
 
-    let (body_risk, body_summary) = classify_set_expr(&query.body);
+    let (body_risk, body_summary) = classify_set_expr(engine, &query.body, raw_sql);
     if body_risk > worst_risk {
         worst_risk = body_risk;
         best_summary = body_summary;
@@ -326,7 +474,7 @@ fn classify_query(query: &Query) -> (StatementRisk, String) {
     (worst_risk, best_summary)
 }
 
-fn classify_set_expr(expr: &SetExpr) -> (StatementRisk, String) {
+fn classify_set_expr(engine: DbEngine, expr: &SetExpr, raw_sql: &str) -> (StatementRisk, String) {
     match expr {
         SetExpr::Select(sel) => {
             if sel.into.is_some() {
@@ -335,10 +483,10 @@ fn classify_set_expr(expr: &SetExpr) -> (StatementRisk, String) {
                 (StatementRisk::ReadOnly, "SELECT".to_owned())
             }
         }
-        SetExpr::Query(q) => classify_query(q),
+        SetExpr::Query(q) => classify_query(engine, q, raw_sql),
         SetExpr::SetOperation { left, right, .. } => {
-            let (lr, ls) = classify_set_expr(left);
-            let (rr, rs) = classify_set_expr(right);
+            let (lr, ls) = classify_set_expr(engine, left, raw_sql);
+            let (rr, rs) = classify_set_expr(engine, right, raw_sql);
             if lr >= rr {
                 (lr, ls)
             } else {
@@ -347,7 +495,7 @@ fn classify_set_expr(expr: &SetExpr) -> (StatementRisk, String) {
         }
         SetExpr::Values(_) | SetExpr::Table(_) => (StatementRisk::ReadOnly, "SELECT".to_owned()),
         SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) | SetExpr::Merge(s) => {
-            classify_ast_statement(s)
+            classify_ast_statement(engine, s, raw_sql)
         }
     }
 }
@@ -367,10 +515,17 @@ fn is_truthy_analyze_option(opt: &UtilityOption) -> bool {
     }
 }
 
-fn strip_leading_sql_comments(mut s: &str) -> &str {
+fn strip_leading_sql_comments(mut s: &str, engine: DbEngine) -> &str {
     loop {
         s = s.trim_start();
         if let Some(rest) = s.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(nl) => s = &rest[nl + 1..],
+                None => return "",
+            }
+        } else if engine == DbEngine::Mysql
+            && let Some(rest) = s.strip_prefix('#')
+        {
             match rest.find('\n') {
                 Some(nl) => s = &rest[nl + 1..],
                 None => return "",
@@ -383,5 +538,67 @@ fn strip_leading_sql_comments(mut s: &str) -> &str {
         } else {
             return s;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspects_mysql_and_sqlite_statements_accurately() {
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Mysql, "SHOW TABLES").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Mysql, "DESCRIBE students").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Mysql, "DESC students").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Mysql, "USE greendale").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Mysql, "REPLACE INTO students VALUES (1, 'Troy')").risk,
+            StatementRisk::WriteDml
+        );
+
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA table_info('students')").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA journal_mode").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA journal_mode = WAL").risk,
+            StatementRisk::WriteDdl
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "EXPLAIN QUERY PLAN SELECT * FROM students").risk,
+            StatementRisk::ReadOnly
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "ATTACH DATABASE 'extra.db' AS extra").risk,
+            StatementRisk::WriteDdl
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "DETACH DATABASE extra").risk,
+            StatementRisk::WriteDdl
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "REINDEX").risk,
+            StatementRisk::WriteDdl
+        );
+        assert_eq!(
+            inspect_statement_for_engine(DbEngine::Sqlite, "VACUUM").risk,
+            StatementRisk::WriteDdl
+        );
     }
 }

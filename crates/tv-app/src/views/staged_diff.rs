@@ -68,7 +68,11 @@ pub fn build_drawer(s: &AppState, session: &SessionState, tab: &TableTabState, k
 
     let sql_for_copy = tab
         .columns()
-        .and_then(|cols| tab.staged.build_transaction_sql(&tab.schema, &tab.object_name, cols).ok())
+        .and_then(|cols| {
+            tab.staged
+                .build_transaction_sql_for_engine(session.profile.engine, &tab.schema, &tab.object_name, cols)
+                .ok()
+        })
         .unwrap_or_default();
 
     let can_commit = tab.staged.has_changes()

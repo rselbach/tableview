@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use rune::Waker;
 use rune::credentials::Credentials;
-use tv_core::engine::postgres::{PostgresSession, quote_ident};
+use tv_core::engine::{connect_session, test_connection};
 use tv_core::{
-    CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbError, DbObject,
+    CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine, DbError, DbObject,
     DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, NewHistoryEntry, PageRequest, PasswordMode,
     QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo,
     SessionId, TabId, TablePage, TableStructure, TransactionOutcome,
@@ -377,6 +377,9 @@ fn pick_default_schema(schemas: &[SchemaInfo], preferred: Option<&str>) -> Optio
     if schemas.iter().any(|s| s.name == "public") {
         return Some("public".to_owned());
     }
+    if schemas.iter().any(|s| s.name == "main") {
+        return Some("main".to_owned());
+    }
     schemas
         .iter()
         .find(|s| !s.is_system)
@@ -389,7 +392,7 @@ async fn worker_loop(
     event_tx: mpsc::Sender<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
 ) {
-    let sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<PostgresSession>>>> =
+    let sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<dyn DbSession>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let query_store: Option<Arc<QueryStore>> = QueryStore::open_default().ok().map(Arc::new);
 
@@ -407,7 +410,7 @@ async fn worker_loop(
 
 async fn handle_cmd(
     cmd: WorkerCmd,
-    sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<PostgresSession>>>>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<dyn DbSession>>>>,
     query_store: Option<Arc<QueryStore>>,
     event_tx: mpsc::Sender<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
@@ -428,7 +431,7 @@ async fn handle_cmd(
                 .map(str::to_owned);
 
             let pw = resolve_password(&profile, prompt_password).await;
-            let connected = PostgresSession::connect(&profile, pw.as_deref(), explicit_db.as_deref()).await;
+            let connected = connect_session(&profile, pw.as_deref(), explicit_db.as_deref()).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
                 Err(error) => {
@@ -436,8 +439,12 @@ async fn handle_cmd(
                     return;
                 }
             };
-            let session = Arc::new(session);
             let server_info = session.server_info().clone();
+            let active_database = if !profile.engine.supports_multi_database() {
+                Some(server_info.current_database.clone())
+            } else {
+                explicit_db
+            };
 
             let (databases, db_log) = match session.list_databases().await {
                 Ok(res) => res,
@@ -448,7 +455,7 @@ async fn handle_cmd(
             };
             logs.push(db_log);
 
-            let (schemas, active_schema, objects) = if explicit_db.is_some() {
+            let (schemas, active_schema, objects) = if active_database.is_some() {
                 match session.list_schemas().await {
                     Ok((schemas, schema_log)) => {
                         logs.push(schema_log);
@@ -487,7 +494,7 @@ async fn handle_cmd(
                     req_id,
                     server_info,
                     databases,
-                    active_database: explicit_db,
+                    active_database,
                     schemas,
                     active_schema,
                     objects,
@@ -504,7 +511,7 @@ async fn handle_cmd(
             database,
         } => {
             let pw = resolve_password(&profile, prompt_password).await;
-            let connected = PostgresSession::connect(&profile, pw.as_deref(), Some(&database)).await;
+            let connected = connect_session(&profile, pw.as_deref(), Some(&database)).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
                 Err(error) => {
@@ -512,7 +519,6 @@ async fn handle_cmd(
                     return;
                 }
             };
-            let session = Arc::new(session);
             let databases = match session.list_databases().await {
                 Ok((dbs, log)) => {
                     logs.push(log);
@@ -740,7 +746,7 @@ async fn handle_cmd(
                     },
                 ),
                 Err(error) => {
-                    let failed_sql = format_failed_page_sql(&request);
+                    let failed_sql = format_failed_page_sql(session.engine(), &request);
                     let logs = vec![ExecutedSql {
                         sql: failed_sql,
                         duration_ms: 0,
@@ -1070,7 +1076,7 @@ async fn handle_cmd(
             password_override,
         } => {
             let pw = resolve_password(&profile, password_override).await;
-            let result = PostgresSession::test_connection(&profile, pw.as_deref()).await;
+            let result = test_connection(&profile, pw.as_deref()).await;
             emit(&event_tx, &waker, WorkerEvent::TestResult { req_id, result });
         }
 
@@ -1276,12 +1282,8 @@ async fn handle_cmd(
     }
 }
 
-fn format_failed_page_sql(req: &PageRequest) -> String {
-    let mut sql = format!(
-        "SELECT * FROM {}.{}",
-        quote_ident(&req.schema),
-        quote_ident(&req.table)
-    );
+fn format_failed_page_sql(engine: DbEngine, req: &PageRequest) -> String {
+    let mut sql = format!("SELECT * FROM {}", engine.qualify_ident(&req.schema, &req.table));
     if let Some(where_clause) = &req.filter_where {
         let trimmed = where_clause.trim();
         if !trimmed.is_empty() {
@@ -1290,7 +1292,12 @@ fn format_failed_page_sql(req: &PageRequest) -> String {
     }
     if let Some(sort) = &req.sort {
         let dir = if sort.ascending { "ASC" } else { "DESC" };
-        sql.push_str(&format!(" ORDER BY {} {dir} NULLS LAST", quote_ident(&sort.column)));
+        let col = engine.quote_ident(&sort.column);
+        if engine == DbEngine::Mysql {
+            sql.push_str(&format!(" ORDER BY ({col} IS NULL) ASC, {col} {dir}"));
+        } else {
+            sql.push_str(&format!(" ORDER BY {col} {dir} NULLS LAST"));
+        }
     }
     sql.push_str(&format!(" LIMIT {} OFFSET {}", req.limit, req.offset));
     sql

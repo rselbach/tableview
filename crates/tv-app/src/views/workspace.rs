@@ -86,6 +86,7 @@ fn build_toolbar(s: &AppState, session: &SessionState, k: &Kit) -> Toolbar {
     };
 
     let has_connected = session.status.as_connected().is_some();
+    let supports_multi_db = session.profile.engine.supports_multi_database();
 
     let leading = row()
         .gap(4.0)
@@ -106,9 +107,10 @@ fn build_toolbar(s: &AppState, session: &SessionState, k: &Kit) -> Toolbar {
                 .label("Open database")
                 .help("Open database")
                 .shortcut("mod+k")
-                .disabled(!has_connected)
+                .disabled(!has_connected || !supports_multi_db)
                 .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_picker(PickerKind::Database, tx))
-                .build(k),
+                .build(k)
+                .key("toolbar-open-db"),
         )
         .child(
             Button::new("SQL")
@@ -263,11 +265,8 @@ fn build_status_pill(session: &SessionState, k: &Kit) -> El {
             if let Some((schema, obj)) = active_obj {
                 summary.push_str(&format!(" : {schema}.{obj}"));
             }
-            row()
+            let mut pill = row()
                 .key("toolbar/status-pill")
-                .role("button")
-                .label("Switch database")
-                .focusable(true)
                 .max_w(500.0)
                 .h(28.0)
                 .px(10.0)
@@ -275,25 +274,31 @@ fn build_status_pill(session: &SessionState, k: &Kit) -> El {
                 .center_y()
                 .radius(k.radius.md)
                 .fill(c.layer_02)
-                .border(0.5, c.border_base)
-                .hover(c.hover)
-                .press(c.pressed)
-                .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_picker(PickerKind::Database, tx))
-                .child(pill_badge(
-                    "toolbar/env-tag",
-                    tag,
-                    env_pal.pill_bg,
-                    env_pal.pill_fg,
-                    env_pal.pill_border,
-                    k,
-                ))
-                .child(
-                    text(summary)
-                        .font(k.ty.mono)
-                        .color(c.text_base)
-                        .shrink()
-                        .truncate(),
-                )
+                .border(0.5, c.border_base);
+            if session.profile.engine.supports_multi_database() {
+                pill = pill
+                    .role("button")
+                    .label("Switch database")
+                    .focusable(true)
+                    .hover(c.hover)
+                    .press(c.pressed)
+                    .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.open_picker(PickerKind::Database, tx));
+            }
+            pill.child(pill_badge(
+                "toolbar/env-tag",
+                tag,
+                env_pal.pill_bg,
+                env_pal.pill_fg,
+                env_pal.pill_border,
+                k,
+            ))
+            .child(
+                text(summary)
+                    .font(k.ty.mono)
+                    .color(c.text_base)
+                    .shrink()
+                    .truncate(),
+            )
         }
     }
 }
@@ -430,38 +435,50 @@ fn build_sidebar(s: &AppState, session: &SessionState, k: &Kit, layer: &mut Vec<
                         .into_iter()
                         .map(|sc| sc.name.clone())
                         .collect();
-                    let schema_refs: Vec<&str> = schema_names.iter().map(String::as_str).collect();
-                    let schema_select = Select::new("sidebar-schema", &schema_refs)
-                        .label("Schema")
-                        .appearance(SelectAppearance::Field)
-                        .fill()
-                        .current(data.active_schema.as_deref())
-                        .placeholder("schema")
-                        .open(session.schema_dropdown_open)
-                        .on_toggle(|s: &mut AppState| {
-                            if let Some(sess) = s.active_session_mut() {
-                                sess.schema_dropdown_open = !sess.schema_dropdown_open;
-                            }
-                        })
-                        .on_close(|s: &mut AppState| {
-                            if let Some(sess) = s.active_session_mut() {
-                                sess.schema_dropdown_open = false;
-                            }
-                        })
-                        .on_choose(|s: &mut AppState, val: &str, _| {
-                            s.select_schema(val.to_owned());
-                        })
-                        .build(k, layer);
-
+                    let show_schema_select = session.profile.engine.uses_schemas() || schema_names.len() > 1;
                     let count = session.filtered_objects().len();
-                    tab_footer = Some(
+                    tab_footer = Some(if show_schema_select {
+                        let schema_refs: Vec<&str> = schema_names.iter().map(String::as_str).collect();
+                        let schema_select = Select::new("sidebar-schema", &schema_refs)
+                            .label("Schema")
+                            .appearance(SelectAppearance::Field)
+                            .fill()
+                            .current(data.active_schema.as_deref())
+                            .placeholder("schema")
+                            .open(session.schema_dropdown_open)
+                            .on_toggle(|s: &mut AppState| {
+                                if let Some(sess) = s.active_session_mut() {
+                                    sess.schema_dropdown_open = !sess.schema_dropdown_open;
+                                }
+                            })
+                            .on_close(|s: &mut AppState| {
+                                if let Some(sess) = s.active_session_mut() {
+                                    sess.schema_dropdown_open = false;
+                                }
+                            })
+                            .on_choose(|s: &mut AppState, val: &str, _| {
+                                s.select_schema(val.to_owned());
+                            })
+                            .build(k, layer);
+
                         row()
                             .w_full()
                             .gap(8.0)
                             .center_y()
                             .child(el().grow(1.0).min_w(0.0).child(schema_select))
-                            .child(text(format!("{count}")).font(k.ty.small).color(c.text_faint)),
-                    );
+                            .child(text(format!("{count}")).font(k.ty.small).color(c.text_faint))
+                    } else {
+                        row()
+                            .w_full()
+                            .gap(8.0)
+                            .center_y()
+                            .child(
+                                text(format!("{count} {}", if count == 1 { "object" } else { "objects" }))
+                                    .font(k.ty.small)
+                                    .color(c.text_faint),
+                            )
+                            .child(spacer())
+                    });
                 }
             }
         },
@@ -815,6 +832,20 @@ fn build_stage(
                     .child(tab_bar)
                     .child(body);
             }
+            let mut actions = row()
+                .gap(8.0)
+                .pt(4.0)
+                .child(empty_cta("Jump to Object (⌘P)", k, true, |s, tx| {
+                    s.open_picker(PickerKind::QuickJump, tx);
+                }))
+                .child(empty_cta("New SQL Query (⌘T)", k, false, |s, tx| {
+                    s.open_new_query_tab(tx);
+                }));
+            if session.profile.engine.supports_multi_database() {
+                actions = actions.child(empty_cta("Switch Database (⌘K)", k, false, |s, tx| {
+                    s.open_picker(PickerKind::Database, tx);
+                }));
+            }
             col()
                 .key("stage-ready")
                 .w_full()
@@ -830,20 +861,7 @@ fn build_stage(
                         .font(k.ty.ui)
                         .color(c.text_muted),
                 )
-                .child(
-                    row()
-                        .gap(8.0)
-                        .pt(4.0)
-                        .child(empty_cta("Jump to Object (⌘P)", k, true, |s, tx| {
-                            s.open_picker(PickerKind::QuickJump, tx);
-                        }))
-                        .child(empty_cta("New SQL Query (⌘T)", k, false, |s, tx| {
-                            s.open_new_query_tab(tx);
-                        }))
-                        .child(empty_cta("Switch Database (⌘K)", k, false, |s, tx| {
-                            s.open_picker(PickerKind::Database, tx);
-                        })),
-                )
+                .child(actions)
         }
     }
 }

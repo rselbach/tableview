@@ -1,7 +1,7 @@
 use rune::{El, ScrollSpec, Tx, col, rich, row, spacer, text};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{Button, ButtonVariant, ControlSize, Dialog, Field, Kit, SegmentedControl, TextInput};
-use tv_core::{ExportFormat, export_rows};
+use tv_core::{ExportFormat, export_rows_for_engine};
 
 use crate::icons;
 use crate::state::{AppState, ExportModalState, OverlayState};
@@ -21,7 +21,8 @@ pub fn build_export_modal(modal: &ExportModalState, k: &Kit, layer: &mut Vec<El>
         .key("export-format-switch");
 
     let preview_count = modal.rows.len().min(8);
-    let preview_text = export_rows(
+    let preview_text = export_rows_for_engine(
+        modal.engine,
         modal.format,
         modal.schema.as_deref(),
         &modal.table_name.text,

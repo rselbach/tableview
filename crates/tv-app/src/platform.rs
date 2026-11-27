@@ -396,7 +396,11 @@ pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
     vec![
         MenuItem::about("About TableView", |s: &mut AppState, tx| {
             s.set_notice(
-                concat!("TableView ", env!("CARGO_PKG_VERSION"), " — PostgreSQL client built with Rune"),
+                concat!(
+                    "TableView ",
+                    env!("CARGO_PKG_VERSION"),
+                    " — SQL database client built with Rune"
+                ),
                 false,
             );
             s.sync_window_title(tx);

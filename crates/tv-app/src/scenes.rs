@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use chrono::{Duration, Utc};
 use rune::ColorScheme;
 use tv_core::{
-    AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbObject, DbObjectKind,
-    EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, IndexInfo, PasswordMode,
-    QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo,
-    SessionId, SortSpec, SslMode, StagedCellValue, StatementRisk, StoreData, TablePage, TableStats, TableStructure,
-    inspect_statement,
+    AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbEngine, DbObject,
+    DbObjectKind, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, IndexInfo,
+    PasswordMode, QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId,
+    SchemaInfo, SessionId, SortSpec, SslMode, StagedCellValue, StatementRisk, StoreData, TablePage, TableStats,
+    TableStructure, inspect_statement,
 };
 
 use crate::state::{
@@ -27,10 +27,13 @@ pub const SCENES: &[SceneEntry] = &[
     ("launcher-settings-dark", scene_launcher_settings_dark),
     ("launcher-settings-light", scene_launcher_settings_light),
     ("connection-form", scene_connection_form),
+    ("connection-form-mysql", scene_connection_form_mysql),
+    ("connection-form-sqlite", scene_connection_form_sqlite),
     ("workspace-disconnected", scene_workspace_disconnected),
     ("workspace-no-db", scene_workspace_no_db),
     ("workspace-connected-dark", scene_workspace_connected_dark),
     ("workspace-connected-light", scene_workspace_connected_light),
+    ("workspace-sqlite-dark", scene_workspace_sqlite_dark),
     ("workspace-db-picker", scene_workspace_db_picker),
     ("workspace-data-grid-dark", scene_workspace_data_grid_dark),
     ("workspace-data-grid-light", scene_workspace_data_grid_light),
@@ -131,6 +134,28 @@ fn scene_connection_form(s: &mut AppState) {
     s.overlay = OverlayState::ConnectionForm(Box::new(form));
 }
 
+fn scene_connection_form_mysql(s: &mut AppState) {
+    reset_to_sample_state(s, true);
+    let mut form = ConnectionFormState::new_blank();
+    form.set_engine(DbEngine::Mysql);
+    form.name = rune::TextEdit::new("greendale_mysql_study");
+    form.host = rune::TextEdit::new("127.0.0.1");
+    form.database = rune::TextEdit::new("study_groups_mysql");
+    form.env = EnvTag::Development;
+    form.color = AccentColor::Blue;
+    form.safety = SafetyPolicy::ConfirmWrites;
+    s.overlay = OverlayState::ConnectionForm(Box::new(form));
+}
+
+fn scene_connection_form_sqlite(s: &mut AppState) {
+    reset_to_sample_state(s, true);
+    let mut form = ConnectionFormState::new_blank();
+    form.set_engine(DbEngine::Sqlite);
+    form.name = rune::TextEdit::new("greendale_local_sqlite");
+    form.file_path = rune::TextEdit::new("/tmp/greendale_campus.sqlite3");
+    s.overlay = OverlayState::ConnectionForm(Box::new(form));
+}
+
 fn scene_workspace_disconnected(s: &mut AppState) {
     reset_to_sample_state(s, false);
     let profile = s.connections[0].clone();
@@ -170,6 +195,74 @@ fn scene_workspace_connected_dark(s: &mut AppState) {
 
 fn scene_workspace_connected_light(s: &mut AppState) {
     setup_connected_workspace(s, false, TableViewMode::Data, None);
+}
+
+fn scene_workspace_sqlite_dark(s: &mut AppState) {
+    reset_to_sample_state(s, true);
+    let profile = ConnectionProfile::new_sqlite("greendale_sqlite", "/tmp/greendale.db");
+    let sid = SessionId::new(1);
+    let mut session = SessionState::new(sid, profile, RequestId::new(1));
+
+    let students_cols = sample_students_columns();
+    session.status = ConnectionState::Connected(Box::new(ConnectedData {
+        server_version: "SQLite 3.49.1".to_owned(),
+        databases: vec![DatabaseInfo {
+            name: "greendale.db".to_owned(),
+            owner: String::new(),
+            size_bytes: Some(65_536),
+        }],
+        active_database: Some("greendale.db".to_owned()),
+        schemas: vec![SchemaInfo {
+            name: "main".to_owned(),
+            is_system: false,
+        }],
+        active_schema: Some("main".to_owned()),
+        objects: vec![
+            DbObject {
+                schema: "main".to_owned(),
+                name: "courses".to_owned(),
+                kind: DbObjectKind::Table,
+                estimated_rows: Some(2),
+                total_bytes: None,
+            },
+            DbObject {
+                schema: "main".to_owned(),
+                name: "students".to_owned(),
+                kind: DbObjectKind::Table,
+                estimated_rows: Some(8),
+                total_bytes: None,
+            },
+        ],
+        expanded_columns: HashMap::new(),
+        selected_object: Some(("main".to_owned(), "students".to_owned())),
+    }));
+
+    let students_tab_id = s.alloc_tab_id();
+    let mut students_tab = WorkspaceTab::new_table(
+        students_tab_id,
+        DbEngine::Sqlite,
+        "main".to_owned(),
+        "students".to_owned(),
+        DbObjectKind::Table,
+        None,
+        None,
+    );
+    if let Some(t) = students_tab.as_table_mut() {
+        t.page = Some(sample_students_page(students_cols.clone()));
+        t.structure = Some(sample_students_structure(students_cols));
+        t.selected_row = Some(0);
+        t.data_table.select("r-0");
+    }
+    session.tabs = vec![students_tab];
+    session.active_tab = Some(students_tab_id);
+    session.console_entries = vec![crate::state::ConsoleLogEntry {
+        timestamp: "2026-11-26 15:34:30.913".to_owned(),
+        sql: "SELECT \"student_id\", \"full_name\", \"gpa\" FROM \"main\".\"students\" LIMIT 301 OFFSET 0".to_owned(),
+        duration_ms: 1,
+        error: None,
+    }];
+    s.sessions.insert(sid, session);
+    s.screen = Screen::Workspace(sid);
 }
 
 fn scene_workspace_db_picker(s: &mut AppState) {
@@ -298,6 +391,7 @@ fn setup_connected_workspace(
     let courses_tab_id = s.alloc_tab_id();
     let mut students_tab = WorkspaceTab::new_table(
         students_tab_id,
+        DbEngine::Postgres,
         "public".to_owned(),
         "students".to_owned(),
         DbObjectKind::Table,
@@ -321,6 +415,7 @@ fn setup_connected_workspace(
 
     let mut courses_tab = WorkspaceTab::new_table(
         courses_tab_id,
+        DbEngine::Postgres,
         "public".to_owned(),
         "courses".to_owned(),
         DbObjectKind::Table,
@@ -809,6 +904,7 @@ fn scene_workspace_export_modal(s: &mut AppState) {
     let cols = sample_students_columns();
     let page = sample_students_page(cols.clone());
     s.overlay = OverlayState::Export(Box::new(ExportModalState {
+        engine: DbEngine::Postgres,
         source_label: "public.students".to_owned(),
         schema: Some("public".to_owned()),
         table_name: rune::TextEdit::new("students"),

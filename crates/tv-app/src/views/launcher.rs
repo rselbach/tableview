@@ -3,7 +3,7 @@ use rune_kit::{
     Button, ButtonVariant, ControlSize, Divider, IconButton, IconButtonVariant, Kit, MenuItem, Select,
     SelectAppearance, TextInput, context_menu,
 };
-use tv_core::{ConnectionProfile, EnvTag, SafetyPolicy, SortOrder};
+use tv_core::{ConnectionProfile, DbEngine, EnvTag, SafetyPolicy, SortOrder};
 
 use crate::icons;
 use crate::platform::{self, Action};
@@ -52,7 +52,7 @@ fn build_left_rail(s: &AppState, k: &Kit, top_inset: f32) -> El {
                 .gap(1.0)
                 .child(text("TableView").font(k.ty.body_medium).color(c.text_base))
                 .child(
-                    text(format!("v{} · PostgreSQL", s.update.running_version))
+                    text(format!("v{} · SQL Client", s.update.running_version))
                         .font(k.ty.small)
                         .color(c.text_muted),
                 ),
@@ -360,12 +360,12 @@ fn build_empty_state(s: &AppState, k: &Kit) -> El {
     let title = if is_filtered {
         "No connections match this filter"
     } else {
-        "No PostgreSQL connections saved yet"
+        "No connections saved yet"
     };
     let subtitle = if is_filtered {
         "Clear your search or switch environment filter to view saved profiles."
     } else {
-        "Create a connection profile or paste a postgres:// URL to get started."
+        "Create a connection profile or paste a postgresql://, mysql://, or sqlite:// URL to get started."
     };
 
     col()
@@ -399,14 +399,14 @@ fn build_connection_row(s: &AppState, profile: &ConnectionProfile, k: &Kit) -> E
     let active_sid = s.find_session_for_connection(id);
     let env_pal = theme::env_colors(profile.env, profile.color, k.dark);
 
-    let pg_emblem = el()
+    let engine_emblem = el()
         .key(format!("launcher/conn/{id}/emblem"))
         .size(34.0, 34.0)
         .radius(17.0)
         .fill(env_pal.pill_bg)
         .border(1.0, env_pal.pill_border)
         .center()
-        .child(text("PG").font(k.ty.ui_medium).color(env_pal.pill_fg));
+        .child(text(profile.engine.short_badge()).font(k.ty.ui_medium).color(env_pal.pill_fg));
 
     let mut top_line = row()
         .w_full()
@@ -449,7 +449,11 @@ fn build_connection_row(s: &AppState, profile: &ConnectionProfile, k: &Kit) -> E
         );
     }
 
-    let subtitle = format!("{} · {}", profile.endpoint_summary(), profile.user);
+    let subtitle = if profile.engine == DbEngine::Sqlite {
+        profile.endpoint_summary()
+    } else {
+        format!("{} · {}", profile.endpoint_summary(), profile.user)
+    };
 
     let info_col = col()
         .grow(1.0)
@@ -507,7 +511,7 @@ fn build_connection_row(s: &AppState, profile: &ConnectionProfile, k: &Kit) -> E
             s.launcher_selected = Some(id);
             s.launcher_context_menu = Some((id, press));
         })
-        .child(pg_emblem)
+        .child(engine_emblem)
         .child(info_col)
         .child(row_actions)
 }

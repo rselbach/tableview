@@ -9,14 +9,17 @@ use rune_kit::shell::TabDragState;
 use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
     AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionId,
-    ConnectionProfile, ConnectionStore, DatabaseInfo, DbObject, DbObjectKind, DraftRowId, EnvTag, ExecutedSql,
-    ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult,
+    ConnectionProfile, ConnectionStore, DatabaseInfo, DbEngine, DbObject, DbObjectKind, DraftRowId, EnvTag,
+    ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult,
     QueryHistoryEntry, QueryStatementResult, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId,
     SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue, StagedChanges,
-    StatementInspection, StoreData, TabId, TablePage, TableStructure, build_fk_where_clause,
-    default_export_filename, evaluate_sql_safety, evaluate_staged_commit_safety, export_rows,
+    StatementInspection, StoreData, TabId, TablePage, TableStructure, build_explain_sql_for_engine,
+    build_fk_where_clause_for_engine, default_export_filename, evaluate_sql_safety_for_engine,
+    evaluate_staged_commit_safety, export_rows_for_engine,
 };
-use tv_core::sql::{cursor_line_col, format_sql, split_statements, statement_at_cursor};
+use tv_core::sql::{
+    cursor_line_col, format_sql, split_statements_for_engine, statement_at_cursor_for_engine,
+};
 
 use tv_update::{UpdateFailure, UpdateStatus};
 
@@ -89,7 +92,7 @@ pub enum ColumnLoadState {
     Error(String),
 }
 
-/// Catalog state populated once a session connects to PostgreSQL.
+/// Catalog state populated once a session connects to a database.
 #[derive(Clone, Debug)]
 pub struct ConnectedData {
     pub server_version: String,
@@ -148,10 +151,11 @@ pub enum OpenFormSelect {
     SslMode,
 }
 
-/// Editable fields and validation state for creating or editing a PostgreSQL connection.
+/// Editable fields and validation state for creating or editing a database connection.
 #[derive(Clone, Debug)]
 pub struct ConnectionFormState {
     pub editing_id: Option<ConnectionId>,
+    pub engine: DbEngine,
     pub name: TextEdit,
     pub folder: TextEdit,
     pub host: TextEdit,
@@ -159,6 +163,7 @@ pub struct ConnectionFormState {
     pub user: TextEdit,
     pub password: TextEdit,
     pub database: TextEdit,
+    pub file_path: TextEdit,
     pub ca_cert: TextEdit,
     pub cert: TextEdit,
     pub key: TextEdit,
@@ -178,6 +183,7 @@ impl ConnectionFormState {
     pub fn new_blank() -> Self {
         Self {
             editing_id: None,
+            engine: DbEngine::Postgres,
             name: TextEdit::new(""),
             folder: TextEdit::new(""),
             host: TextEdit::new("127.0.0.1"),
@@ -185,6 +191,7 @@ impl ConnectionFormState {
             user: TextEdit::new("postgres"),
             password: TextEdit::new(""),
             database: TextEdit::new(""),
+            file_path: TextEdit::new(""),
             ca_cert: TextEdit::new(""),
             cert: TextEdit::new(""),
             key: TextEdit::new(""),
@@ -201,16 +208,48 @@ impl ConnectionFormState {
         }
     }
 
+    pub fn set_engine(&mut self, engine: DbEngine) {
+        if self.editing_id.is_some() || self.engine == engine {
+            return;
+        }
+        self.engine = engine;
+        if engine != DbEngine::Sqlite {
+            let port_trimmed = self.port.text.trim();
+            if port_trimmed.is_empty() || matches!(port_trimmed, "0" | "5432" | "3306") {
+                self.port = TextEdit::new(engine.default_port().to_string());
+            }
+            let user_trimmed = self.user.text.trim();
+            if user_trimmed.is_empty() || matches!(user_trimmed, "postgres" | "root") {
+                self.user = TextEdit::new(engine.default_user());
+            }
+        }
+        self.open_select = OpenFormSelect::None;
+        self.validation_error = None;
+        self.test_status = TestStatus::Idle;
+    }
+
     pub fn from_profile(profile: &ConnectionProfile, loading_credential: bool) -> Self {
         Self {
             editing_id: Some(profile.id),
+            engine: profile.engine,
             name: TextEdit::new(&profile.name),
             folder: TextEdit::new(profile.folder.as_deref().unwrap_or("")),
             host: TextEdit::new(&profile.host),
-            port: TextEdit::new(profile.port.to_string()),
+            port: if profile.engine == DbEngine::Sqlite {
+                TextEdit::new("")
+            } else {
+                TextEdit::new(profile.port.to_string())
+            },
             user: TextEdit::new(&profile.user),
             password: TextEdit::new(""),
             database: TextEdit::new(profile.database.as_deref().unwrap_or("")),
+            file_path: TextEdit::new(
+                profile
+                    .file_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
             ca_cert: TextEdit::new(
                 profile
                     .ssl
@@ -249,37 +288,83 @@ impl ConnectionFormState {
     }
 
     pub fn to_profile(&self, existing: Option<&ConnectionProfile>) -> Result<ConnectionProfile, String> {
-        let host = self.host.text.trim();
-        let port = if host.starts_with('/') && self.port.text.trim().is_empty() {
-            5432
+        let created_at = existing.map(|p| p.created_at).unwrap_or_else(chrono::Utc::now);
+        let last_connected_at = existing.and_then(|p| p.last_connected_at);
+
+        let mut profile = if self.engine == DbEngine::Sqlite {
+            let file_path = non_empty_opt(&self.file_path.text).map(PathBuf::from);
+            let mut name = self.name.text.trim().to_owned();
+            if name.is_empty()
+                && let Some(ref fp) = file_path
+            {
+                let path_str = fp.to_string_lossy();
+                if path_str == ":memory:" {
+                    name = "SQLite (memory)".to_owned();
+                } else if let Some(stem) = fp.file_stem().and_then(|s| s.to_str())
+                    && !stem.trim().is_empty()
+                {
+                    name = stem.to_owned();
+                } else {
+                    name = path_str.into_owned();
+                }
+            }
+            ConnectionProfile {
+                id: self.editing_id.unwrap_or_default(),
+                name,
+                engine: DbEngine::Sqlite,
+                folder: non_empty_opt(&self.folder.text),
+                env: self.env,
+                color: self.color,
+                safety: self.safety,
+                host: String::new(),
+                port: 0,
+                user: String::new(),
+                password_mode: PasswordMode::None,
+                database: None,
+                file_path,
+                ssl: tv_core::SslConfig {
+                    mode: SslMode::Disable,
+                    ..Default::default()
+                },
+                created_at,
+                last_connected_at,
+            }
         } else {
-            self.port
-                .text
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| "Port must be a number between 1 and 65535".to_owned())?
+            let host = self.host.text.trim();
+            let port = if host.starts_with('/') && self.port.text.trim().is_empty() {
+                self.engine.default_port()
+            } else {
+                self.port
+                    .text
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| "Port must be a number between 1 and 65535".to_owned())?
+            };
+            ConnectionProfile {
+                id: self.editing_id.unwrap_or_default(),
+                name: self.name.text.trim().to_owned(),
+                engine: self.engine,
+                folder: non_empty_opt(&self.folder.text),
+                env: self.env,
+                color: self.color,
+                safety: self.safety,
+                host: host.to_owned(),
+                port,
+                user: self.user.text.trim().to_owned(),
+                password_mode: self.password_mode,
+                database: non_empty_opt(&self.database.text),
+                file_path: None,
+                ssl: tv_core::SslConfig {
+                    mode: self.ssl_mode,
+                    ca_cert_path: non_empty_opt(&self.ca_cert.text).map(Into::into),
+                    client_cert_path: non_empty_opt(&self.cert.text).map(Into::into),
+                    client_key_path: non_empty_opt(&self.key.text).map(Into::into),
+                },
+                created_at,
+                last_connected_at,
+            }
         };
-        let mut profile = ConnectionProfile {
-            id: self.editing_id.unwrap_or_default(),
-            name: self.name.text.trim().to_owned(),
-            folder: non_empty_opt(&self.folder.text),
-            env: self.env,
-            color: self.color,
-            safety: self.safety,
-            host: host.to_owned(),
-            port,
-            user: self.user.text.trim().to_owned(),
-            password_mode: self.password_mode,
-            database: non_empty_opt(&self.database.text),
-            ssl: tv_core::SslConfig {
-                mode: self.ssl_mode,
-                ca_cert_path: non_empty_opt(&self.ca_cert.text).map(Into::into),
-                client_cert_path: non_empty_opt(&self.cert.text).map(Into::into),
-                client_key_path: non_empty_opt(&self.key.text).map(Into::into),
-            },
-            created_at: existing.map(|p| p.created_at).unwrap_or_else(chrono::Utc::now),
-            last_connected_at: existing.and_then(|p| p.last_connected_at),
-        };
+
         if profile.name.is_empty() && !profile.host.is_empty() {
             profile.name = profile.host.clone();
         }
@@ -319,7 +404,7 @@ impl PickerState {
     }
 }
 
-/// Modal state for importing a `postgres://` URL into a new connection form.
+/// Modal state for importing a connection URL (`postgresql://`, `mysql://`, or `sqlite://`) into a new connection form.
 #[derive(Clone, Debug)]
 pub struct ImportUrlState {
     pub url: TextEdit,
@@ -378,6 +463,7 @@ pub struct SafetyConfirmModalState {
 /// Modal state for previewing and exporting tabular rows as CSV, JSON, or SQL INSERT.
 #[derive(Clone, Debug)]
 pub struct ExportModalState {
+    pub engine: DbEngine,
     pub source_label: String,
     pub schema: Option<String>,
     pub table_name: TextEdit,
@@ -481,6 +567,7 @@ pub struct FkPeekState {
 
 /// Interactive state for one open table or view tab (`Data | Structure | Indexes` + inspector state).
 pub struct TableTabState {
+    pub engine: DbEngine,
     pub schema: String,
     pub object_name: String,
     pub object_kind: DbObjectKind,
@@ -526,6 +613,7 @@ pub struct TableTabState {
 impl TableTabState {
     pub fn new(
         tab_id: TabId,
+        engine: DbEngine,
         schema: String,
         object_name: String,
         object_kind: DbObjectKind,
@@ -534,6 +622,7 @@ impl TableTabState {
     ) -> Self {
         let tid = tab_id.get();
         Self {
+            engine,
             schema,
             object_name,
             object_kind,
@@ -687,7 +776,10 @@ impl TableTabState {
         let (before, after) = self.staged.build_diff_texts(&self.schema, &self.object_name, cols);
         let row_file = FileDiff::from_texts(format!("{}.{}.rows", self.schema, self.object_name), &before, &after);
         let mut files = vec![row_file];
-        match self.staged.build_transaction_sql(&self.schema, &self.object_name, cols) {
+        match self
+            .staged
+            .build_transaction_sql_for_engine(self.engine, &self.schema, &self.object_name, cols)
+        {
             Ok(sql) => {
                 files.push(FileDiff::between(
                     None,
@@ -841,6 +933,7 @@ pub struct WorkspaceTab {
 impl WorkspaceTab {
     pub fn new_table(
         id: TabId,
+        engine: DbEngine,
         schema: String,
         object_name: String,
         object_kind: DbObjectKind,
@@ -851,6 +944,7 @@ impl WorkspaceTab {
             id,
             content: TabContent::Table(Box::new(TableTabState::new(
                 id,
+                engine,
                 schema,
                 object_name,
                 object_kind,
@@ -1474,11 +1568,15 @@ impl AppState {
             .filter(|c| {
                 q.is_empty()
                     || c.name.to_ascii_lowercase().contains(&q)
+                    || c.engine.label().to_ascii_lowercase().contains(&q)
                     || c.host.to_ascii_lowercase().contains(&q)
                     || c.user.to_ascii_lowercase().contains(&q)
                     || c.database
                         .as_deref()
                         .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
+                    || c.file_path
+                        .as_ref()
+                        .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(&q))
             })
             .collect()
     }
@@ -1519,6 +1617,49 @@ impl AppState {
         self.launcher_context_menu = None;
         self.overlay = OverlayState::ConnectionForm(Box::new(ConnectionFormState::new_blank()));
         tx.focus_when_shown("form-name", true);
+    }
+
+    pub fn set_form_engine(&mut self, engine: DbEngine) {
+        if let OverlayState::ConnectionForm(ref mut form) = self.overlay {
+            form.set_engine(engine);
+        }
+    }
+
+    pub fn browse_sqlite_file(&mut self, tx: &mut Tx) {
+        let mut options = FileDialogOptions {
+            title: "Choose SQLite Database File".to_owned(),
+            ..Default::default()
+        }
+        .filter("SQLite Database", &["db", "sqlite", "sqlite3", "db3"]);
+        if let OverlayState::ConnectionForm(ref form) = self.overlay {
+            let trimmed = form.file_path.text.trim();
+            if !trimmed.is_empty() && trimmed != ":memory:" {
+                let path = PathBuf::from(trimmed);
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    options.directory = Some(parent.to_path_buf());
+                }
+            }
+        }
+        tx.open_file(options, |s: &mut Self, result, _| match result {
+            Ok(Some(path)) => {
+                if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+                    let path_str = path.to_string_lossy().into_owned();
+                    form.file_path = TextEdit::new(&path_str);
+                    if form.name.text.trim().is_empty()
+                        && let Some(stem) = path.file_stem().and_then(|st| st.to_str())
+                        && !stem.trim().is_empty()
+                    {
+                        form.name = TextEdit::new(stem);
+                    }
+                    form.validation_error = None;
+                    form.test_status = TestStatus::Idle;
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                s.set_notice(format!("File dialog failed: {err}"), true);
+            }
+        });
     }
 
     pub fn open_edit_connection_form(&mut self, connection_id: ConnectionId, tx: &mut Tx) {
@@ -1649,7 +1790,7 @@ impl AppState {
         let OverlayState::ImportUrl(ref mut modal) = self.overlay else {
             return;
         };
-        let (profile, secret) = match ConnectionProfile::from_postgres_url(&modal.url.text) {
+        let (profile, secret) = match ConnectionProfile::from_url(&modal.url.text) {
             Ok(res) => res,
             Err(err) => {
                 modal.error = Some(err.to_string());
@@ -1686,7 +1827,7 @@ impl AppState {
         let Some(profile) = self.connections.iter().find(|c| c.id == id) else {
             return;
         };
-        let url = profile.to_postgres_url(true);
+        let url = profile.to_url(true);
         tx.copy(url);
         self.launcher_context_menu = None;
         self.set_notice("Copied connection URL (password masked)", false);
@@ -1748,7 +1889,10 @@ impl AppState {
             return;
         };
 
-        if profile.password_mode == PasswordMode::AskEveryTime && explicit_password.is_none() {
+        if profile.engine != DbEngine::Sqlite
+            && profile.password_mode == PasswordMode::AskEveryTime
+            && explicit_password.is_none()
+        {
             self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
                 connection_id,
                 connection_name: profile.name.clone(),
@@ -1945,6 +2089,7 @@ impl AppState {
                 .unwrap_or(DbObjectKind::Table);
             let tab = WorkspaceTab::new_table(
                 tab_id,
+                session.profile.engine,
                 schema.clone(),
                 object.clone(),
                 kind,
@@ -2784,6 +2929,7 @@ impl AppState {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
+            let engine = session.profile.engine;
             let policy = session.profile.safety;
             let Some(tab_id) = session.active_tab else {
                 return;
@@ -2802,7 +2948,10 @@ impl AppState {
                 tab.commit_error = Some("Missing table columns metadata".to_owned());
                 return;
             };
-            let stmts = match tab.staged.build_statements(&tab.schema, &tab.object_name, &cols) {
+            let stmts = match tab
+                .staged
+                .build_statements_for_engine(engine, &tab.schema, &tab.object_name, &cols)
+            {
                 Ok(s) => s,
                 Err(err) => {
                     tab.commit_error = Some(err.to_string());
@@ -2867,7 +3016,7 @@ impl AppState {
             req_id,
             loading: has_worker,
             result: None,
-            error: (!has_worker).then(|| "Connect to a live PostgreSQL database to load referenced rows.".to_owned()),
+            error: (!has_worker).then(|| "Connect to a live database to load referenced rows.".to_owned()),
         });
         if let (Some(worker), Some(rid)) = (&self.worker, req_id) {
             worker.send(WorkerCmd::FetchFkPeek {
@@ -2894,14 +3043,17 @@ impl AppState {
         source_col: ColumnMeta,
         tx: &mut Tx,
     ) {
-        let Some(where_clause) = build_fk_where_clause(&fk.target_column, &value, &source_col) else {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(engine) = self.sessions.get(&session_id).map(|s| s.profile.engine) else {
+            return;
+        };
+        let Some(where_clause) = build_fk_where_clause_for_engine(engine, &fk.target_column, &value, &source_col) else {
             self.set_notice("Cannot follow a NULL foreign key", false);
             return;
         };
         self.close_fk_peek();
-        let Screen::Workspace(session_id) = self.screen else {
-            return;
-        };
         let existing_tab_id = self.sessions.get(&session_id).and_then(|sess| {
             sess.tabs
                 .iter()
@@ -2936,6 +3088,7 @@ impl AppState {
                     .unwrap_or(DbObjectKind::Table);
                 session.tabs.push(WorkspaceTab::new_table(
                     tab_id,
+                    engine,
                     fk.target_schema.clone(),
                     fk.target_table.clone(),
                     kind,
@@ -2997,6 +3150,7 @@ impl AppState {
         let Some(session) = self.active_session() else {
             return false;
         };
+        let engine = session.profile.engine;
         let Some(tab) = session.active_tab() else {
             return false;
         };
@@ -3011,6 +3165,7 @@ impl AppState {
                     return true;
                 }
                 ExportModalState {
+                    engine,
                     source_label: format!("{}.{}", t.schema, t.object_name),
                     schema: Some(t.schema.clone()),
                     table_name: TextEdit::new(&t.object_name),
@@ -3029,6 +3184,7 @@ impl AppState {
                     return true;
                 }
                 ExportModalState {
+                    engine,
                     source_label: q.title.clone(),
                     schema: None,
                     table_name: TextEdit::new("query_result"),
@@ -3053,7 +3209,8 @@ impl AppState {
         let OverlayState::Export(ref modal) = self.overlay else {
             return;
         };
-        let content = export_rows(
+        let content = export_rows_for_engine(
+            modal.engine,
             modal.format,
             modal.schema.as_deref(),
             &modal.table_name.text,
@@ -3071,7 +3228,8 @@ impl AppState {
         let OverlayState::Export(ref modal) = self.overlay else {
             return;
         };
-        let content = export_rows(
+        let content = export_rows_for_engine(
+            modal.engine,
             modal.format,
             modal.schema.as_deref(),
             &modal.table_name.text,
@@ -3110,6 +3268,7 @@ impl AppState {
         };
         struct ReadyQuery {
             tab_id: TabId,
+            engine: DbEngine,
             policy: SafetyPolicy,
             env: EnvTag,
             statements: Vec<String>,
@@ -3120,6 +3279,7 @@ impl AppState {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return false;
             };
+            let engine = session.profile.engine;
             let policy = session.profile.safety;
             let env = session.profile.env;
             let is_connected = session.status.as_connected().is_some();
@@ -3139,7 +3299,7 @@ impl AppState {
             }
 
             let extracted = if all {
-                let stmts = split_statements(&tab.editor.text);
+                let stmts = split_statements_for_engine(&tab.editor.text, engine);
                 if stmts.is_empty() {
                     None
                 } else {
@@ -3147,7 +3307,7 @@ impl AppState {
                     Some((stmts.into_iter().map(|s| s.sql).collect(), sql_text))
                 }
             } else {
-                statements_for_current(&tab.editor)
+                statements_for_current(&tab.editor, engine)
             };
 
             let Some((statements, executed_sql_text)) = extracted else {
@@ -3157,6 +3317,7 @@ impl AppState {
 
             ReadyQuery {
                 tab_id,
+                engine,
                 policy,
                 env,
                 statements,
@@ -3167,6 +3328,7 @@ impl AppState {
 
         let ReadyQuery {
             tab_id,
+            engine,
             policy,
             env,
             statements,
@@ -3174,7 +3336,7 @@ impl AppState {
             row_limit,
         } = outcome;
 
-        match evaluate_sql_safety(policy, env, &statements) {
+        match evaluate_sql_safety_for_engine(engine, policy, env, &statements) {
             SafetyDecision::Allow => {
                 self.dispatch_query_execution(session_id, tab_id, statements, executed_sql_text, row_limit);
             }
@@ -3220,10 +3382,11 @@ impl AppState {
         let Screen::Workspace(session_id) = self.screen else {
             return false;
         };
-        let (tab_id, policy, env, statement) = {
+        let (tab_id, engine, policy, env, statement) = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return false;
             };
+            let engine = session.profile.engine;
             let policy = session.profile.safety;
             let env = session.profile.env;
             let is_connected = session.status.as_connected().is_some();
@@ -3241,17 +3404,18 @@ impl AppState {
                 tab.show_explain = true;
                 return true;
             }
-            let Some((stmts, _)) = statements_for_current(&tab.editor) else {
+            let Some((stmts, _)) = statements_for_current(&tab.editor, engine) else {
                 self.set_notice("Place cursor inside a SQL statement to explain", false);
                 return true;
             };
             let first = stmts.into_iter().next().unwrap_or_default();
-            (tab_id, policy, env, first)
+            (tab_id, engine, policy, env, first)
         };
 
+        let analyze = analyze && engine.supports_explain_analyze();
         if analyze {
-            let wrapped = vec![format!("EXPLAIN ANALYZE {statement}")];
-            match evaluate_sql_safety(policy, env, &wrapped) {
+            let wrapped = vec![build_explain_sql_for_engine(engine, &statement, true)];
+            match evaluate_sql_safety_for_engine(engine, policy, env, &wrapped) {
                 SafetyDecision::Allow => {}
                 SafetyDecision::Block { reason, .. } => {
                     if let Some(session) = self.sessions.get_mut(&session_id)
@@ -3676,7 +3840,7 @@ impl AppState {
             .or_else(|| session.profile.database.clone());
         let profile = session.profile.clone();
         let pw = session.session_password.clone();
-        if profile.password_mode == PasswordMode::AskEveryTime && pw.is_none() {
+        if profile.engine != DbEngine::Sqlite && profile.password_mode == PasswordMode::AskEveryTime && pw.is_none() {
             let conn_id = profile.id;
             let name = profile.name.clone();
             self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
@@ -3724,6 +3888,9 @@ impl AppState {
                 return;
             };
             if session.status.as_connected().is_none() {
+                return;
+            }
+            if kind == PickerKind::Database && !session.profile.engine.supports_multi_database() {
                 return;
             }
             if kind == PickerKind::QuickJump
@@ -4645,16 +4812,16 @@ fn unpack_batch(tab_id: TabId, batch: QueryBatchResult) -> BatchOutcomes {
     }
 }
 
-fn statements_for_current(editor: &TextEdit) -> Option<(Vec<String>, String)> {
+fn statements_for_current(editor: &TextEdit, engine: DbEngine) -> Option<(Vec<String>, String)> {
     if editor.anchor != editor.focus {
         let sel = editor.selected();
-        let stmts = split_statements(sel);
+        let stmts = split_statements_for_engine(sel, engine);
         if !stmts.is_empty() {
             let texts = stmts.into_iter().map(|s| s.sql).collect();
             return Some((texts, sel.trim().to_owned()));
         }
     }
-    let stmt = statement_at_cursor(&editor.text, editor.anchor, editor.focus)?;
+    let stmt = statement_at_cursor_for_engine(&editor.text, editor.anchor, editor.focus, engine)?;
     let sql = stmt.sql;
     Some((vec![sql.clone()], sql))
 }

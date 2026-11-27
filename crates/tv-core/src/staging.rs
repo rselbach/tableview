@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::engine::postgres::quote_ident;
+use crate::connection::DbEngine;
 use crate::engine::{CellValue, ColumnMeta};
 
 /// Identifier for a newly inserted unsaved row inside a table tab.
@@ -28,43 +28,87 @@ pub enum StagedCellValue {
     Literal(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogicalColType {
+    Bool,
+    Int,
+    Float,
+    Numeric,
+    Json,
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Uuid,
+    Bytes,
+    Array,
+    Text,
+}
+
+fn classify_column_type(col: &ColumnMeta) -> LogicalColType {
+    let udt = col.udt_name.trim().to_ascii_lowercase();
+    let dtype = col.data_type.trim().to_ascii_lowercase();
+    if udt.starts_with("tinyint(1)")
+        || dtype.starts_with("tinyint(1)")
+        || matches!(udt.as_str(), "bool" | "boolean")
+        || dtype == "boolean"
+    {
+        return LogicalColType::Bool;
+    }
+    if udt.starts_with('_') {
+        return LogicalColType::Array;
+    }
+    let base = udt.split('(').next().unwrap_or(&udt).trim();
+    match base {
+        "int2" | "int4" | "int8" | "integer" | "int" | "bigint" | "smallint" | "mediumint" | "tinyint" => {
+            LogicalColType::Int
+        }
+        "float4" | "float8" | "real" | "double" | "double precision" | "float" => LogicalColType::Float,
+        "numeric" | "money" | "decimal" => LogicalColType::Numeric,
+        "json" | "jsonb" => LogicalColType::Json,
+        "date" => LogicalColType::Date,
+        "time" | "timetz" => LogicalColType::Time,
+        "timestamptz" => LogicalColType::TimestampTz,
+        "timestamp" | "datetime" => LogicalColType::Timestamp,
+        "uuid" => LogicalColType::Uuid,
+        "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "varbinary" | "binary" => LogicalColType::Bytes,
+        _ => LogicalColType::Text,
+    }
+}
+
 impl StagedCellValue {
     /// Converts a staged cell value into a [`CellValue`] preview for rendering in the grid and inspector.
     pub fn to_preview_cell(&self, col: &ColumnMeta) -> CellValue {
         match self {
             Self::Null => CellValue::Null,
             Self::DefaultExpr => CellValue::Text("DEFAULT".to_owned()),
-            Self::Literal(raw) => match col.udt_name.as_str() {
-                "bool" => match raw.trim().to_ascii_lowercase().as_str() {
+            Self::Literal(raw) => match classify_column_type(col) {
+                LogicalColType::Bool => match raw.trim().to_ascii_lowercase().as_str() {
                     "true" | "t" | "1" | "yes" | "y" | "on" => CellValue::Bool(true),
                     "false" | "f" | "0" | "no" | "n" | "off" => CellValue::Bool(false),
                     _ => CellValue::Text(raw.clone()),
                 },
-                "int2" | "int4" | "int8" => match raw.trim().parse::<i64>() {
+                LogicalColType::Int => match raw.trim().parse::<i64>() {
                     Ok(v) => CellValue::Int(v),
                     Err(_) => CellValue::Text(raw.clone()),
                 },
-                "float4" | "float8" => match raw.trim().parse::<f64>() {
+                LogicalColType::Float => match raw.trim().parse::<f64>() {
                     Ok(v) if v.is_finite() => CellValue::Float(v),
                     _ => CellValue::Text(raw.clone()),
                 },
-                "numeric" | "money" => CellValue::Numeric(raw.trim().to_owned()),
-                "json" | "jsonb" => CellValue::Json(raw.clone()),
-                "date" => CellValue::Date(raw.clone()),
-                "time" | "timetz" => CellValue::Time(raw.clone()),
-                "timestamptz" | "timestamp" => {
-                    CellValue::parse_from_pg_text(&col.udt_name, Some(raw.clone()))
+                LogicalColType::Numeric => CellValue::Numeric(raw.trim().to_owned()),
+                LogicalColType::Json => CellValue::Json(raw.clone()),
+                LogicalColType::Date => CellValue::Date(raw.clone()),
+                LogicalColType::Time => CellValue::Time(raw.clone()),
+                LogicalColType::TimestampTz => CellValue::parse_from_pg_text("timestamptz", Some(raw.clone())),
+                LogicalColType::Timestamp => CellValue::parse_from_pg_text("timestamp", Some(raw.clone())),
+                LogicalColType::Uuid => CellValue::parse_from_pg_text("uuid", Some(raw.clone())),
+                LogicalColType::Bytes => {
+                    let hex = strip_hex_prefix(raw.trim());
+                    CellValue::parse_from_pg_text("bytea", Some(hex.to_owned()))
                 }
-                "uuid" => CellValue::parse_from_pg_text("uuid", Some(raw.clone())),
-                "bytea" => {
-                    if let Some(hex) = raw.strip_prefix("\\x") {
-                        CellValue::parse_from_pg_text("bytea", Some(hex.to_owned()))
-                    } else {
-                        CellValue::parse_from_pg_text("bytea", Some(raw.clone()))
-                    }
-                }
-                _ if col.udt_name.starts_with('_') => CellValue::Array(raw.clone()),
-                _ => CellValue::Text(raw.clone()),
+                LogicalColType::Array => CellValue::Array(raw.clone()),
+                LogicalColType::Text => CellValue::Text(raw.clone()),
             },
         }
     }
@@ -271,9 +315,20 @@ impl StagedChanges {
         self.inserts.iter().find(|r| r.id == id)
     }
 
-    /// Generates parameterized-safe SQL statements (single transaction order: updates, inserts, deletes).
+    /// Generates parameterized-safe PostgreSQL SQL statements (single transaction order: updates, inserts, deletes).
     pub fn build_statements(
         &self,
+        schema: &str,
+        table: &str,
+        columns: &[ColumnMeta],
+    ) -> Result<Vec<String>, StagingError> {
+        self.build_statements_for_engine(DbEngine::Postgres, schema, table, columns)
+    }
+
+    /// Generates dialect-aware SQL statements (single transaction order: updates, inserts, deletes).
+    pub fn build_statements_for_engine(
+        &self,
+        engine: DbEngine,
         schema: &str,
         table: &str,
         columns: &[ColumnMeta],
@@ -295,7 +350,7 @@ impl StagedChanges {
             });
         }
 
-        let fq_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
+        let fq_table = engine.qualify_ident(schema, table);
         let mut stmts = Vec::with_capacity(self.updates.len() + self.inserts.len() + self.deletes.len());
 
         // 1. Updates
@@ -308,13 +363,17 @@ impl StagedChanges {
                 .iter()
                 .filter_map(|(&col_idx, val)| {
                     let col = columns.get(col_idx)?;
-                    Some(format!("{} = {}", quote_ident(&col.name), format_pg_literal(col, val)))
+                    Some(format!(
+                        "{} = {}",
+                        engine.quote_ident(&col.name),
+                        format_literal(engine, col, val)
+                    ))
                 })
                 .collect();
             if set_clauses.is_empty() {
                 continue;
             }
-            let where_sql = build_pk_where(&pk_indices, columns, &upd.original_row);
+            let where_sql = build_pk_where(engine, &pk_indices, columns, &upd.original_row);
             stmts.push(format!("UPDATE {fq_table} SET {} WHERE {where_sql};", set_clauses.join(", ")));
         }
 
@@ -327,11 +386,16 @@ impl StagedChanges {
                 if matches!(staged_val, StagedCellValue::DefaultExpr) {
                     continue;
                 }
-                col_names.push(quote_ident(&col.name));
-                val_exprs.push(format_pg_literal(col, staged_val));
+                col_names.push(engine.quote_ident(&col.name));
+                val_exprs.push(format_literal(engine, col, staged_val));
             }
             if col_names.is_empty() {
-                stmts.push(format!("INSERT INTO {fq_table} DEFAULT VALUES;"));
+                match engine {
+                    DbEngine::Mysql => stmts.push(format!("INSERT INTO {fq_table} () VALUES ();")),
+                    DbEngine::Postgres | DbEngine::Sqlite => {
+                        stmts.push(format!("INSERT INTO {fq_table} DEFAULT VALUES;"));
+                    }
+                }
             } else {
                 stmts.push(format!(
                     "INSERT INTO {fq_table} ({}) VALUES ({});",
@@ -343,7 +407,7 @@ impl StagedChanges {
 
         // 3. Deletes
         for original_row in self.deletes.values() {
-            let where_sql = build_pk_where(&pk_indices, columns, original_row);
+            let where_sql = build_pk_where(engine, &pk_indices, columns, original_row);
             stmts.push(format!("DELETE FROM {fq_table} WHERE {where_sql};"));
         }
 
@@ -360,8 +424,23 @@ impl StagedChanges {
         table: &str,
         columns: &[ColumnMeta],
     ) -> Result<String, StagingError> {
-        let stmts = self.build_statements(schema, table, columns)?;
-        Ok(format!("BEGIN;\n\n{}\n\nCOMMIT;\n", stmts.join("\n")))
+        self.build_transaction_sql_for_engine(DbEngine::Postgres, schema, table, columns)
+    }
+
+    /// Formats all staged changes as a dialect-appropriate transaction SQL script.
+    pub fn build_transaction_sql_for_engine(
+        &self,
+        engine: DbEngine,
+        schema: &str,
+        table: &str,
+        columns: &[ColumnMeta],
+    ) -> Result<String, StagingError> {
+        let stmts = self.build_statements_for_engine(engine, schema, table, columns)?;
+        let begin = match engine {
+            DbEngine::Mysql => "START TRANSACTION;",
+            DbEngine::Postgres | DbEngine::Sqlite => "BEGIN;",
+        };
+        Ok(format!("{begin}\n\n{}\n\nCOMMIT;\n", stmts.join("\n")))
     }
 
     /// Builds synchronized before/after text blocks so `rune_kit::diff::FileDiff` renders row-level changes clearly.
@@ -445,16 +524,20 @@ fn format_row_label(
     parts.join(", ")
 }
 
-fn build_pk_where(pk_indices: &[usize], columns: &[ColumnMeta], row: &[CellValue]) -> String {
+fn build_pk_where(engine: DbEngine, pk_indices: &[usize], columns: &[ColumnMeta], row: &[CellValue]) -> String {
     let clauses: Vec<String> = pk_indices
         .iter()
         .filter_map(|&idx| {
             let col = columns.get(idx)?;
             let val = row.get(idx).unwrap_or(&CellValue::Null);
             if val.is_null() {
-                Some(format!("{} IS NULL", quote_ident(&col.name)))
+                Some(format!("{} IS NULL", engine.quote_ident(&col.name)))
             } else {
-                Some(format!("{} = {}", quote_ident(&col.name), format_pg_cell_literal(col, val)))
+                Some(format!(
+                    "{} = {}",
+                    engine.quote_ident(&col.name),
+                    format_cell_literal(engine, col, val)
+                ))
             }
         })
         .collect();
@@ -466,13 +549,44 @@ pub fn escape_sql_string(raw: &str) -> String {
     raw.replace('\'', "''")
 }
 
-/// Formats a staged cell edit into a type-safe PostgreSQL literal or expression.
-pub fn format_pg_literal(col: &ColumnMeta, val: &StagedCellValue) -> String {
+/// Escapes backslashes and single quotes for MySQL string literals (`\` -> `\\`, `'` -> `''`).
+pub fn escape_mysql_string(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('\'', "''")
+}
+
+fn strip_hex_prefix(raw: &str) -> &str {
+    raw.strip_prefix("\\x")
+        .or_else(|| raw.strip_prefix("\\X"))
+        .or_else(|| raw.strip_prefix("0x"))
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw)
+}
+
+/// Formats a staged cell edit into a dialect-safe SQL literal or expression.
+pub fn format_literal(engine: DbEngine, col: &ColumnMeta, val: &StagedCellValue) -> String {
     match val {
         StagedCellValue::Null => "NULL".to_owned(),
         StagedCellValue::DefaultExpr => "DEFAULT".to_owned(),
-        StagedCellValue::Literal(raw) => format_raw_pg_literal(col, raw),
+        StagedCellValue::Literal(raw) => match engine {
+            DbEngine::Postgres => format_raw_pg_literal(col, raw),
+            DbEngine::Mysql => format_raw_mysql_literal(col, raw),
+            DbEngine::Sqlite => format_raw_sqlite_literal(col, raw),
+        },
     }
+}
+
+/// Formats an existing decoded [`CellValue`] into a dialect-safe SQL literal.
+pub fn format_cell_literal(engine: DbEngine, col: &ColumnMeta, val: &CellValue) -> String {
+    match engine {
+        DbEngine::Postgres => format_pg_cell_literal(col, val),
+        DbEngine::Mysql => format_mysql_cell_literal(val),
+        DbEngine::Sqlite => format_sqlite_cell_literal(val),
+    }
+}
+
+/// Formats a staged cell edit into a type-safe PostgreSQL literal or expression.
+pub fn format_pg_literal(col: &ColumnMeta, val: &StagedCellValue) -> String {
+    format_literal(DbEngine::Postgres, col, val)
 }
 
 /// Formats an existing decoded [`CellValue`] into a PostgreSQL SQL literal for `WHERE`, `INSERT`, or FK queries.
@@ -512,6 +626,164 @@ pub fn format_pg_cell_literal(col: &ColumnMeta, val: &CellValue) -> String {
             format!("'{}'::{cast}", escape_sql_string(s))
         }
         CellValue::Text(s) => format!("'{}'", escape_sql_string(s)),
+    }
+}
+
+fn format_mysql_cell_literal(val: &CellValue) -> String {
+    match val {
+        CellValue::Null => "NULL".to_owned(),
+        CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
+        CellValue::Int(i) => i.to_string(),
+        CellValue::Float(f) => {
+            if f.is_finite() {
+                f.to_string()
+            } else {
+                format!("'{}'", escape_mysql_string(&f.to_string()))
+            }
+        }
+        CellValue::Numeric(s) => {
+            let trimmed = s.trim();
+            if is_plain_decimal(trimmed) {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_mysql_string(trimmed))
+            }
+        }
+        CellValue::Uuid(u) => format!("'{u}'"),
+        CellValue::Timestamp { raw, .. }
+        | CellValue::Date(raw)
+        | CellValue::Time(raw)
+        | CellValue::Json(raw)
+        | CellValue::Array(raw)
+        | CellValue::Text(raw) => format!("'{}'", escape_mysql_string(raw)),
+        CellValue::Bytes(bytes) => format!("X'{}'", crate::engine::encode_hex(bytes)),
+    }
+}
+
+fn format_sqlite_cell_literal(val: &CellValue) -> String {
+    match val {
+        CellValue::Null => "NULL".to_owned(),
+        CellValue::Bool(b) => if *b { "1" } else { "0" }.to_owned(),
+        CellValue::Int(i) => i.to_string(),
+        CellValue::Float(f) => {
+            if f.is_finite() {
+                f.to_string()
+            } else {
+                format!("'{}'", escape_sql_string(&f.to_string()))
+            }
+        }
+        CellValue::Numeric(s) => {
+            let trimmed = s.trim();
+            if is_plain_decimal(trimmed) {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_sql_string(trimmed))
+            }
+        }
+        CellValue::Uuid(u) => format!("'{u}'"),
+        CellValue::Timestamp { raw, .. }
+        | CellValue::Date(raw)
+        | CellValue::Time(raw)
+        | CellValue::Json(raw)
+        | CellValue::Array(raw)
+        | CellValue::Text(raw) => format!("'{}'", escape_sql_string(raw)),
+        CellValue::Bytes(bytes) => format!("X'{}'", crate::engine::encode_hex(bytes)),
+    }
+}
+
+fn format_raw_mysql_literal(col: &ColumnMeta, raw: &str) -> String {
+    let trimmed = raw.trim();
+    match classify_column_type(col) {
+        LogicalColType::Bool => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" | "y" | "on" => "TRUE".to_owned(),
+            "false" | "f" | "0" | "no" | "n" | "off" => "FALSE".to_owned(),
+            _ => format!("'{}'", escape_mysql_string(trimmed)),
+        },
+        LogicalColType::Int => {
+            if trimmed.parse::<i64>().is_ok() {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_mysql_string(trimmed))
+            }
+        }
+        LogicalColType::Float => {
+            if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_mysql_string(trimmed))
+            }
+        }
+        LogicalColType::Numeric => {
+            if is_plain_decimal(trimmed) {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_mysql_string(trimmed))
+            }
+        }
+        LogicalColType::Bytes => {
+            let hex = strip_hex_prefix(trimmed);
+            if hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                format!("X'{hex}'")
+            } else {
+                format!("'{}'", escape_mysql_string(raw))
+            }
+        }
+        LogicalColType::Json | LogicalColType::Text | LogicalColType::Array => {
+            format!("'{}'", escape_mysql_string(raw))
+        }
+        LogicalColType::Date
+        | LogicalColType::Time
+        | LogicalColType::Timestamp
+        | LogicalColType::TimestampTz
+        | LogicalColType::Uuid => format!("'{}'", escape_mysql_string(trimmed)),
+    }
+}
+
+fn format_raw_sqlite_literal(col: &ColumnMeta, raw: &str) -> String {
+    let trimmed = raw.trim();
+    match classify_column_type(col) {
+        LogicalColType::Bool => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" | "yes" | "y" | "on" => "1".to_owned(),
+            "false" | "f" | "0" | "no" | "n" | "off" => "0".to_owned(),
+            _ => format!("'{}'", escape_sql_string(trimmed)),
+        },
+        LogicalColType::Int => {
+            if trimmed.parse::<i64>().is_ok() {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_sql_string(trimmed))
+            }
+        }
+        LogicalColType::Float => {
+            if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_sql_string(trimmed))
+            }
+        }
+        LogicalColType::Numeric => {
+            if is_plain_decimal(trimmed) {
+                trimmed.to_owned()
+            } else {
+                format!("'{}'", escape_sql_string(trimmed))
+            }
+        }
+        LogicalColType::Bytes => {
+            let hex = strip_hex_prefix(trimmed);
+            if hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                format!("X'{hex}'")
+            } else {
+                format!("'{}'", escape_sql_string(raw))
+            }
+        }
+        LogicalColType::Json | LogicalColType::Text | LogicalColType::Array => {
+            format!("'{}'", escape_sql_string(raw))
+        }
+        LogicalColType::Date
+        | LogicalColType::Time
+        | LogicalColType::Timestamp
+        | LogicalColType::TimestampTz
+        | LogicalColType::Uuid => format!("'{}'", escape_sql_string(trimmed)),
     }
 }
 
@@ -599,12 +871,107 @@ pub fn build_fk_where_clause(
     value: &CellValue,
     source_col: &ColumnMeta,
 ) -> Option<String> {
+    build_fk_where_clause_for_engine(DbEngine::Postgres, target_column, value, source_col)
+}
+
+/// Builds a dialect-aware `WHERE` filter snippet targeting the referenced foreign-key row, returning `None` for `NULL`.
+pub fn build_fk_where_clause_for_engine(
+    engine: DbEngine,
+    target_column: &str,
+    value: &CellValue,
+    source_col: &ColumnMeta,
+) -> Option<String> {
     if value.is_null() {
         return None;
     }
     Some(format!(
         "{} = {}",
-        quote_ident(target_column),
-        format_pg_cell_literal(source_col, value)
+        engine.quote_ident(target_column),
+        format_cell_literal(engine, source_col, value)
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, udt_name: &str, pk: bool, default_expr: Option<&str>) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            data_type: udt_name.to_owned(),
+            udt_name: udt_name.to_owned(),
+            nullable: !pk,
+            default_expr: default_expr.map(str::to_owned),
+            is_primary_key: pk,
+            is_unique: false,
+            comment: None,
+            foreign_key: None,
+        }
+    }
+
+    #[test]
+    fn mysql_and_sqlite_staging_sql_dialects() {
+        let cols = vec![
+            col("id", "int", true, Some("auto_increment")),
+            col("active", "tinyint(1)", false, None),
+            col("note", "varchar", false, None),
+            col("badge", "blob", false, None),
+        ];
+
+        assert_eq!(escape_mysql_string(r"a\b'c"), r"a\\b''c");
+
+        let mut staged = StagedChanges::new();
+        let row0 = vec![
+            CellValue::Int(1),
+            CellValue::Bool(true),
+            CellValue::Text("hi".to_owned()),
+            CellValue::Bytes(vec![0xca, 0xfe]),
+        ];
+        staged.stage_cell_edit(0, &row0, 1, StagedCellValue::Literal("false".to_owned()));
+        staged.stage_cell_edit(0, &row0, 2, StagedCellValue::Literal(r"it's \ok".to_owned()));
+        let draft = staged.stage_insert_row(&cols);
+        let _ = draft;
+
+        let mysql_tx = staged
+            .build_transaction_sql_for_engine(DbEngine::Mysql, "greendale", "students", &cols)
+            .expect("mysql tx");
+        assert!(mysql_tx.starts_with("START TRANSACTION;\n"));
+        assert!(mysql_tx.contains("UPDATE `greendale`.`students` SET `active` = FALSE, `note` = 'it''s \\\\ok' WHERE `id` = 1;"));
+        assert!(mysql_tx.contains("INSERT INTO `greendale`.`students` (`active`, `note`, `badge`) VALUES (NULL, NULL, NULL);"));
+
+        let sqlite_tx = staged
+            .build_transaction_sql_for_engine(DbEngine::Sqlite, "", "students", &cols)
+            .expect("sqlite tx");
+        assert!(sqlite_tx.starts_with("BEGIN;\n"));
+        assert!(sqlite_tx.contains("UPDATE \"students\" SET \"active\" = 0, \"note\" = 'it''s \\ok' WHERE \"id\" = 1;"));
+
+        let mut default_only = StagedChanges::new();
+        default_only.stage_insert_row(&[col("id", "int", true, Some("1"))]);
+        assert_eq!(
+            default_only
+                .build_statements_for_engine(DbEngine::Mysql, "", "t", &[col("id", "int", true, Some("1"))])
+                .expect("mysql default insert"),
+            vec!["INSERT INTO `t` () VALUES ();"]
+        );
+        assert_eq!(
+            default_only
+                .build_statements_for_engine(DbEngine::Sqlite, "", "t", &[col("id", "int", true, Some("1"))])
+                .expect("sqlite default insert"),
+            vec!["INSERT INTO \"t\" DEFAULT VALUES;"]
+        );
+
+        assert_eq!(
+            format_cell_literal(DbEngine::Mysql, &cols[3], &CellValue::Bytes(vec![0xde, 0xad])),
+            "X'dead'"
+        );
+        assert_eq!(
+            format_cell_literal(DbEngine::Sqlite, &cols[1], &CellValue::Bool(true)),
+            "1"
+        );
+        assert_eq!(
+            StagedCellValue::Literal("1".to_owned()).to_preview_cell(&cols[1]),
+            CellValue::Bool(true)
+        );
+    }
 }

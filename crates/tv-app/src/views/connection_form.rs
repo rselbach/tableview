@@ -1,21 +1,43 @@
 use rune::{El, Key, Tx, col, el, row, spacer, text};
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, Dialog, Field, Kit, Select, SelectAppearance, Spinner, TextInput,
+    Button, ButtonVariant, ControlSize, Dialog, Field, Kit, SegmentedControl, Select, SelectAppearance, Spinner,
+    State, TextInput,
 };
-use tv_core::{AccentColor, ConnectionId, EnvTag, PasswordMode, SafetyPolicy, SslMode};
+use tv_core::{AccentColor, ConnectionId, DbEngine, EnvTag, PasswordMode, SafetyPolicy, SslMode};
 
 use crate::state::{AppState, ConnectionFormState, ImportUrlState, OpenFormSelect, OverlayState, PasswordPromptState, TestStatus};
 use crate::theme;
 
-/// Builds the modal dialog for creating or editing a PostgreSQL connection.
+/// Builds the modal dialog for creating or editing a database connection.
 pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     let is_edit = form.editing_id.is_some();
-    let title = if is_edit {
-        "Edit PostgreSQL Connection"
+    let title = format!(
+        "{} {} Connection",
+        if is_edit { "Edit" } else { "New" },
+        form.engine.label()
+    );
+
+    let engine_labels: Vec<&str> = DbEngine::ALL.iter().map(|e| e.label()).collect();
+    let engine_idx = DbEngine::ALL.iter().position(|e| *e == form.engine).unwrap_or(0);
+    let mut engine_seg = SegmentedControl::new(&engine_labels, Some(engine_idx))
+        .label("Database engine")
+        .width(None);
+    if is_edit {
+        for i in 0..DbEngine::ALL.len() {
+            engine_seg = engine_seg.segment_state(i, State::Disabled);
+        }
     } else {
-        "New PostgreSQL Connection"
-    };
+        engine_seg = engine_seg.on_pick(|s: &mut AppState, idx, _| {
+            if let Some(engine) = DbEngine::ALL.get(idx).copied() {
+                s.set_form_engine(engine);
+            }
+        });
+    }
+    let engine_field = Field::new()
+        .label("Engine")
+        .control(engine_seg.build(k).key("form-engine"))
+        .build(k);
 
     let name_field = Field::new()
         .label("Name")
@@ -125,222 +147,271 @@ pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut
         .radius(k.radius.md)
         .fill(c.layer_02)
         .border(0.5, c.border_muted)
+        .child(engine_field)
         .child(name_field)
         .child(meta_row);
 
-    let host_port_row = row()
-        .w_full()
-        .gap(10.0)
-        .child(
-            col().grow(3.0).min_w(0.0).child(
-                Field::new()
-                    .label("Host / Socket")
-                    .control(
-                        TextInput::new(&form.host)
-                            .label("Host or Unix socket")
-                            .placeholder("127.0.0.1")
-                            .width(None)
-                            .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.host))
-                            .build(k),
-                    )
-                    .build(k),
-            ),
-        )
-        .child(
-            col().w(96.0).child(
-                Field::new()
-                    .label("Port")
-                    .control(
-                        TextInput::new(&form.port)
-                            .label("Port")
-                            .placeholder("5432")
-                            .width(None)
-                            .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.port))
-                            .build(k),
-                    )
-                    .build(k),
-            ),
-        );
-
-    let user_db_row = row()
-        .w_full()
-        .gap(10.0)
-        .child(
-            col().grow(1.0).min_w(0.0).child(
-                Field::new()
-                    .label("User")
-                    .control(
-                        TextInput::new(&form.user)
-                            .label("User")
-                            .placeholder("postgres")
-                            .width(None)
-                            .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.user))
-                            .build(k),
-                    )
-                    .build(k),
-            ),
-        )
-        .child(
-            col().grow(1.0).min_w(0.0).child(
-                Field::new()
-                    .label("Database")
-                    .control(
-                        TextInput::new(&form.database)
-                            .label("Database")
-                            .placeholder("Optional (pick with ⌘K)")
-                            .width(None)
-                            .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.database))
-                            .build(k),
-                    )
-                    .build(k),
-            ),
-        );
-
-    let pw_disabled = form.password_mode != PasswordMode::Keychain;
-    let pw_placeholder = match form.password_mode {
-        PasswordMode::Keychain if form.loading_credential => "Loading from keychain…",
-        PasswordMode::Keychain => "Stored in system keychain",
-        PasswordMode::AskEveryTime => "Prompted on connect",
-        PasswordMode::None => "No password",
-    };
-    let pw_mode_labels: Vec<&str> = PasswordMode::ALL.iter().map(|m| m.label()).collect();
-    let pw_mode_select = Select::new("form-pw-mode", &pw_mode_labels)
-        .label("Password Mode")
-        .appearance(SelectAppearance::Field)
-        .fill()
-        .current(Some(form.password_mode.label()))
-        .open(form.open_select == OpenFormSelect::PasswordMode)
-        .on_toggle(|s: &mut AppState| toggle_form_select(s, OpenFormSelect::PasswordMode))
-        .on_close(|s: &mut AppState| close_form_select(s))
-        .on_choose(|s: &mut AppState, val: &str, _| {
-            if let OverlayState::ConnectionForm(f) = &mut s.overlay {
-                if let Some(mode) = PasswordMode::from_label(val) {
-                    f.password_mode = mode;
+    let conn_card = if form.engine == DbEngine::Sqlite {
+        let sqlite_input = TextInput::new(&form.file_path)
+            .label("Database File")
+            .placeholder("/path/to/database.db or :memory:")
+            .width(None)
+            .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.file_path))
+            .on_change(|s: &mut AppState, _| {
+                if let OverlayState::ConnectionForm(f) = &mut s.overlay {
+                    f.validation_error = None;
                 }
-                f.open_select = OpenFormSelect::None;
-            }
-        })
-        .build(k, layer);
+            })
+            .build(k)
+            .key("form-sqlite-path");
+        let browse_btn = Button::new("Browse…")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Regular)
+            .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.browse_sqlite_file(tx))
+            .build(k)
+            .key("form-sqlite-browse");
 
-    let password_row = row()
-        .w_full()
-        .gap(10.0)
-        .items_end()
-        .child(
-            col().grow(1.3).min_w(0.0).child(
+        col()
+            .key("form-conn-card")
+            .w_full()
+            .padding(12.0)
+            .gap(10.0)
+            .radius(k.radius.md)
+            .fill(c.layer_02)
+            .border(0.5, c.border_muted)
+            .child(
                 Field::new()
-                    .label("Password")
+                    .label("Database File")
+                    .suffix("Choose an existing .db / .sqlite / .sqlite3 file, or enter :memory:.")
                     .control(
-                        TextInput::new(&form.password)
-                            .label("Password")
-                            .placeholder(pw_placeholder)
-                            .width(None)
-                            .secure()
-                            .disabled(pw_disabled)
-                            .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.password))
-                            .on_change(|s: &mut AppState, _| {
-                                if let OverlayState::ConnectionForm(f) = &mut s.overlay {
-                                    f.password_touched = true;
-                                }
-                            })
-                            .build(k),
+                        row()
+                            .w_full()
+                            .gap(8.0)
+                            .center_y()
+                            .child(el().grow(1.0).min_w(0.0).child(sqlite_input))
+                            .child(browse_btn),
                     )
                     .build(k),
-            ),
-        )
-        .child(
-            col().grow(1.0).min_w(0.0).child(
-                Field::new()
-                    .label("Storage")
-                    .control(pw_mode_select)
-                    .build(k),
-            ),
-        );
+            )
+    } else {
+        let port_placeholder = form.engine.default_port().to_string();
+        let user_placeholder = form.engine.default_user();
 
-    let ssl_labels: Vec<&str> = SslMode::ALL.iter().map(|m| m.label()).collect();
-    let ssl_select = Select::new("form-ssl-mode", &ssl_labels)
-        .label("SSL Mode")
-        .appearance(SelectAppearance::Field)
-        .fill()
-        .current(Some(form.ssl_mode.label()))
-        .open(form.open_select == OpenFormSelect::SslMode)
-        .on_toggle(|s: &mut AppState| toggle_form_select(s, OpenFormSelect::SslMode))
-        .on_close(|s: &mut AppState| close_form_select(s))
-        .on_choose(|s: &mut AppState, val: &str, _| {
-            if let OverlayState::ConnectionForm(f) = &mut s.overlay {
-                if let Some(mode) = SslMode::from_pg_param(val) {
-                    f.ssl_mode = mode;
-                }
-                f.open_select = OpenFormSelect::None;
-            }
-        })
-        .build(k, layer);
-
-    let mut conn_card = col()
-        .key("form-conn-card")
-        .w_full()
-        .padding(12.0)
-        .gap(10.0)
-        .radius(k.radius.md)
-        .fill(c.layer_02)
-        .border(0.5, c.border_muted)
-        .child(host_port_row)
-        .child(user_db_row)
-        .child(password_row)
-        .child(Field::new().label("SSL Mode").control(ssl_select).build(k));
-
-    if matches!(form.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull | SslMode::Require) {
-        conn_card = conn_card.child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .child(
-                    col().grow(1.0).min_w(0.0).child(
-                        Field::new()
-                            .label("CA Cert")
-                            .control(
-                                TextInput::new(&form.ca_cert)
-                                    .label("CA certificate path")
-                                    .placeholder("Optional PEM path")
-                                    .width(None)
-                                    .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.ca_cert))
-                                    .build(k),
-                            )
-                            .build(k),
-                    ),
-                )
-                .child(
-                    col().grow(1.0).min_w(0.0).child(
-                        Field::new()
-                            .label("Client Cert")
-                            .control(
-                                TextInput::new(&form.cert)
-                                    .label("Client certificate path")
-                                    .placeholder("Optional PEM path")
-                                    .width(None)
-                                    .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.cert))
-                                    .build(k),
-                            )
-                            .build(k),
-                    ),
-                )
-                .child(
-                    col().grow(1.0).min_w(0.0).child(
-                        Field::new()
-                            .label("Client Key")
-                            .control(
-                                TextInput::new(&form.key)
-                                    .label("Client private key path")
-                                    .placeholder("Optional PEM path")
-                                    .width(None)
-                                    .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.key))
-                                    .build(k),
-                            )
-                            .build(k),
-                    ),
+        let host_port_row = row()
+            .w_full()
+            .gap(10.0)
+            .child(
+                col().grow(3.0).min_w(0.0).child(
+                    Field::new()
+                        .label("Host / Socket")
+                        .control(
+                            TextInput::new(&form.host)
+                                .label("Host or Unix socket")
+                                .placeholder("127.0.0.1")
+                                .width(None)
+                                .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.host))
+                                .build(k),
+                        )
+                        .build(k),
                 ),
-        );
-    }
+            )
+            .child(
+                col().w(96.0).child(
+                    Field::new()
+                        .label("Port")
+                        .control(
+                            TextInput::new(&form.port)
+                                .label("Port")
+                                .placeholder(port_placeholder)
+                                .width(None)
+                                .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.port))
+                                .build(k),
+                        )
+                        .build(k),
+                ),
+            );
+
+        let user_db_row = row()
+            .w_full()
+            .gap(10.0)
+            .child(
+                col().grow(1.0).min_w(0.0).child(
+                    Field::new()
+                        .label("User")
+                        .control(
+                            TextInput::new(&form.user)
+                                .label("User")
+                                .placeholder(user_placeholder)
+                                .width(None)
+                                .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.user))
+                                .build(k),
+                        )
+                        .build(k),
+                ),
+            )
+            .child(
+                col().grow(1.0).min_w(0.0).child(
+                    Field::new()
+                        .label("Database")
+                        .control(
+                            TextInput::new(&form.database)
+                                .label("Database")
+                                .placeholder("Optional (pick with ⌘K)")
+                                .width(None)
+                                .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.database))
+                                .build(k),
+                        )
+                        .build(k),
+                ),
+            );
+
+        let pw_disabled = form.password_mode != PasswordMode::Keychain;
+        let pw_placeholder = match form.password_mode {
+            PasswordMode::Keychain if form.loading_credential => "Loading from keychain…",
+            PasswordMode::Keychain => "Stored in system keychain",
+            PasswordMode::AskEveryTime => "Prompted on connect",
+            PasswordMode::None => "No password",
+        };
+        let pw_mode_labels: Vec<&str> = PasswordMode::ALL.iter().map(|m| m.label()).collect();
+        let pw_mode_select = Select::new("form-pw-mode", &pw_mode_labels)
+            .label("Password Mode")
+            .appearance(SelectAppearance::Field)
+            .fill()
+            .current(Some(form.password_mode.label()))
+            .open(form.open_select == OpenFormSelect::PasswordMode)
+            .on_toggle(|s: &mut AppState| toggle_form_select(s, OpenFormSelect::PasswordMode))
+            .on_close(|s: &mut AppState| close_form_select(s))
+            .on_choose(|s: &mut AppState, val: &str, _| {
+                if let OverlayState::ConnectionForm(f) = &mut s.overlay {
+                    if let Some(mode) = PasswordMode::from_label(val) {
+                        f.password_mode = mode;
+                    }
+                    f.open_select = OpenFormSelect::None;
+                }
+            })
+            .build(k, layer);
+
+        let password_row = row()
+            .w_full()
+            .gap(10.0)
+            .items_end()
+            .child(
+                col().grow(1.3).min_w(0.0).child(
+                    Field::new()
+                        .label("Password")
+                        .control(
+                            TextInput::new(&form.password)
+                                .label("Password")
+                                .placeholder(pw_placeholder)
+                                .width(None)
+                                .secure()
+                                .disabled(pw_disabled)
+                                .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.password))
+                                .on_change(|s: &mut AppState, _| {
+                                    if let OverlayState::ConnectionForm(f) = &mut s.overlay {
+                                        f.password_touched = true;
+                                    }
+                                })
+                                .build(k),
+                        )
+                        .build(k),
+                ),
+            )
+            .child(
+                col().grow(1.0).min_w(0.0).child(
+                    Field::new()
+                        .label("Storage")
+                        .control(pw_mode_select)
+                        .build(k),
+                ),
+            );
+
+        let ssl_labels: Vec<&str> = SslMode::ALL.iter().map(|m| m.label()).collect();
+        let ssl_select = Select::new("form-ssl-mode", &ssl_labels)
+            .label("SSL Mode")
+            .appearance(SelectAppearance::Field)
+            .fill()
+            .current(Some(form.ssl_mode.label()))
+            .open(form.open_select == OpenFormSelect::SslMode)
+            .on_toggle(|s: &mut AppState| toggle_form_select(s, OpenFormSelect::SslMode))
+            .on_close(|s: &mut AppState| close_form_select(s))
+            .on_choose(|s: &mut AppState, val: &str, _| {
+                if let OverlayState::ConnectionForm(f) = &mut s.overlay {
+                    if let Some(mode) = SslMode::from_pg_param(val) {
+                        f.ssl_mode = mode;
+                    }
+                    f.open_select = OpenFormSelect::None;
+                }
+            })
+            .build(k, layer);
+
+        let mut card = col()
+            .key("form-conn-card")
+            .w_full()
+            .padding(12.0)
+            .gap(10.0)
+            .radius(k.radius.md)
+            .fill(c.layer_02)
+            .border(0.5, c.border_muted)
+            .child(host_port_row)
+            .child(user_db_row)
+            .child(password_row)
+            .child(Field::new().label("SSL Mode").control(ssl_select).build(k));
+
+        if matches!(form.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull | SslMode::Require) {
+            card = card.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .child(
+                        col().grow(1.0).min_w(0.0).child(
+                            Field::new()
+                                .label("CA Cert")
+                                .control(
+                                    TextInput::new(&form.ca_cert)
+                                        .label("CA certificate path")
+                                        .placeholder("Optional PEM path")
+                                        .width(None)
+                                        .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.ca_cert))
+                                        .build(k),
+                                )
+                                .build(k),
+                        ),
+                    )
+                    .child(
+                        col().grow(1.0).min_w(0.0).child(
+                            Field::new()
+                                .label("Client Cert")
+                                .control(
+                                    TextInput::new(&form.cert)
+                                        .label("Client certificate path")
+                                        .placeholder("Optional PEM path")
+                                        .width(None)
+                                        .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.cert))
+                                        .build(k),
+                                )
+                                .build(k),
+                        ),
+                    )
+                    .child(
+                        col().grow(1.0).min_w(0.0).child(
+                            Field::new()
+                                .label("Client Key")
+                                .control(
+                                    TextInput::new(&form.key)
+                                        .label("Client private key path")
+                                        .placeholder("Optional PEM path")
+                                        .width(None)
+                                        .on_edit(|s: &mut AppState| s.form_field_mut(|f| &mut f.key))
+                                        .build(k),
+                                )
+                                .build(k),
+                        ),
+                    ),
+            );
+        }
+        card
+    };
 
     let mut feedback = col().w_full().gap(6.0);
     if let Some(err) = &form.validation_error {
@@ -480,12 +551,12 @@ fn close_form_select(s: &mut AppState) {
     }
 }
 
-/// Builds the modal for importing a `postgres://` connection URL.
+/// Builds the modal for importing a `postgresql://`, `mysql://`, or `sqlite://` connection URL.
 pub fn build_import_url(modal: &ImportUrlState, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     let input = TextInput::new(&modal.url)
-        .label("PostgreSQL URL")
-        .placeholder("postgresql://user:password@127.0.0.1:5432/database?sslmode=prefer")
+        .label("Connection URL")
+        .placeholder("postgresql://..., mysql://..., or sqlite:///path/to/database.db")
         .width(None)
         .on_edit(AppState::import_url_mut)
         .on_submit(|s: &mut AppState, tx| s.submit_import_url(tx))
@@ -530,7 +601,7 @@ pub fn build_import_url(modal: &ImportUrlState, k: &Kit, layer: &mut Vec<El>) {
             ),
     );
 
-    Dialog::new("import-url", "Import PostgreSQL URL")
+    Dialog::new("import-url", "Import Connection URL")
         .open(true)
         .width(500.0)
         .fit()

@@ -8,7 +8,7 @@ use crate::state::QueryTabState;
 use crate::views::pill_badge;
 
 /// Builds the Visual EXPLAIN pane (operator tree + proportional bars, or formatted JSON).
-pub fn build_explain_pane(tab: &QueryTabState, k: &Kit) -> El {
+pub fn build_explain_pane(tab: &QueryTabState, supports_analyze: bool, k: &Kit) -> El {
     let c = &k.c;
 
     if tab.explain_loading {
@@ -54,13 +54,13 @@ pub fn build_explain_pane(tab: &QueryTabState, k: &Kit) -> El {
             .gap(8.0)
             .child(text("No execution plan captured yet").font(k.ty.body_medium).color(c.text_base))
             .child(
-                text("Click Explain (⇧⌘E) to inspect the PostgreSQL query plan.")
+                text("Click Explain (⇧⌘E) to inspect the query plan.")
                     .font(k.ty.ui_compact)
                     .color(c.text_muted),
             );
     };
 
-    let summary_bar = build_summary_bar(tab, plan, k);
+    let summary_bar = build_summary_bar(tab, plan, supports_analyze, k);
 
     let body = if tab.explain_raw_json {
         let highlights = syntax::highlight(Some("json"), &plan.raw_json);
@@ -117,7 +117,7 @@ pub fn build_explain_pane(tab: &QueryTabState, k: &Kit) -> El {
         .child(body)
 }
 
-fn build_summary_bar(tab: &QueryTabState, plan: &ExplainPlan, k: &Kit) -> El {
+fn build_summary_bar(tab: &QueryTabState, plan: &ExplainPlan, supports_analyze: bool, k: &Kit) -> El {
     let c = &k.c;
     let mono = k.ty.small.mono().features("'tnum'");
     let raw_for_copy = plan.raw_json.clone();
@@ -180,7 +180,7 @@ fn build_summary_bar(tab: &QueryTabState, plan: &ExplainPlan, k: &Kit) -> El {
         .build(k)
         .key("explain-mode-switch");
 
-    row()
+    let mut bar = row()
         .key("explain-summary-bar")
         .w_full()
         .h(36.0)
@@ -191,8 +191,10 @@ fn build_summary_bar(tab: &QueryTabState, plan: &ExplainPlan, k: &Kit) -> El {
         .border_sides([0.0, 0.0, 1.0, 0.0], c.border_muted)
         .child(left)
         .child(spacer())
-        .child(mode_switch)
-        .child(
+        .child(mode_switch);
+
+    if supports_analyze {
+        bar = bar.child(
             Button::new("Run ANALYZE")
                 .variant(ButtonVariant::Outline)
                 .control_size(ControlSize::Mini)
@@ -202,19 +204,21 @@ fn build_summary_bar(tab: &QueryTabState, plan: &ExplainPlan, k: &Kit) -> El {
                 })
                 .build(k)
                 .key("explain-analyze-btn"),
-        )
-        .child(
-            Button::new("Copy JSON")
-                .variant(ButtonVariant::Ghost)
-                .control_size(ControlSize::Mini)
-                .icon(&icons::COPY)
-                .on_press_tx(move |s: &mut crate::state::AppState, tx: &mut Tx| {
-                    tx.copy(raw_for_copy.clone());
-                    s.set_notice("Copied EXPLAIN JSON to clipboard", false);
-                })
-                .build(k)
-                .key("explain-copy-btn"),
-        )
+        );
+    }
+
+    bar.child(
+        Button::new("Copy JSON")
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Mini)
+            .icon(&icons::COPY)
+            .on_press_tx(move |s: &mut crate::state::AppState, tx: &mut Tx| {
+                tx.copy(raw_for_copy.clone());
+                s.set_notice("Copied EXPLAIN JSON to clipboard", false);
+            })
+            .build(k)
+            .key("explain-copy-btn"),
+    )
 }
 
 fn flatten_plan<'a>(node: &'a ExplainNode, depth: usize, out: &mut Vec<(usize, &'a ExplainNode)>) {
@@ -375,11 +379,16 @@ fn build_node_card(
 
 fn node_badge_colors(node_type: &str, k: &Kit) -> (rune::Color, rune::Color, rune::Color) {
     let c = &k.c;
-    if node_type == "Seq Scan" {
+    let upper = node_type.to_ascii_uppercase();
+    if node_type == "Seq Scan"
+        || upper == "SCAN"
+        || upper.contains("FULL TABLE SCAN")
+        || upper.contains("TABLE SCAN")
+    {
         (c.warning.bg, c.warning.fg, c.warning.border)
-    } else if node_type.contains("Index") {
+    } else if upper == "SEARCH" || node_type.contains("Index") || upper.contains("INDEX") {
         (c.success.bg, c.success.fg, c.success.border)
-    } else if node_type.contains("Join") || node_type.contains("Nested Loop") {
+    } else if node_type.contains("Join") || upper.contains("NESTED LOOP") {
         (c.info.bg, c.info.fg, c.info.border)
     } else {
         (c.layer_02, c.text_base, c.border_base)
