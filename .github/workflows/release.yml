@@ -123,9 +123,7 @@ jobs:
       - name: Lint and test
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked -p tv-update
-          cargo test --locked -p tv-core --lib --test core_unit
-          cargo test --locked -p tv-app
+          cargo test --locked --workspace -- --skip live_postgres
 
       - name: Import Developer ID signing certificate
         env:
@@ -302,7 +300,7 @@ jobs:
           shared-key: release-update-tool
 
       - name: Build update tool
-        run: cargo build --locked --release -p tv-update --bin tv-update-tool
+        run: cargo build --locked -p tv-update --bin tv-update-tool
 
       - name: Sign update feed
         env:
@@ -315,7 +313,7 @@ jobs:
           dmg="TableView-${VERSION}-macos-arm64.dmg"
           minimum_os="$(python3 -c 'import plistlib; print(plistlib.load(open("packaging/macos/Info.plist", "rb"))["LSMinimumSystemVersion"])')"
           mkdir -p _site
-          target/release/tv-update-tool sign-feed \
+          target/debug/tv-update-tool sign-feed \
             --version "${VERSION}" \
             --build "${BUILD}" \
             --arch arm64 \
@@ -336,7 +334,7 @@ jobs:
           BUILD: ${{ github.run_number }}
         run: |
           for attempt in 1 2 3 4 5; do
-            if target/release/tv-update-tool verify-feed _site/update.json \
+            if target/debug/tv-update-tool verify-feed _site/update.json \
               --version "${VERSION}" --build "${BUILD}" --arch arm64 --download; then
               exit 0
             fi
