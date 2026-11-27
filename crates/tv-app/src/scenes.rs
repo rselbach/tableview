@@ -475,10 +475,11 @@ fn scene_workspace_sql_editor_dark(s: &mut AppState) {
         qtab.saved_snapshot = sql.to_owned();
     }
     qtab.total_duration_ms = Some(11);
-    let mut t1 = rune_kit::TableState::new().key("tv-qres-3-0");
-    t1.select("r-0");
-    let res1 = QueryResultTabState {
-        statement: QueryStatementResult {
+    let mut res1 = QueryResultTabState::new(
+        tid,
+        0,
+        0,
+        QueryStatementResult {
             sql: "SELECT student_id, id, full_name, email, enrolled, gpa, profile, created_at, group_id FROM public.students WHERE enrolled = true ORDER BY student_id".to_owned(),
             columns: cols,
             rows: enrolled_rows,
@@ -488,11 +489,14 @@ fn scene_workspace_sql_editor_dark(s: &mut AppState) {
             elapsed_ms: 8,
             error: None,
         },
-        table: t1,
-        selected_row: Some(0),
-    };
-    let res2 = QueryResultTabState {
-        statement: QueryStatementResult {
+    );
+    res1.table.select("r-0");
+    res1.selected_row = Some(0);
+    let res2 = QueryResultTabState::new(
+        tid,
+        0,
+        1,
+        QueryStatementResult {
             sql: "SELECT COUNT(*) AS active_students FROM public.students WHERE enrolled = true".to_owned(),
             columns: vec![ColumnMeta {
                 name: "active_students".to_owned(),
@@ -512,9 +516,7 @@ fn scene_workspace_sql_editor_dark(s: &mut AppState) {
             elapsed_ms: 3,
             error: None,
         },
-        table: rune_kit::TableState::new().key("tv-qres-3-1"),
-        selected_row: None,
-    };
+    );
     qtab.results = vec![res1, res2];
 
     if let Some(session) = s.active_session_mut() {
@@ -558,8 +560,11 @@ fn scene_workspace_sql_saved_queries(s: &mut AppState) {
     let tid = s.alloc_tab_id();
     let mut qtab = QueryTabState::new(tid, saved_name, saved_sql.clone(), Some(saved_id));
     qtab.total_duration_ms = Some(6);
-    qtab.results = vec![QueryResultTabState {
-        statement: QueryStatementResult {
+    qtab.results = vec![QueryResultTabState::new(
+        tid,
+        0,
+        0,
+        QueryStatementResult {
             sql: saved_sql,
             columns: Vec::new(),
             rows: Vec::new(),
@@ -569,9 +574,7 @@ fn scene_workspace_sql_saved_queries(s: &mut AppState) {
             elapsed_ms: 6,
             error: None,
         },
-        table: rune_kit::TableState::new().key("tv-qres-3-0"),
-        selected_row: None,
-    }];
+    )];
 
     if let Some(session) = s.active_session_mut() {
         session.sidebar_tab = SidebarTab::Queries;

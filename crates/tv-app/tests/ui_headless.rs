@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rune::{ColorScheme, Env, Key, KeyEvent, Mods, Runtime};
+use rune::{ColorScheme, Env, GesturePhase, Key, KeyEvent, Mods, Runtime, WheelEvent};
 use rune_kit::diff::DiffMode;
 use tv_app::platform::{Action, dispatch_action};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
@@ -1752,6 +1752,615 @@ fn sqlite_workspace_hides_schema_dropdown_and_disables_multi_db_switching() {
     assert!(rt.find("explain-pane-root").is_some());
     assert!(rt.find("explain-copy-btn").is_some());
     assert!(rt.find("explain-analyze-btn").is_none());
+}
+
+fn find_el_by_key<'a>(els: &'a [rune::ElementInfo], key: &str) -> &'a rune::ElementInfo {
+    els.iter()
+        .find(|el| el.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("missing element key {key}"))
+}
+
+fn find_el_by_path_suffix<'a>(els: &'a [rune::ElementInfo], suffix: &str) -> Option<&'a rune::ElementInfo> {
+    els.iter().find(|el| el.path.ends_with(suffix))
+}
+
+fn settle_frames(rt: &mut Runtime<AppState>) {
+    for _ in 0..4 {
+        rt.frame(1.0 / 60.0);
+    }
+}
+
+#[test]
+fn sql_results_horizontal_scrollbar_drag_wheel_shift_wheel_and_keys() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sql-editor-dark");
+    settle_frames(&mut rt);
+
+    let els = rt.elements();
+    let track = find_el_by_key(&els, "tv-qres-3-0-hscroll-track");
+    let thumb = find_el_by_key(&els, "tv-qres-3-0-hscroll-thumb");
+    assert!(track.rect[2] > 200.0, "expected wide hscroll track, got {:?}", track.rect);
+    assert!(
+        thumb.rect[2] >= 32.0 && thumb.rect[2] < track.rect[2],
+        "expected overflowing hscroll thumb < track width, thumb={:?} track={:?}",
+        thumb.rect,
+        track.rect
+    );
+    let track_rect = track.rect;
+    let start_thumb_x = thumb.rect[0];
+    let mid_y = thumb.rect[1] + thumb.rect[3] * 0.5;
+    let grab_x = thumb.rect[0] + thumb.rect[2] * 0.5;
+    let right_target_x = track_rect[0] + track_rect[2] - 8.0;
+
+    // 1. Drag scrollbar thumb to the right edge -> rightmost column `group_id` (`c-8`) appears
+    // while frozen `#` column stays pinned at the left edge.
+    rt.pointer_down(grab_x, mid_y);
+    rt.frame(0.0);
+    rt.pointer_move(right_target_x, mid_y);
+    rt.frame(0.1);
+    rt.pointer_up(right_target_x, mid_y);
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty(), "live_only warnings: {:?}", rt.live_only_warnings());
+
+    let els_dragged = rt.elements();
+    let vp_rect = find_el_by_path_suffix(&els_dragged, "tv-qres-3-0/viewport")
+        .expect("qres viewport")
+        .rect;
+    let thumb_after_drag = find_el_by_key(&els_dragged, "tv-qres-3-0-hscroll-thumb");
+    assert!(
+        thumb_after_drag.rect[0] > start_thumb_x + 40.0,
+        "thumb did not move right: before={start_thumb_x}, after={:?}",
+        thumb_after_drag.rect
+    );
+    let header_c8 = find_el_by_path_suffix(&els_dragged, "/header/c-8").expect("header c-8 visible after drag");
+    let row0_c8 = find_el_by_path_suffix(&els_dragged, "/r-0/c-8").expect("row 0 c-8 visible after drag");
+    assert!(header_c8.visible[2] > 20.0, "header c-8 not visible: {:?}", header_c8.visible);
+    assert!(row0_c8.visible[2] > 20.0, "row0 c-8 not visible: {:?}", row0_c8.visible);
+    let frozen_hash = find_el_by_path_suffix(&els_dragged, "/header/#").expect("frozen # header");
+    assert!(
+        (frozen_hash.rect[0] - vp_rect[0]).abs() <= 1.0,
+        "frozen # drifted from left edge: hash={:?} vp={:?}",
+        frozen_hash.rect,
+        vp_rect
+    );
+
+    // 2. Click left end of track to jump back to start.
+    rt.pointer_down(track_rect[0] + 6.0, mid_y);
+    rt.pointer_up(track_rect[0] + 6.0, mid_y);
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+    let els_reset = rt.elements();
+    let thumb_reset = find_el_by_key(&els_reset, "tv-qres-3-0-hscroll-thumb");
+    assert!(
+        thumb_reset.rect[0] <= start_thumb_x + 1.5,
+        "track jump did not return to start: thumb={:?} start_thumb_x={start_thumb_x}",
+        thumb_reset.rect
+    );
+
+    // 3. Horizontal wheel scrolls content and moves scrollbar thumb in sync.
+    let vx = vp_rect[0] + vp_rect[2] * 0.5;
+    let vy = vp_rect[1] + vp_rect[3] * 0.5;
+    rt.wheel_xy(vx, vy, -280.0, 0.0);
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+    let els_wheel = rt.elements();
+    let thumb_after_wheel = find_el_by_key(&els_wheel, "tv-qres-3-0-hscroll-thumb").rect[0];
+    assert!(
+        thumb_after_wheel > track_rect[0] + 10.0,
+        "horizontal wheel did not update thumb: {thumb_after_wheel} vs track {}",
+        track_rect[0]
+    );
+
+    // 4. macOS Shift + precise vertical wheel scrolls horizontally too.
+    rt.wheel_event(
+        WheelEvent::new(0.0, -240.0)
+            .at(vx, vy)
+            .mods(Mods {
+                shift: true,
+                ..Default::default()
+            })
+            .precise(true),
+    );
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+    let thumb_after_shift_wheel = find_el_by_key(&rt.elements(), "tv-qres-3-0-hscroll-thumb").rect[0];
+    assert!(
+        thumb_after_shift_wheel > thumb_after_wheel + 10.0,
+        "Shift+precise wheel did not scroll further right: before={thumb_after_wheel}, after={thumb_after_shift_wheel}"
+    );
+
+    // 5. Clicking a visible row focuses the grid; Left/Right arrows scroll horizontally without losing row selection.
+    let r0 = find_el_by_key(&rt.elements(), "r-0").visible;
+    rt.pointer_down(r0[0] + 80.0, r0[1] + r0[3] * 0.5);
+    rt.pointer_up(r0[0] + 80.0, r0[1] + r0[3] * 0.5);
+    settle_frames(&mut rt);
+    assert!(
+        find_el_by_key(&rt.elements(), "tv-qres-3-0").focused,
+        "clicking visible row should focus results table"
+    );
+    let before_keys_x = find_el_by_key(&rt.elements(), "tv-qres-3-0-hscroll-thumb").rect[0];
+    rt.key(KeyEvent::from(Key::Left));
+    rt.key(KeyEvent::from(Key::Left));
+    settle_frames(&mut rt);
+    let after_left_x = find_el_by_key(&rt.elements(), "tv-qres-3-0-hscroll-thumb").rect[0];
+    assert!(
+        after_left_x < before_keys_x - 10.0,
+        "Key::Left did not scroll left: before={before_keys_x}, after={after_left_x}"
+    );
+    rt.key(KeyEvent {
+        key: Key::Right,
+        mods: Mods {
+            shift: true,
+            ..Default::default()
+        },
+    });
+    settle_frames(&mut rt);
+    let after_shift_right_x = find_el_by_key(&rt.elements(), "tv-qres-3-0-hscroll-thumb").rect[0];
+    assert!(
+        after_shift_right_x > after_left_x + 20.0,
+        "Shift+Right did not scroll right: left={after_left_x}, right={after_shift_right_x}"
+    );
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_query_tab()
+            .expect("query tab")
+            .active_result_state()
+            .expect("res0")
+            .selected_row,
+        Some(0)
+    );
+    assert!(rt.live_only_warnings().is_empty());
+
+    // 5b. Dragging the scrollbar preserves table focus so arrow keys keep working immediately.
+    let els_before_drag = rt.elements();
+    let bar_after = find_el_by_key(&els_before_drag, "tv-qres-3-0-hscroll-bar").rect;
+    let track_after = find_el_by_key(&els_before_drag, "tv-qres-3-0-hscroll-track").rect;
+    let thumb_after = find_el_by_key(&els_before_drag, "tv-qres-3-0-hscroll-thumb").rect;
+    let bar_mid_y = thumb_after[1] + thumb_after[3] * 0.5;
+    let drag_end_x = track_after[0] + track_after[2] - 8.0;
+    rt.pointer_down(thumb_after[0] + thumb_after[2] * 0.5, bar_mid_y);
+    rt.frame(0.0);
+    rt.pointer_move(drag_end_x, bar_mid_y);
+    rt.frame(0.1);
+    rt.pointer_up(drag_end_x, bar_mid_y);
+    settle_frames(&mut rt);
+    assert!(
+        find_el_by_key(&rt.elements(), "tv-qres-3-0").focused,
+        "dragging horizontal scrollbar must preserve table focus"
+    );
+    let thumb_after_re_drag = find_el_by_key(&rt.elements(), "tv-qres-3-0-hscroll-thumb").rect[0];
+    rt.key(KeyEvent::from(Key::Left));
+    settle_frames(&mut rt);
+    let thumb_after_post_drag_left = find_el_by_key(&rt.elements(), "tv-qres-3-0-hscroll-thumb").rect[0];
+    assert!(
+        thumb_after_post_drag_left < thumb_after_re_drag - 10.0,
+        "Key::Left after scrollbar drag did not scroll: drag={thumb_after_re_drag}, left={thumb_after_post_drag_left}"
+    );
+    // Clicking the 4-pt left scrollbar gutter also preserves table focus.
+    rt.pointer_down(bar_after[0] + 1.5, bar_mid_y);
+    rt.pointer_up(bar_after[0] + 1.5, bar_mid_y);
+    settle_frames(&mut rt);
+    assert!(
+        find_el_by_key(&rt.elements(), "tv-qres-3-0").focused,
+        "clicking scrollbar 4-pt gutter must preserve table focus"
+    );
+    assert!(rt.live_only_warnings().is_empty());
+
+    // 6. Narrow Result 2 (`active_students`) omits the horizontal scrollbar.
+    let (tab1_x, tab1_y) = rt.find("query-result-tab-1").expect("result tab 1");
+    rt.pointer_down(tab1_x, tab1_y);
+    rt.pointer_up(tab1_x, tab1_y);
+    settle_frames(&mut rt);
+    assert!(rt.find("tv-qres-3-1-hscroll-bar").is_none());
+    assert!(rt.find("tv-qres-3-1-hscroll-track").is_none());
+}
+
+fn wide_greendale_columns() -> Vec<ColumnMeta> {
+    let col = |name: &str, data_type: &str, udt_name: &str| ColumnMeta {
+        name: name.to_owned(),
+        data_type: data_type.to_owned(),
+        udt_name: udt_name.to_owned(),
+        nullable: false,
+        default_expr: None,
+        is_primary_key: name == "student_id",
+        is_unique: false,
+        comment: None,
+        foreign_key: None,
+    };
+    vec![
+        col("student_id", "integer", "int4"),
+        col("campus_id", "integer", "int4"),
+        col("full_name", "text", "text"),
+        col("study_room", "text", "text"),
+        col("campus_email", "text", "text"),
+        col("air_conditioning_tier", "text", "text"),
+        col("paintball_rank", "text", "text"),
+        col("club_affiliation", "text", "text"),
+        col("graduation_term", "text", "text"),
+        col("organization_id", "uuid", "uuid"),
+    ]
+}
+
+#[test]
+fn sql_results_single_row_and_zero_row_wide_results_scroll_horizontally() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-sql-editor-dark");
+    settle_frames(&mut rt);
+
+    // 1. Single wide row (mirroring 1-row result panel clipping right-side fields).
+    let single_row = vec![vec![
+        CellValue::Int(1422876),
+        CellValue::Int(1413748),
+        CellValue::Text("Troy Barnes".to_owned()),
+        CellValue::Text("Greendale Community College - Study Room F".to_owned()),
+        CellValue::Text("troy.barnes@greendale.edu".to_owned()),
+        CellValue::Text("Truest Repairman Annex".to_owned()),
+        CellValue::Text("Season 2 Paintball Co-Champion".to_owned()),
+        CellValue::Text("Spanish 101 Study Group".to_owned()),
+        CellValue::Text("Spring 2014".to_owned()),
+        CellValue::Text("00000000-0000-0000-0000-000000000007".to_owned()),
+    ]];
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .expect("session")
+            .active_query_tab_mut()
+            .expect("query tab");
+        q.replace_results(vec![QueryStatementResult {
+            sql: "SELECT * FROM public.greendale_roster WHERE student_id = 1422876;".to_owned(),
+            columns: wide_greendale_columns(),
+            rows: single_row,
+            rows_affected: None,
+            total_rows_seen: 1,
+            truncated: false,
+            elapsed_ms: 4,
+            error: None,
+        }]);
+    });
+    settle_frames(&mut rt);
+
+    let key1 = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_query_tab()
+        .expect("query tab")
+        .active_result_state()
+        .expect("res1")
+        .table_key
+        .clone();
+    let els = rt.elements();
+    let track = find_el_by_key(&els, &format!("{key1}-hscroll-track"));
+    let thumb = find_el_by_key(&els, &format!("{key1}-hscroll-thumb"));
+    assert!(thumb.rect[2] < track.rect[2]);
+    let mid_y = thumb.rect[1] + thumb.rect[3] * 0.5;
+    let right_x = track.rect[0] + track.rect[2] - 4.0;
+    rt.pointer_down(thumb.rect[0] + thumb.rect[2] * 0.5, mid_y);
+    rt.frame(0.0);
+    rt.pointer_move(right_x, mid_y);
+    rt.frame(0.1);
+    rt.pointer_up(right_x, mid_y);
+    settle_frames(&mut rt);
+
+    let els_after = rt.elements();
+    let last_cell = find_el_by_path_suffix(&els_after, "/r-0/c-9").expect("organization_id cell visible");
+    assert!(last_cell.visible[2] > 40.0, "organization_id cell not visible: {:?}", last_cell.visible);
+    assert!(rt.live_only_warnings().is_empty());
+
+    // 2. Replacing with a zero-row wide result resets horizontal scroll back to the left edge
+    // and still scrolls its header horizontally when dragged/clicked.
+    rt.update(|s, _| {
+        let q = s
+            .active_session_mut()
+            .expect("session")
+            .active_query_tab_mut()
+            .expect("query tab");
+        q.replace_results(vec![QueryStatementResult {
+            sql: "SELECT * FROM public.greendale_roster WHERE false;".to_owned(),
+            columns: wide_greendale_columns(),
+            rows: Vec::new(),
+            rows_affected: None,
+            total_rows_seen: 0,
+            truncated: false,
+            elapsed_ms: 2,
+            error: None,
+        }]);
+    });
+    settle_frames(&mut rt);
+    assert!(has_text(&rt, "Query returned 0 rows"));
+
+    let key2 = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_query_tab()
+        .expect("query tab")
+        .active_result_state()
+        .expect("res2")
+        .table_key
+        .clone();
+    assert_ne!(key1, key2);
+    let els_zero = rt.elements();
+    let bar_zero_rect = find_el_by_key(&els_zero, &format!("{key2}-hscroll-bar")).rect;
+    let track_zero = find_el_by_key(&els_zero, &format!("{key2}-hscroll-track"));
+    let thumb_zero = find_el_by_key(&els_zero, &format!("{key2}-hscroll-thumb"));
+    assert!(thumb_zero.rect[2] < track_zero.rect[2]);
+    assert!(
+        thumb_zero.rect[0] <= track_zero.rect[0] + 5.5,
+        "new result should start scrolled at left edge: thumb={:?} track={:?}",
+        thumb_zero.rect,
+        track_zero.rect
+    );
+    let track_zero_rect = track_zero.rect;
+    let thumb_zero_start_x = thumb_zero.rect[0];
+    let mid_y0 = thumb_zero.rect[1] + thumb_zero.rect[3] * 0.5;
+    let vp0 = find_el_by_path_suffix(&els_zero, &format!("{key2}/viewport"))
+        .expect("0-row viewport")
+        .rect;
+    let content0_x = find_el_by_path_suffix(&els_zero, &format!("{key2}/viewport/content"))
+        .expect("0-row content")
+        .rect[0];
+
+    // Native horizontal wheel moves both the headers and the scrollbar thumb in sync.
+    let vx0 = vp0[0] + vp0[2] * 0.5;
+    let vy0 = vp0[1] + 50.0;
+    rt.wheel_xy(vx0, vy0, -160.0, 0.0);
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+
+    let els_zero_wheel = rt.elements();
+    let content_after_wheel_x = find_el_by_path_suffix(&els_zero_wheel, &format!("{key2}/viewport/content"))
+        .expect("0-row content after wheel")
+        .rect[0];
+    assert!(
+        (content0_x - content_after_wheel_x - 160.0).abs() <= 2.0,
+        "expected ~160pt wheel scroll on 0-row header: before={content0_x}, after={content_after_wheel_x}"
+    );
+    let thumb_after_wheel_x = find_el_by_key(&els_zero_wheel, &format!("{key2}-hscroll-thumb")).rect[0];
+    assert!(
+        thumb_after_wheel_x > thumb_zero_start_x + 15.0,
+        "0-row horizontal wheel did not update thumb: start={thumb_zero_start_x}, after={thumb_after_wheel_x}"
+    );
+
+    // Option-modified horizontal swipe on a zero-row grid must also stay synced with the thumb.
+    rt.wheel_event(
+        WheelEvent::new(-120.0, 0.0)
+            .at(vx0, vy0)
+            .mods(Mods { alt: true, ..Mods::default() })
+            .precise(true),
+    );
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+
+    let els_zero_alt_wheel = rt.elements();
+    let content_after_alt_wheel_x =
+        find_el_by_path_suffix(&els_zero_alt_wheel, &format!("{key2}/viewport/content"))
+            .expect("0-row content after alt wheel")
+            .rect[0];
+    assert!(
+        (content_after_wheel_x - content_after_alt_wheel_x - 120.0).abs() <= 2.0,
+        "expected ~120pt Option+wheel scroll on 0-row header: wheel={content_after_wheel_x}, alt_wheel={content_after_alt_wheel_x}"
+    );
+    let thumb_after_alt_wheel_x =
+        find_el_by_key(&els_zero_alt_wheel, &format!("{key2}-hscroll-thumb")).rect[0];
+    assert!(
+        thumb_after_alt_wheel_x > thumb_after_wheel_x + 10.0,
+        "0-row Option+horizontal wheel did not update thumb: wheel={thumb_after_wheel_x}, alt_wheel={thumb_after_alt_wheel_x}"
+    );
+
+    // Phased horizontal swipe whose middle delta wobbles vertically must keep latching horizontally.
+    rt.wheel_event(
+        WheelEvent::new(-90.0, -10.0)
+            .at(vx0, vy0)
+            .phase(GesturePhase::Began)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(-15.0, -20.0)
+            .at(vx0, vy0)
+            .phase(GesturePhase::Moved)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(-120.0, 0.0)
+            .at(vx0, vy0)
+            .phase(GesturePhase::Moved)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(0.0, 0.0)
+            .at(vx0, vy0)
+            .phase(GesturePhase::Ended)
+            .precise(true),
+    );
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+
+    let els_zero_phased = rt.elements();
+    let content_after_phased_x =
+        find_el_by_path_suffix(&els_zero_phased, &format!("{key2}/viewport/content"))
+            .expect("0-row content after phased swipe")
+            .rect[0];
+    assert!(
+        (content_after_alt_wheel_x - content_after_phased_x - 225.0).abs() <= 2.0,
+        "phased swipe with vertical wobble stalled on 0-row grid: before={content_after_alt_wheel_x}, after={content_after_phased_x}"
+    );
+    let thumb_after_phased_x =
+        find_el_by_key(&els_zero_phased, &format!("{key2}-hscroll-thumb")).rect[0];
+    assert!(
+        thumb_after_phased_x > thumb_after_alt_wheel_x + 15.0,
+        "0-row phased horizontal swipe did not update thumb: before={thumb_after_alt_wheel_x}, after={thumb_after_phased_x}"
+    );
+
+    // Clicking the zero-row viewport focuses the grid and Key::Right advances forward from wheel offset.
+    rt.pointer_down(vx0, vy0);
+    rt.pointer_up(vx0, vy0);
+    settle_frames(&mut rt);
+    assert!(
+        find_el_by_key(&rt.elements(), &key2).focused,
+        "clicking 0-row grid should focus table"
+    );
+    rt.key(KeyEvent::from(Key::Right));
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+
+    let els_zero_key = rt.elements();
+    let content_after_key_x = find_el_by_path_suffix(&els_zero_key, &format!("{key2}/viewport/content"))
+        .expect("0-row content after key")
+        .rect[0];
+    assert!(
+        content_after_key_x < content_after_phased_x - 80.0,
+        "Key::Right on 0-row grid jumped backward or stalled: phased={content_after_phased_x}, key={content_after_key_x}"
+    );
+    let thumb_after_key_x = find_el_by_key(&els_zero_key, &format!("{key2}-hscroll-thumb")).rect[0];
+    assert!(
+        thumb_after_key_x > thumb_after_phased_x + 10.0,
+        "Key::Right did not advance 0-row thumb: phased={thumb_after_phased_x}, key={thumb_after_key_x}"
+    );
+
+    // Click the 4-pt left gutter to return to x=0 while preserving table focus, then verify
+    // unphased diagonal swipe latching and Shift+precise momentum conversion on 0-row grids.
+    rt.pointer_down(bar_zero_rect[0] + 1.5, mid_y0);
+    rt.pointer_up(bar_zero_rect[0] + 1.5, mid_y0);
+    settle_frames(&mut rt);
+    let els_zero_gutter = rt.elements();
+    assert!(
+        find_el_by_key(&els_zero_gutter, &key2).focused,
+        "clicking 0-row scrollbar 4-pt gutter must preserve table focus"
+    );
+    let content_at_start_x =
+        find_el_by_path_suffix(&els_zero_gutter, &format!("{key2}/viewport/content"))
+            .expect("0-row content at start")
+            .rect[0];
+    assert!(
+        (content_at_start_x - content0_x).abs() <= 1.5,
+        "gutter click should reset scroll to start: expected={content0_x}, got={content_at_start_x}"
+    );
+
+    // Unphased precise horizontal swipe whose middle delta is vertically dominant must stay latched.
+    rt.wheel_event(
+        WheelEvent::new(-90.0, -10.0)
+            .at(vx0, vy0)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(-15.0, -20.0)
+            .at(vx0, vy0)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(-120.0, 0.0)
+            .at(vx0, vy0)
+            .precise(true),
+    );
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+
+    let els_zero_unphased = rt.elements();
+    let content_after_unphased_x =
+        find_el_by_path_suffix(&els_zero_unphased, &format!("{key2}/viewport/content"))
+            .expect("0-row content after unphased swipe")
+            .rect[0];
+    assert!(
+        (content0_x - content_after_unphased_x - 225.0).abs() <= 2.0,
+        "unphased swipe with vertical wobble stalled on 0-row grid: start={content0_x}, after={content_after_unphased_x}"
+    );
+
+    // Wait past UNPHASED_WHEEL_IDLE (0.1s), then send a Shift+precise swipe followed by momentum
+    // within MOMENTUM_GAP (<= 0.05s) so the first momentum Began(dy) delta is converted too.
+    rt.frame(0.15);
+    let shift = Mods {
+        shift: true,
+        ..Mods::default()
+    };
+    rt.wheel_event(
+        WheelEvent::new(0.0, -90.0)
+            .at(vx0, vy0)
+            .mods(shift)
+            .phase(GesturePhase::Began)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(0.0, -15.0)
+            .at(vx0, vy0)
+            .mods(shift)
+            .phase(GesturePhase::Moved)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(0.0, 0.0)
+            .at(vx0, vy0)
+            .mods(shift)
+            .phase(GesturePhase::Ended)
+            .precise(true),
+    );
+    rt.frame(0.016);
+    rt.wheel_event(
+        WheelEvent::new(0.0, -120.0)
+            .at(vx0, vy0)
+            .mods(shift)
+            .phase(GesturePhase::Began)
+            .precise(true),
+    );
+    rt.wheel_event(
+        WheelEvent::new(0.0, 0.0)
+            .at(vx0, vy0)
+            .mods(shift)
+            .phase(GesturePhase::Ended)
+            .precise(true),
+    );
+    settle_frames(&mut rt);
+    assert!(rt.live_only_warnings().is_empty());
+
+    let els_zero_shift_mom = rt.elements();
+    let content_after_shift_mom_x =
+        find_el_by_path_suffix(&els_zero_shift_mom, &format!("{key2}/viewport/content"))
+            .expect("0-row content after shift momentum")
+            .rect[0];
+    assert!(
+        (content_after_unphased_x - content_after_shift_mom_x - 225.0).abs() <= 2.0,
+        "Shift+precise momentum dropped delta on 0-row grid: before={content_after_unphased_x}, after={content_after_shift_mom_x}"
+    );
+
+    rt.pointer_down(track_zero_rect[0] + track_zero_rect[2] - 4.0, mid_y0);
+    rt.pointer_up(track_zero_rect[0] + track_zero_rect[2] - 4.0, mid_y0);
+    settle_frames(&mut rt);
+    let els_zero_after = rt.elements();
+    assert!(
+        find_el_by_key(&els_zero_after, &key2).focused,
+        "clicking 0-row scrollbar track must preserve table focus"
+    );
+    let header_c9 = find_el_by_path_suffix(&els_zero_after, "/header/c-9").expect("0-row header c-9");
+    assert!(header_c9.visible[2] > 40.0, "0-row header c-9 not visible: {:?}", header_c9.visible);
+    assert!(rt.live_only_warnings().is_empty());
+}
+
+#[test]
+fn table_data_grid_horizontal_scrollbar_scrolls_wide_columns() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    settle_frames(&mut rt);
+
+    let els = rt.elements();
+    let track = find_el_by_key(&els, "tv-data-1-hscroll-track");
+    let thumb = find_el_by_key(&els, "tv-data-1-hscroll-thumb");
+    assert!(thumb.rect[2] >= 32.0 && thumb.rect[2] < track.rect[2]);
+
+    let mid_y = thumb.rect[1] + thumb.rect[3] * 0.5;
+    let right_x = track.rect[0] + track.rect[2] - 6.0;
+    rt.pointer_down(thumb.rect[0] + thumb.rect[2] * 0.5, mid_y);
+    rt.frame(0.0);
+    rt.pointer_move(right_x, mid_y);
+    rt.frame(0.1);
+    rt.pointer_up(right_x, mid_y);
+    settle_frames(&mut rt);
+
+    let els_after = rt.elements();
+    let group_cell = find_el_by_path_suffix(&els_after, "/r-0/group_id").expect("group_id visible after drag");
+    assert!(group_cell.visible[2] > 10.0, "group_id cell not visible: {:?}", group_cell.visible);
+    assert!(rt.live_only_warnings().is_empty());
 }
 
 fn empty_runtime(dark: bool) -> Runtime<AppState> {

@@ -840,7 +840,7 @@ fn build_stage(
             if let Some(active_tab) = session.active_tab() {
                 let tab_bar = table_grid::build_tab_bar(session, k, cx);
                 let body = match &active_tab.content {
-                    TabContent::Table(table_tab) => table_grid::build_table_tab(s, session, table_tab, k, layer),
+                    TabContent::Table(table_tab) => table_grid::build_table_tab(s, session, table_tab, k, cx, layer),
                     TabContent::Query(query_tab) => query_editor::build_query_tab(s, session, query_tab, k, cx, layer),
                 };
                 return col()

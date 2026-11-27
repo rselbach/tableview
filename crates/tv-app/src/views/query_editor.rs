@@ -14,6 +14,7 @@ use crate::state::{
 use crate::views::explain_view;
 use crate::views::pill_badge;
 use crate::views::table_grid::{initial_col_width, is_numeric_udt, render_cell_value};
+use crate::views::table_scroll::wrap_table_hscroll;
 
 /// Builds the full SQL query workbench tab: action bar, syntax-highlighted editor,
 /// draggable vertical splitter, and multi-statement result grids.
@@ -34,7 +35,7 @@ pub fn build_query_tab(
 
     let editor_pane = build_editor_pane(tab, editor_h, k);
     let splitter = build_split_handle(total_h, k);
-    let results_pane = build_results_pane(s, session, tab, k);
+    let results_pane = build_results_pane(s, session, tab, k, cx);
 
     let split_body = col()
         .key(split_key)
@@ -337,7 +338,13 @@ fn build_split_handle(total_h: f32, k: &Kit) -> El {
         .child(el().size(36.0, 2.0).radius(1.0).fill(c.border_strong))
 }
 
-fn build_results_pane(s: &AppState, session: &SessionState, tab: &QueryTabState, k: &Kit) -> El {
+fn build_results_pane(
+    s: &AppState,
+    session: &SessionState,
+    tab: &QueryTabState,
+    k: &Kit,
+    cx: &Cx<AppState>,
+) -> El {
     let c = &k.c;
     let header = build_results_header(tab, k);
 
@@ -367,7 +374,7 @@ fn build_results_pane(s: &AppState, session: &SessionState, tab: &QueryTabState,
                 k,
             )
         } else if res.statement.is_tabular() {
-            build_result_grid(s, tab, res, k)
+            build_result_grid(s, tab, res, k, cx)
         } else {
             build_dml_card(res, k)
         }
@@ -581,7 +588,13 @@ fn build_results_header(tab: &QueryTabState, k: &Kit) -> El {
         .child(summary_row)
 }
 
-fn build_result_grid(s: &AppState, tab: &QueryTabState, res: &QueryResultTabState, k: &Kit) -> El {
+fn build_result_grid(
+    s: &AppState,
+    tab: &QueryTabState,
+    res: &QueryResultTabState,
+    k: &Kit,
+    cx: &Cx<AppState>,
+) -> El {
     let c = &k.c;
     if res.statement.columns.is_empty() {
         return build_dml_card(res, k);
@@ -629,7 +642,9 @@ fn build_result_grid(s: &AppState, tab: &QueryTabState, res: &QueryResultTabStat
         table = table.column(column);
     }
 
+    let row_hscroll = res.hscroll.clone();
     let built = table
+        .row(move |_, _, r| row_hscroll.attach_row(r))
         .cell(move |s: &AppState, row_idx, col_id| {
             let Some(res) = s
                 .active_session()
@@ -669,13 +684,14 @@ fn build_result_grid(s: &AppState, tab: &QueryTabState, res: &QueryResultTabStat
         .grow(1.0)
         .min_h(0.0);
 
-    if res.statement.rows.is_empty() {
+    let grid = if res.statement.rows.is_empty() {
         el().w_full()
             .grow(1.0)
             .min_h(0.0)
             .child(built.w_full().h_full())
             .child(
                 el().pin(Some(0.0), Some(32.0), Some(0.0), Some(0.0))
+                    .inert()
                     .center()
                     .child(
                         text("Query returned 0 rows")
@@ -685,7 +701,10 @@ fn build_result_grid(s: &AppState, tab: &QueryTabState, res: &QueryResultTabStat
             )
     } else {
         built
-    }
+    };
+
+    let has_rows = !res.statement.rows.is_empty();
+    wrap_table_hscroll(&res.table_key, &res.hscroll, grid, has_rows, cx, k)
 }
 
 fn build_dml_card(res: &QueryResultTabState, k: &Kit) -> El {

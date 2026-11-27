@@ -24,6 +24,7 @@ use tv_core::sql::{
 use tv_update::{UpdateFailure, UpdateStatus};
 
 use crate::update::{UpdateBridge, UpdateHostEvent, UpdateUiState, manual_check_notice};
+use crate::views::table_scroll::TableHScroll;
 use crate::worker::{WorkerBridge, WorkerCmd, WorkerEvent};
 
 pub const STATUS_NOTICE_DURATION_SECS: f64 = 4.0;
@@ -591,8 +592,11 @@ pub struct TableTabState {
     pub structure: Option<TableStructure>,
     pub structure_error: Option<String>,
     pub data_table: TableState,
+    pub data_hscroll: TableHScroll,
     pub structure_table: TableState,
+    pub structure_hscroll: TableHScroll,
     pub indexes_table: TableState,
+    pub indexes_hscroll: TableHScroll,
     pub selected_row: Option<usize>,
     pub selected_row_key: Option<RowKey>,
     pub selected_cell: Option<(RowKey, usize)>,
@@ -647,8 +651,11 @@ impl TableTabState {
             structure: None,
             structure_error: None,
             data_table: TableState::new().key(format!("tv-data-{tid}")),
+            data_hscroll: TableHScroll::default(),
             structure_table: TableState::new().key(format!("tv-struct-{tid}")),
+            structure_hscroll: TableHScroll::default(),
             indexes_table: TableState::new().key(format!("tv-idx-{tid}")),
+            indexes_hscroll: TableHScroll::default(),
             selected_row: None,
             selected_row_key: None,
             selected_cell: None,
@@ -817,8 +824,27 @@ pub const QUERY_LIMIT_OPTIONS: &[(Option<usize>, &str)] = &[
 /// One statement result pane rendered under the SQL editor.
 pub struct QueryResultTabState {
     pub statement: QueryStatementResult,
+    pub table_key: String,
     pub table: TableState,
+    pub hscroll: TableHScroll,
     pub selected_row: Option<usize>,
+}
+
+impl QueryResultTabState {
+    pub fn new(tab_id: TabId, result_gen: u64, idx: usize, statement: QueryStatementResult) -> Self {
+        let table_key = if result_gen == 0 {
+            format!("tv-qres-{}-{idx}", tab_id.get())
+        } else {
+            format!("tv-qres-{}-{result_gen}-{idx}", tab_id.get())
+        };
+        Self {
+            statement,
+            table: TableState::new().key(table_key.clone()),
+            table_key,
+            hscroll: TableHScroll::default(),
+            selected_row: None,
+        }
+    }
 }
 
 /// Interactive state for one SQL query workbench tab (editor, live timer, multi-result grids).
@@ -835,6 +861,7 @@ pub struct QueryTabState {
     pub cancelling: bool,
     pub active_req_id: Option<RequestId>,
     pub elapsed_ms: u64,
+    pub result_gen: u64,
     pub results: Vec<QueryResultTabState>,
     pub active_result: usize,
     pub batch_error: Option<String>,
@@ -871,6 +898,7 @@ impl QueryTabState {
             cancelling: false,
             active_req_id: None,
             elapsed_ms: 0,
+            result_gen: 0,
             results: Vec::new(),
             active_result: 0,
             batch_error: None,
@@ -912,6 +940,18 @@ impl QueryTabState {
 
     pub fn active_result_state_mut(&mut self) -> Option<&mut QueryResultTabState> {
         self.results.get_mut(self.active_result)
+    }
+
+    pub fn replace_results(&mut self, statements: Vec<QueryStatementResult>) {
+        self.result_gen = self.result_gen.wrapping_add(1);
+        let tab_id = self.tab_id;
+        let result_gen = self.result_gen;
+        self.results = statements
+            .into_iter()
+            .enumerate()
+            .map(|(idx, statement)| QueryResultTabState::new(tab_id, result_gen, idx, statement))
+            .collect();
+        self.active_result = 0;
     }
 
     pub fn selected_result_row(&self) -> Option<(&[ColumnMeta], &[CellValue])> {
@@ -4638,12 +4678,13 @@ impl AppState {
                     tab.active_req_id = None;
                     match result {
                         Ok(batch) => {
+                            tab.result_gen = tab.result_gen.wrapping_add(1);
                             let BatchOutcomes {
                                 results,
                                 total_duration_ms,
                                 cancelled,
                                 error_msg,
-                            } = unpack_batch(tab_id, batch);
+                            } = unpack_batch(tab_id, tab.result_gen, batch);
                             tab.elapsed_ms = total_duration_ms;
                             tab.total_duration_ms = Some(total_duration_ms);
                             tab.batch_cancelled = cancelled;
@@ -5167,17 +5208,12 @@ struct BatchOutcomes {
     error_msg: Option<String>,
 }
 
-fn unpack_batch(tab_id: TabId, batch: QueryBatchResult) -> BatchOutcomes {
-    let tid = tab_id.get();
+fn unpack_batch(tab_id: TabId, result_gen: u64, batch: QueryBatchResult) -> BatchOutcomes {
     let results = batch
         .results
         .into_iter()
         .enumerate()
-        .map(|(idx, statement)| QueryResultTabState {
-            statement,
-            table: TableState::new().key(format!("tv-qres-{tid}-{idx}")),
-            selected_row: None,
-        })
+        .map(|(idx, statement)| QueryResultTabState::new(tab_id, result_gen, idx, statement))
         .collect();
     let error_msg = if batch.cancelled {
         Some("Query cancelled".to_owned())
