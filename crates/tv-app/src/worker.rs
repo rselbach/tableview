@@ -14,6 +14,23 @@ use tv_core::{
 
 const QUERY_HISTORY_LIMIT: usize = 200;
 
+/// Future returned by [`SessionConnector`] when establishing a database session.
+pub type ConnectSessionFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(Arc<dyn DbSession>, Vec<ExecutedSql>), DbError>> + Send>,
+>;
+
+/// Factory closure used by [`WorkerBridge`] to open or re-open database sessions.
+pub type SessionConnector =
+    Arc<dyn Fn(ConnectionProfile, Option<String>, Option<String>) -> ConnectSessionFuture + Send + Sync>;
+
+fn default_session_connector() -> SessionConnector {
+    Arc::new(|profile, password, database| {
+        Box::pin(async move {
+            connect_session(&profile, password.as_deref(), database.as_deref()).await
+        })
+    })
+}
+
 /// Commands dispatched from the UI thread to the background database worker.
 #[derive(Debug)]
 pub enum WorkerCmd {
@@ -23,6 +40,12 @@ pub enum WorkerCmd {
         profile: ConnectionProfile,
         prompt_password: Option<String>,
         database: Option<String>,
+        preferred_schema: Option<String>,
+    },
+    UpdateSessionProfile {
+        session_id: SessionId,
+        profile: ConnectionProfile,
+        password_update: Option<Option<String>>,
     },
     SelectDatabase {
         session_id: SessionId,
@@ -34,6 +57,7 @@ pub enum WorkerCmd {
     SelectSchema {
         session_id: SessionId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         schema: String,
     },
     LoadColumns {
@@ -45,6 +69,7 @@ pub enum WorkerCmd {
     ReloadWorkspace {
         session_id: SessionId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         active_schema: Option<String>,
     },
     FetchTablePage {
@@ -64,6 +89,7 @@ pub enum WorkerCmd {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         connection_id: ConnectionId,
         connection_name: String,
         database: Option<String>,
@@ -73,6 +99,7 @@ pub enum WorkerCmd {
     },
     CancelQuery {
         session_id: SessionId,
+        req_id: RequestId,
     },
     LoadQueryLibrary {
         session_id: SessionId,
@@ -122,12 +149,14 @@ pub enum WorkerCmd {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         statements: Vec<String>,
     },
     ExplainSql {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         statement: String,
         analyze: bool,
     },
@@ -160,9 +189,16 @@ pub enum WorkerEvent {
         req_id: RequestId,
         error: DbError,
     },
+    SessionDisconnected {
+        session_id: SessionId,
+        connect_req_id: RequestId,
+        error: DbError,
+    },
     SchemasAndObjectsLoaded {
         session_id: SessionId,
         req_id: RequestId,
+        is_db_switch: bool,
+        server_version: Option<String>,
         databases: Vec<DatabaseInfo>,
         active_database: String,
         schemas: Vec<SchemaInfo>,
@@ -278,6 +314,15 @@ pub struct WorkerBridge {
 impl WorkerBridge {
     /// Spawns the background Tokio worker thread. Returns `None` if runtime initialization fails.
     pub fn spawn() -> Option<Self> {
+        Self::spawn_inner(default_session_connector(), false)
+    }
+
+    /// Spawns the background worker with a custom session connector and isolated in-memory query store.
+    pub fn spawn_with_connector(connector: SessionConnector) -> Option<Self> {
+        Self::spawn_inner(connector, true)
+    }
+
+    fn spawn_inner(connector: SessionConnector, in_memory_history: bool) -> Option<Self> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
         let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
@@ -297,7 +342,13 @@ impl WorkerBridge {
                 if handle_tx.send(rt.handle().clone()).is_err() {
                     return;
                 }
-                rt.block_on(worker_loop(cmd_rx, event_tx, worker_waker));
+                rt.block_on(worker_loop(
+                    cmd_rx,
+                    event_tx,
+                    worker_waker,
+                    connector,
+                    in_memory_history,
+                ));
             })
             .ok()?;
 
@@ -387,33 +438,420 @@ fn pick_default_schema(schemas: &[SchemaInfo], preferred: Option<&str>) -> Optio
         .map(|s| s.name.clone())
 }
 
+#[derive(Default)]
+struct ReconnectGate {
+    last_failure: Option<(Instant, DbError)>,
+}
+
+struct SessionEntry {
+    connect_req_id: RequestId,
+    session: Arc<dyn DbSession>,
+    profile: ConnectionProfile,
+    password: Option<String>,
+    database: Option<String>,
+    reconnect_gate: Arc<tokio::sync::Mutex<ReconnectGate>>,
+}
+
+type SessionMap = Arc<tokio::sync::Mutex<HashMap<SessionId, SessionEntry>>>;
+type SessionEpochMap = Arc<std::sync::Mutex<HashMap<SessionId, u64>>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LivenessCheck {
+    Fast,
+    AlwaysPing,
+}
+
+enum SessionCallError {
+    Operation { engine: DbEngine, error: DbError },
+    Disconnected { connect_req_id: Option<RequestId>, cause: DbError },
+}
+
+struct QueryCancelEntry {
+    tx: tokio::sync::watch::Sender<bool>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    session: Option<Arc<dyn DbSession>>,
+}
+type QueryCancelMap = Arc<std::sync::Mutex<HashMap<RequestId, QueryCancelEntry>>>;
+type QueryCancelHandle = (
+    tokio::sync::watch::Receiver<bool>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
+
+fn is_current_lifecycle_epoch(epochs: &SessionEpochMap, session_id: SessionId, expected: Option<u64>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    epochs
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&session_id).copied())
+        == Some(expected)
+}
+
+struct CancelRegistration {
+    map: QueryCancelMap,
+    req_id: RequestId,
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.map.lock() {
+            guard.remove(&self.req_id);
+        }
+    }
+}
+
+fn supports_background_reconnect(engine: DbEngine) -> bool {
+    matches!(engine, DbEngine::Postgres | DbEngine::Mysql)
+}
+
+fn unwrap_disconnect_cause(error: DbError) -> DbError {
+    match error {
+        DbError::DisconnectedBeforeDispatch(inner) => *inner,
+        other => other,
+    }
+}
+
+fn is_session_disconnect_err(session: &dyn DbSession, error: &DbError) -> bool {
+    matches!(
+        error,
+        DbError::Disconnected | DbError::DisconnectedBeforeDispatch(_)
+    ) || (session.is_disconnected()
+        && matches!(
+            error,
+            DbError::AuthFailed(_) | DbError::ConnectionFailed(_) | DbError::TlsConfig(_)
+        ))
+}
+
+fn emit_session_disconnected(
+    tx: &mpsc::Sender<WorkerEvent>,
+    waker: &Arc<std::sync::Mutex<Option<Waker>>>,
+    session_id: SessionId,
+    connect_req_id: Option<RequestId>,
+    error: DbError,
+) {
+    if let Some(connect_req_id) = connect_req_id {
+        emit(
+            tx,
+            waker,
+            WorkerEvent::SessionDisconnected {
+                session_id,
+                connect_req_id,
+                error: unwrap_disconnect_cause(error),
+            },
+        );
+    }
+}
+
+async fn current_connect_req_id(
+    sessions: &SessionMap,
+    session_id: SessionId,
+    expected_connect_req_id: RequestId,
+) -> Option<RequestId> {
+    let map = sessions.lock().await;
+    map.get(&session_id)
+        .filter(|entry| entry.connect_req_id == expected_connect_req_id)
+        .map(|entry| entry.connect_req_id)
+}
+
+async fn reconnect_session(
+    sessions: &SessionMap,
+    connector: &SessionConnector,
+    session_id: SessionId,
+    stale_session: &Arc<dyn DbSession>,
+    stale_connect_req_id: RequestId,
+) -> Result<(Arc<dyn DbSession>, RequestId), (Option<RequestId>, DbError)> {
+    let call_started = Instant::now();
+    let (gate, profile, cached_pw, database) = {
+        let map = sessions.lock().await;
+        let Some(entry) = map.get(&session_id) else {
+            return Err((None, DbError::Disconnected));
+        };
+        if entry.connect_req_id != stale_connect_req_id {
+            return Err((None, DbError::Disconnected));
+        }
+        if !Arc::ptr_eq(&entry.session, stale_session) {
+            return Ok((Arc::clone(&entry.session), entry.connect_req_id));
+        }
+        (
+            Arc::clone(&entry.reconnect_gate),
+            entry.profile.clone(),
+            entry.password.clone(),
+            entry.database.clone(),
+        )
+    };
+
+    let mut gate_guard = gate.lock().await;
+
+    {
+        let map = sessions.lock().await;
+        let Some(entry) = map.get(&session_id) else {
+            return Err((None, DbError::Disconnected));
+        };
+        if entry.connect_req_id != stale_connect_req_id {
+            return Err((None, DbError::Disconnected));
+        }
+        if !Arc::ptr_eq(&entry.session, stale_session) {
+            return Ok((Arc::clone(&entry.session), entry.connect_req_id));
+        }
+    }
+
+    if let Some((failed_at, ref err)) = gate_guard.last_failure
+        && failed_at >= call_started
+    {
+        let still_current = current_connect_req_id(sessions, session_id, stale_connect_req_id).await;
+        return Err((still_current, err.clone()));
+    }
+
+    let pw = if cached_pw.is_some() {
+        cached_pw
+    } else {
+        resolve_password(&profile, None).await
+    };
+
+    match (connector)(profile, pw.clone(), database).await {
+        Ok((new_session, _connect_logs)) => {
+            gate_guard.last_failure = None;
+            let mut map = sessions.lock().await;
+            let Some(entry) = map.get_mut(&session_id) else {
+                return Err((None, DbError::Disconnected));
+            };
+            if entry.connect_req_id != stale_connect_req_id {
+                return Err((None, DbError::Disconnected));
+            }
+            entry.session = Arc::clone(&new_session);
+            if entry.password.is_none() {
+                entry.password = pw;
+            }
+            Ok((new_session, entry.connect_req_id))
+        }
+        Err(err) => {
+            gate_guard.last_failure = Some((Instant::now(), err.clone()));
+            let still_current = current_connect_req_id(sessions, session_id, stale_connect_req_id).await;
+            Err((still_current, err))
+        }
+    }
+}
+
+async fn prepare_session(
+    sessions: &SessionMap,
+    connector: &SessionConnector,
+    session_id: SessionId,
+    liveness: LivenessCheck,
+    expected_connect_req_id: Option<RequestId>,
+) -> Result<(Arc<dyn DbSession>, RequestId), SessionCallError> {
+    let (session, connect_req_id) = {
+        let map = sessions.lock().await;
+        let Some(entry) = map.get(&session_id) else {
+            return Err(SessionCallError::Disconnected {
+                connect_req_id: None,
+                cause: DbError::Disconnected,
+            });
+        };
+        if expected_connect_req_id.is_some_and(|exp| entry.connect_req_id != exp) {
+            return Err(SessionCallError::Disconnected {
+                connect_req_id: None,
+                cause: DbError::Disconnected,
+            });
+        }
+        (Arc::clone(&entry.session), entry.connect_req_id)
+    };
+
+    if !supports_background_reconnect(session.engine()) {
+        return Ok((session, connect_req_id));
+    }
+
+    if session.is_disconnected() {
+        return reconnect_session(sessions, connector, session_id, &session, connect_req_id)
+            .await
+            .map_err(|(cid, cause)| SessionCallError::Disconnected {
+                connect_req_id: cid,
+                cause,
+            });
+    }
+
+    if liveness == LivenessCheck::AlwaysPing
+        && let Err(err) = session.ping().await
+    {
+        if is_session_disconnect_err(session.as_ref(), &err) {
+            return reconnect_session(sessions, connector, session_id, &session, connect_req_id)
+                .await
+                .map_err(|(cid, cause)| SessionCallError::Disconnected {
+                    connect_req_id: cid,
+                    cause,
+                });
+        }
+        return Err(SessionCallError::Operation {
+            engine: session.engine(),
+            error: err,
+        });
+    }
+
+    Ok((session, connect_req_id))
+}
+
+async fn run_with_reconnect<T, F, Fut>(
+    sessions: &SessionMap,
+    connector: &SessionConnector,
+    session_id: SessionId,
+    liveness: LivenessCheck,
+    allow_retry_on_disconnect: bool,
+    expected_connect_req_id: Option<RequestId>,
+    mut op: F,
+) -> Result<T, SessionCallError>
+where
+    F: FnMut(Arc<dyn DbSession>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DbError>>,
+{
+    let (session, connect_req_id) =
+        prepare_session(sessions, connector, session_id, liveness, expected_connect_req_id).await?;
+    let engine = session.engine();
+    match op(Arc::clone(&session)).await {
+        Ok(val) => Ok(val),
+        Err(error) if is_session_disconnect_err(session.as_ref(), &error) => {
+            let retry_allowed = supports_background_reconnect(engine)
+                && (allow_retry_on_disconnect || matches!(error, DbError::DisconnectedBeforeDispatch(_)));
+            if !retry_allowed {
+                let cid = current_connect_req_id(sessions, session_id, connect_req_id).await;
+                return Err(SessionCallError::Disconnected {
+                    connect_req_id: cid,
+                    cause: unwrap_disconnect_cause(error),
+                });
+            }
+            let (fresh_session, fresh_cid) =
+                reconnect_session(sessions, connector, session_id, &session, connect_req_id)
+                    .await
+                    .map_err(|(cid, cause)| SessionCallError::Disconnected {
+                        connect_req_id: cid,
+                        cause,
+                    })?;
+            let fresh_engine = fresh_session.engine();
+            match op(Arc::clone(&fresh_session)).await {
+                Ok(val) => Ok(val),
+                Err(error) if is_session_disconnect_err(fresh_session.as_ref(), &error) => {
+                    let cid = current_connect_req_id(sessions, session_id, fresh_cid).await;
+                    Err(SessionCallError::Disconnected {
+                        connect_req_id: cid,
+                        cause: unwrap_disconnect_cause(error),
+                    })
+                }
+                Err(error) => Err(SessionCallError::Operation {
+                    engine: fresh_engine,
+                    error,
+                }),
+            }
+        }
+        Err(error) => Err(SessionCallError::Operation { engine, error }),
+    }
+}
+
 async fn worker_loop(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<WorkerCmd>,
     event_tx: mpsc::Sender<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    connector: SessionConnector,
+    in_memory_history: bool,
 ) {
-    let sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<dyn DbSession>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let query_store: Option<Arc<QueryStore>> = QueryStore::open_default().ok().map(Arc::new);
+    let sessions: SessionMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let active_cancels: QueryCancelMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let session_epochs: SessionEpochMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mut next_lifecycle_epoch: u64 = 0;
+    let query_store: Option<Arc<QueryStore>> = if in_memory_history {
+        QueryStore::open_in_memory().ok().map(Arc::new)
+    } else {
+        QueryStore::open_default().ok().map(Arc::new)
+    };
 
     while let Some(cmd) = cmd_rx.recv().await {
         let sessions = Arc::clone(&sessions);
+        let active_cancels = Arc::clone(&active_cancels);
+        let session_epochs = Arc::clone(&session_epochs);
         let query_store = query_store.clone();
         let event_tx = event_tx.clone();
         let waker = Arc::clone(&waker);
+        let connector = Arc::clone(&connector);
+
+        let lifecycle_epoch = match &cmd {
+            WorkerCmd::Connect { session_id, .. } | WorkerCmd::SelectDatabase { session_id, .. } => {
+                next_lifecycle_epoch += 1;
+                if let Ok(mut guard) = session_epochs.lock() {
+                    guard.insert(*session_id, next_lifecycle_epoch);
+                }
+                Some(next_lifecycle_epoch)
+            }
+            WorkerCmd::Disconnect { session_id } => {
+                next_lifecycle_epoch += 1;
+                if let Ok(mut guard) = session_epochs.lock() {
+                    guard.insert(*session_id, next_lifecycle_epoch);
+                }
+                Some(next_lifecycle_epoch)
+            }
+            _ => None,
+        };
+
+        let (cancel_handle, cancel_target_session) = match &cmd {
+            WorkerCmd::ExecuteSql { req_id, .. } => {
+                let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if let Ok(mut guard) = active_cancels.lock() {
+                    guard.insert(
+                        *req_id,
+                        QueryCancelEntry {
+                            tx: cancel_tx,
+                            flag: Arc::clone(&cancel_flag),
+                            session: None,
+                        },
+                    );
+                }
+                (Some((cancel_rx, cancel_flag)), None)
+            }
+            WorkerCmd::CancelQuery { req_id, .. } => {
+                let target = if let Ok(guard) = active_cancels.lock()
+                    && let Some(entry) = guard.get(req_id)
+                {
+                    entry.flag.store(true, std::sync::atomic::Ordering::Release);
+                    entry.tx.send_replace(true);
+                    entry.session.clone()
+                } else {
+                    None
+                };
+                (None, target)
+            }
+            _ => (None, None),
+        };
 
         tokio::spawn(async move {
-            handle_cmd(cmd, sessions, query_store, event_tx, waker).await;
+            handle_cmd(
+                cmd,
+                sessions,
+                session_epochs,
+                lifecycle_epoch,
+                active_cancels,
+                cancel_handle,
+                cancel_target_session,
+                query_store,
+                event_tx,
+                waker,
+                connector,
+            )
+            .await;
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_cmd(
     cmd: WorkerCmd,
-    sessions: Arc<tokio::sync::Mutex<HashMap<SessionId, Arc<dyn DbSession>>>>,
+    sessions: SessionMap,
+    session_epochs: SessionEpochMap,
+    lifecycle_epoch: Option<u64>,
+    active_cancels: QueryCancelMap,
+    cancel_handle: Option<QueryCancelHandle>,
+    cancel_target_session: Option<Arc<dyn DbSession>>,
     query_store: Option<Arc<QueryStore>>,
     event_tx: mpsc::Sender<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    connector: SessionConnector,
 ) {
     match cmd {
         WorkerCmd::Connect {
@@ -422,6 +860,7 @@ async fn handle_cmd(
             profile,
             prompt_password,
             database,
+            preferred_schema,
         } => {
             let explicit_db = database
                 .as_deref()
@@ -431,11 +870,13 @@ async fn handle_cmd(
                 .map(str::to_owned);
 
             let pw = resolve_password(&profile, prompt_password).await;
-            let connected = connect_session(&profile, pw.as_deref(), explicit_db.as_deref()).await;
+            let connected = (connector)(profile.clone(), pw.clone(), explicit_db.clone()).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
                 Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                    }
                     return;
                 }
             };
@@ -443,13 +884,19 @@ async fn handle_cmd(
             let active_database = if !profile.engine.supports_multi_database() {
                 Some(server_info.current_database.clone())
             } else {
-                explicit_db
+                explicit_db.clone()
             };
+            let reconnect_db = explicit_db.or_else(|| {
+                let cur = server_info.current_database.trim();
+                (!cur.is_empty()).then(|| cur.to_owned())
+            });
 
             let (databases, db_log) = match session.list_databases().await {
                 Ok(res) => res,
                 Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                    }
                     return;
                 }
             };
@@ -459,7 +906,7 @@ async fn handle_cmd(
                 match session.list_schemas().await {
                     Ok((schemas, schema_log)) => {
                         logs.push(schema_log);
-                        let chosen = pick_default_schema(&schemas, None);
+                        let chosen = pick_default_schema(&schemas, preferred_schema.as_deref());
                         let objs = if let Some(ref schema_name) = chosen {
                             match session.list_objects(schema_name).await {
                                 Ok((objs, obj_log)) => {
@@ -467,7 +914,13 @@ async fn handle_cmd(
                                     objs
                                 }
                                 Err(error) => {
-                                    emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                                        emit(
+                                            &event_tx,
+                                            &waker,
+                                            WorkerEvent::ConnectFailed { session_id, req_id, error },
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -477,7 +930,9 @@ async fn handle_cmd(
                         (schemas, chosen, objs)
                     }
                     Err(error) => {
-                        emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                        if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                            emit(&event_tx, &waker, WorkerEvent::ConnectFailed { session_id, req_id, error });
+                        }
                         return;
                     }
                 }
@@ -485,7 +940,23 @@ async fn handle_cmd(
                 (Vec::new(), None, Vec::new())
             };
 
-            sessions.lock().await.insert(session_id, session);
+            {
+                let mut map = sessions.lock().await;
+                if !is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                    return;
+                }
+                map.insert(
+                    session_id,
+                    SessionEntry {
+                        connect_req_id: req_id,
+                        session,
+                        profile,
+                        password: pw,
+                        database: reconnect_db,
+                        reconnect_gate: Arc::new(tokio::sync::Mutex::new(ReconnectGate::default())),
+                    },
+                );
+            }
             emit(
                 &event_tx,
                 &waker,
@@ -503,6 +974,20 @@ async fn handle_cmd(
             );
         }
 
+        WorkerCmd::UpdateSessionProfile {
+            session_id,
+            profile,
+            password_update,
+        } => {
+            let mut map = sessions.lock().await;
+            if let Some(entry) = map.get_mut(&session_id) {
+                entry.profile = profile;
+                if let Some(updated_pw) = password_update {
+                    entry.password = updated_pw;
+                }
+            }
+        }
+
         WorkerCmd::SelectDatabase {
             session_id,
             req_id,
@@ -511,11 +996,13 @@ async fn handle_cmd(
             database,
         } => {
             let pw = resolve_password(&profile, prompt_password).await;
-            let connected = connect_session(&profile, pw.as_deref(), Some(&database)).await;
+            let connected = (connector)(profile.clone(), pw.clone(), Some(database.clone())).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
                 Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                    }
                     return;
                 }
             };
@@ -525,14 +1012,18 @@ async fn handle_cmd(
                     dbs
                 }
                 Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                    }
                     return;
                 }
             };
             let (schemas, schema_log) = match session.list_schemas().await {
                 Ok(res) => res,
                 Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                    }
                     return;
                 }
             };
@@ -546,7 +1037,9 @@ async fn handle_cmd(
                         objs
                     }
                     Err(error) => {
-                        emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                        if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                            emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
+                        }
                         return;
                     }
                 }
@@ -554,13 +1047,32 @@ async fn handle_cmd(
                 Vec::new()
             };
 
-            sessions.lock().await.insert(session_id, session);
+            let server_version = session.server_info().version.clone();
+            {
+                let mut map = sessions.lock().await;
+                if !is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                    return;
+                }
+                map.insert(
+                    session_id,
+                    SessionEntry {
+                        connect_req_id: req_id,
+                        session,
+                        profile,
+                        password: pw,
+                        database: Some(database.clone()),
+                        reconnect_gate: Arc::new(tokio::sync::Mutex::new(ReconnectGate::default())),
+                    },
+                );
+            }
             emit(
                 &event_tx,
                 &waker,
                 WorkerEvent::SchemasAndObjectsLoaded {
                     session_id,
                     req_id,
+                    is_db_switch: true,
+                    server_version: Some(server_version),
                     databases,
                     active_database: database,
                     schemas,
@@ -574,21 +1086,24 @@ async fn handle_cmd(
         WorkerCmd::SelectSchema {
             session_id,
             req_id,
+            connect_req_id,
             schema,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::OperationFailed {
-                        session_id,
-                        req_id,
-                        error: DbError::Disconnected,
-                    },
-                );
-                return;
-            };
-            match session.list_objects(&schema).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::Fast,
+                true,
+                Some(connect_req_id),
+                |session| {
+                    let schema = schema.clone();
+                    async move { session.list_objects(&schema).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((objects, log)) => emit(
                     &event_tx,
                     &waker,
@@ -600,7 +1115,19 @@ async fn handle_cmd(
                         logs: vec![log],
                     },
                 ),
-                Err(error) => emit(
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::OperationFailed {
+                            session_id,
+                            req_id,
+                            error: DbError::Disconnected,
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { error, .. }) => emit(
                     &event_tx,
                     &waker,
                     WorkerEvent::OperationFailed { session_id, req_id, error },
@@ -614,10 +1141,22 @@ async fn handle_cmd(
             schema,
             object,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                return;
-            };
-            match session.list_columns(&schema, &object).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::Fast,
+                true,
+                None,
+                |session| {
+                    let schema = schema.clone();
+                    let object = object.clone();
+                    async move { session.list_columns(&schema, &object).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((columns, log)) => emit(
                     &event_tx,
                     &waker,
@@ -630,7 +1169,22 @@ async fn handle_cmd(
                         logs: vec![log],
                     },
                 ),
-                Err(error) => emit(
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::ColumnsLoaded {
+                            session_id,
+                            req_id,
+                            schema,
+                            object,
+                            columns: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { error, .. }) => emit(
                     &event_tx,
                     &waker,
                     WorkerEvent::ColumnsLoaded {
@@ -648,69 +1202,74 @@ async fn handle_cmd(
         WorkerCmd::ReloadWorkspace {
             session_id,
             req_id,
+            connect_req_id,
             active_schema,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::Fast,
+                true,
+                Some(connect_req_id),
+                |session| {
+                    let active_schema = active_schema.clone();
+                    async move {
+                        let mut logs = Vec::new();
+                        let (databases, db_log) = session.list_databases().await?;
+                        logs.push(db_log);
+                        let (schemas, schema_log) = session.list_schemas().await?;
+                        logs.push(schema_log);
+                        let chosen = pick_default_schema(&schemas, active_schema.as_deref());
+                        let objects = if let Some(ref schema_name) = chosen {
+                            let (objs, obj_log) = session.list_objects(schema_name).await?;
+                            logs.push(obj_log);
+                            objs
+                        } else {
+                            Vec::new()
+                        };
+                        let active_database = session.server_info().current_database.clone();
+                        Ok((databases, active_database, schemas, chosen, objects, logs))
+                    }
+                },
+            )
+            .await;
+
+            match outcome {
+                Ok((databases, active_database, schemas, chosen, objects, logs)) => emit(
                     &event_tx,
                     &waker,
-                    WorkerEvent::OperationFailed {
+                    WorkerEvent::SchemasAndObjectsLoaded {
                         session_id,
                         req_id,
-                        error: DbError::Disconnected,
+                        is_db_switch: false,
+                        server_version: None,
+                        databases,
+                        active_database,
+                        schemas,
+                        active_schema: chosen,
+                        objects,
+                        logs,
                     },
-                );
-                return;
-            };
-            let mut logs = Vec::new();
-            let databases = match session.list_databases().await {
-                Ok((dbs, log)) => {
-                    logs.push(log);
-                    dbs
+                ),
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::OperationFailed {
+                            session_id,
+                            req_id,
+                            error: DbError::Disconnected,
+                        },
+                    );
                 }
-                Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
-                    return;
-                }
-            };
-            let (schemas, schema_log) = match session.list_schemas().await {
-                Ok(res) => res,
-                Err(error) => {
-                    emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
-                    return;
-                }
-            };
-            logs.push(schema_log);
-            let chosen = pick_default_schema(&schemas, active_schema.as_deref());
-            let objects = if let Some(ref schema_name) = chosen {
-                match session.list_objects(schema_name).await {
-                    Ok((objs, obj_log)) => {
-                        logs.push(obj_log);
-                        objs
-                    }
-                    Err(error) => {
-                        emit(&event_tx, &waker, WorkerEvent::OperationFailed { session_id, req_id, error });
-                        return;
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            let active_database = session.server_info().current_database.clone();
-            emit(
-                &event_tx,
-                &waker,
-                WorkerEvent::SchemasAndObjectsLoaded {
-                    session_id,
-                    req_id,
-                    databases,
-                    active_database,
-                    schemas,
-                    active_schema: chosen,
-                    objects,
-                    logs,
-                },
-            );
+                Err(SessionCallError::Operation { error, .. }) => emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::OperationFailed { session_id, req_id, error },
+                ),
+            }
         }
 
         WorkerCmd::FetchTablePage {
@@ -719,21 +1278,21 @@ async fn handle_cmd(
             req_id,
             request,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::TablePageLoaded {
-                        session_id,
-                        tab_id,
-                        req_id,
-                        result: Err(DbError::Disconnected),
-                        logs: Vec::new(),
-                    },
-                );
-                return;
-            };
-            match session.fetch_table_page(&request).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::Fast,
+                true,
+                None,
+                |session| {
+                    let req = request.clone();
+                    async move { session.fetch_table_page(&req).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((page, logs)) => emit(
                     &event_tx,
                     &waker,
@@ -745,8 +1304,22 @@ async fn handle_cmd(
                         logs,
                     },
                 ),
-                Err(error) => {
-                    let failed_sql = format_failed_page_sql(session.engine(), &request);
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::TablePageLoaded {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { engine, error }) => {
+                    let failed_sql = format_failed_page_sql(engine, &request);
                     let logs = vec![ExecutedSql {
                         sql: failed_sql,
                         duration_ms: 0,
@@ -774,21 +1347,22 @@ async fn handle_cmd(
             schema,
             table,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::TableStructureLoaded {
-                        session_id,
-                        tab_id,
-                        req_id,
-                        result: Err(DbError::Disconnected),
-                        logs: Vec::new(),
-                    },
-                );
-                return;
-            };
-            match session.describe_table(&schema, &table).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::Fast,
+                true,
+                None,
+                |session| {
+                    let schema = schema.clone();
+                    let table = table.clone();
+                    async move { session.describe_table(&schema, &table).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((structure, logs)) => emit(
                     &event_tx,
                     &waker,
@@ -800,7 +1374,21 @@ async fn handle_cmd(
                         logs,
                     },
                 ),
-                Err(error) => emit(
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::TableStructureLoaded {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { error, .. }) => emit(
                     &event_tx,
                     &waker,
                     WorkerEvent::TableStructureLoaded {
@@ -818,6 +1406,7 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            connect_req_id,
             connection_id,
             connection_name,
             database,
@@ -825,20 +1414,12 @@ async fn handle_cmd(
             executed_sql_text,
             row_limit,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::QueryCompleted {
-                        session_id,
-                        tab_id,
-                        req_id,
-                        result: Err(DbError::Disconnected),
-                        logs: Vec::new(),
-                        recorded_history: None,
-                    },
-                );
+            let Some((mut cancel_rx, cancel_flag)) = cancel_handle else {
                 return;
+            };
+            let _cancel_guard = CancelRegistration {
+                map: Arc::clone(&active_cancels),
+                req_id,
             };
 
             let start = Instant::now();
@@ -846,30 +1427,208 @@ async fn handle_cmd(
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
 
-            let exec_fut = session.execute_sql(&statements, row_limit);
-            tokio::pin!(exec_fut);
+            let outcome = if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow() {
+                Err(SessionCallError::Operation {
+                    engine: DbEngine::Postgres,
+                    error: DbError::Cancelled,
+                })
+            } else {
+                let prep_fut = prepare_session(
+                    &sessions,
+                    &connector,
+                    session_id,
+                    LivenessCheck::AlwaysPing,
+                    Some(connect_req_id),
+                );
+                tokio::pin!(prep_fut);
 
-            let outcome = loop {
-                tokio::select! {
-                    res = &mut exec_fut => break res,
-                    _ = ticker.tick() => {
-                        emit(
-                            &event_tx,
-                            &waker,
-                            WorkerEvent::QueryTick {
-                                session_id,
-                                tab_id,
-                                req_id,
-                                elapsed_ms: start.elapsed().as_millis() as u64,
-                            },
-                        );
+                let prepared = loop {
+                    tokio::select! {
+                        res = &mut prep_fut => break Some(res),
+                        Ok(()) = cancel_rx.changed() => {
+                            if *cancel_rx.borrow() {
+                                break None;
+                            }
+                        }
+                        _ = ticker.tick() => {
+                            emit(
+                                &event_tx,
+                                &waker,
+                                WorkerEvent::QueryTick {
+                                    session_id,
+                                    tab_id,
+                                    req_id,
+                                    elapsed_ms: start.elapsed().as_millis() as u64,
+                                },
+                            );
+                        }
+                    }
+                };
+
+                match prepared {
+                    None => Err(SessionCallError::Operation {
+                        engine: DbEngine::Postgres,
+                        error: DbError::Cancelled,
+                    }),
+                    Some(Err(err)) => Err(err),
+                    Some(Ok((mut session, mut session_cid))) => {
+                        let cancel_key = req_id.get();
+                        let mut retried_pre_dispatch = false;
+                        loop {
+                            let pre_cancelled = if let Ok(mut guard) = active_cancels.lock() {
+                                match guard.get_mut(&req_id) {
+                                    Some(entry) if !entry.flag.load(std::sync::atomic::Ordering::Acquire) => {
+                                        entry.session = Some(Arc::clone(&session));
+                                        false
+                                    }
+                                    _ => true,
+                                }
+                            } else {
+                                cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow()
+                            };
+                            if pre_cancelled || *cancel_rx.borrow() {
+                                break Err(SessionCallError::Operation {
+                                    engine: session.engine(),
+                                    error: DbError::Cancelled,
+                                });
+                            }
+                            let exec_res = {
+                                let exec_fut = session.execute_sql_cancellable(
+                                    &statements,
+                                    row_limit,
+                                    cancel_key,
+                                    Some(cancel_flag.as_ref()),
+                                );
+                                tokio::pin!(exec_fut);
+                                loop {
+                                    tokio::select! {
+                                        res = &mut exec_fut => break res,
+                                        _ = ticker.tick() => {
+                                            emit(
+                                                &event_tx,
+                                                &waker,
+                                                WorkerEvent::QueryTick {
+                                                    session_id,
+                                                    tab_id,
+                                                    req_id,
+                                                    elapsed_ms: start.elapsed().as_millis() as u64,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            };
+                            match exec_res {
+                                Ok(ok) => break Ok(ok),
+                                Err(DbError::DisconnectedBeforeDispatch(cause)) => {
+                                    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow() {
+                                        break Err(SessionCallError::Operation {
+                                            engine: session.engine(),
+                                            error: DbError::Cancelled,
+                                        });
+                                    }
+                                    if retried_pre_dispatch || !supports_background_reconnect(session.engine()) {
+                                        let cid = current_connect_req_id(&sessions, session_id, session_cid).await;
+                                        break Err(SessionCallError::Disconnected {
+                                            connect_req_id: cid,
+                                            cause: *cause,
+                                        });
+                                    }
+                                    retried_pre_dispatch = true;
+                                    if let Ok(mut guard) = active_cancels.lock()
+                                        && let Some(entry) = guard.get_mut(&req_id)
+                                    {
+                                        entry.session = None;
+                                    }
+                                    let reconnected = {
+                                        let rec_fut = reconnect_session(
+                                            &sessions,
+                                            &connector,
+                                            session_id,
+                                            &session,
+                                            session_cid,
+                                        );
+                                        tokio::pin!(rec_fut);
+                                        loop {
+                                            tokio::select! {
+                                                res = &mut rec_fut => break Some(res),
+                                                Ok(()) = cancel_rx.changed() => {
+                                                    if *cancel_rx.borrow() {
+                                                        break None;
+                                                    }
+                                                }
+                                                _ = ticker.tick() => {
+                                                    emit(
+                                                        &event_tx,
+                                                        &waker,
+                                                        WorkerEvent::QueryTick {
+                                                            session_id,
+                                                            tab_id,
+                                                            req_id,
+                                                            elapsed_ms: start.elapsed().as_millis() as u64,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    };
+                                    match reconnected {
+                                        None => {
+                                            break Err(SessionCallError::Operation {
+                                                engine: session.engine(),
+                                                error: DbError::Cancelled,
+                                            });
+                                        }
+                                        Some(Err((cid, cause))) => {
+                                            break Err(SessionCallError::Disconnected {
+                                                connect_req_id: cid,
+                                                cause,
+                                            });
+                                        }
+                                        Some(Ok((fresh_session, fresh_cid))) => {
+                                            session = fresh_session;
+                                            session_cid = fresh_cid;
+                                        }
+                                    }
+                                }
+                                Err(error) if is_session_disconnect_err(session.as_ref(), &error) => {
+                                    let cid = current_connect_req_id(&sessions, session_id, session_cid).await;
+                                    break Err(SessionCallError::Disconnected {
+                                        connect_req_id: cid,
+                                        cause: unwrap_disconnect_cause(error),
+                                    });
+                                }
+                                Err(error) => {
+                                    break Err(SessionCallError::Operation {
+                                        engine: session.engine(),
+                                        error,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             };
 
             let (result, logs) = match outcome {
                 Ok((batch, logs)) => (Ok(batch), logs),
-                Err(error) => (Err(error), Vec::new()),
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::QueryCompleted {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                            recorded_history: None,
+                        },
+                    );
+                    return;
+                }
+                Err(SessionCallError::Operation { error, .. }) => (Err(error), Vec::new()),
             };
 
             let recorded_history = if let Some(store) = query_store
@@ -926,10 +1685,9 @@ async fn handle_cmd(
             );
         }
 
-        WorkerCmd::CancelQuery { session_id } => {
-            let session = sessions.lock().await.get(&session_id).cloned();
-            if let Some(session) = session {
-                drop(session.cancel_running_query().await);
+        WorkerCmd::CancelQuery { req_id, .. } => {
+            if let Some(session) = cancel_target_session {
+                drop(session.cancel_query_by_key(req_id.get()).await);
             }
         }
 
@@ -1067,7 +1825,10 @@ async fn handle_cmd(
         }
 
         WorkerCmd::Disconnect { session_id } => {
-            sessions.lock().await.remove(&session_id);
+            let mut map = sessions.lock().await;
+            if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                map.remove(&session_id);
+            }
         }
 
         WorkerCmd::TestConnection {
@@ -1136,23 +1897,24 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            connect_req_id,
             statements,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::StagedChangesCommitted {
-                        session_id,
-                        tab_id,
-                        req_id,
-                        result: Err(DbError::Disconnected),
-                        logs: Vec::new(),
-                    },
-                );
-                return;
-            };
-            match session.execute_transaction(&statements).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::AlwaysPing,
+                false,
+                Some(connect_req_id),
+                |session| {
+                    let stmts = statements.clone();
+                    async move { session.execute_transaction(&stmts).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((outcome, logs)) => emit(
                     &event_tx,
                     &waker,
@@ -1164,7 +1926,21 @@ async fn handle_cmd(
                         logs,
                     },
                 ),
-                Err(error) => {
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::StagedChangesCommitted {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { error, .. }) => {
                     let logs = vec![ExecutedSql {
                         sql: statements.join("\n"),
                         duration_ms: 0,
@@ -1189,24 +1965,30 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            connect_req_id,
             statement,
             analyze,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::ExplainCompleted {
-                        session_id,
-                        tab_id,
-                        req_id,
-                        result: Err(DbError::Disconnected),
-                        logs: Vec::new(),
-                    },
-                );
-                return;
+            let liveness = if analyze {
+                LivenessCheck::AlwaysPing
+            } else {
+                LivenessCheck::Fast
             };
-            match session.explain_sql(&statement, analyze).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                liveness,
+                !analyze,
+                Some(connect_req_id),
+                |session| {
+                    let stmt = statement.clone();
+                    async move { session.explain_sql(&stmt, analyze).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((plan, log)) => emit(
                     &event_tx,
                     &waker,
@@ -1218,7 +2000,21 @@ async fn handle_cmd(
                         logs: vec![log],
                     },
                 ),
-                Err(error) => emit(
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::ExplainCompleted {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { error, .. }) => emit(
                     &event_tx,
                     &waker,
                     WorkerEvent::ExplainCompleted {
@@ -1240,21 +2036,23 @@ async fn handle_cmd(
             value,
             source_col,
         } => {
-            let Some(session) = sessions.lock().await.get(&session_id).cloned() else {
-                emit(
-                    &event_tx,
-                    &waker,
-                    WorkerEvent::FkPeekLoaded {
-                        session_id,
-                        tab_id,
-                        req_id,
-                        result: Err(DbError::Disconnected),
-                        logs: Vec::new(),
-                    },
-                );
-                return;
-            };
-            match session.fetch_fk_row(&fk, &value, &source_col).await {
+            let outcome = run_with_reconnect(
+                &sessions,
+                &connector,
+                session_id,
+                LivenessCheck::Fast,
+                true,
+                None,
+                |session| {
+                    let fk = fk.clone();
+                    let value = value.clone();
+                    let source_col = source_col.clone();
+                    async move { session.fetch_fk_row(&fk, &value, &source_col).await }
+                },
+            )
+            .await;
+
+            match outcome {
                 Ok((peek, log)) => emit(
                     &event_tx,
                     &waker,
@@ -1266,7 +2064,21 @@ async fn handle_cmd(
                         logs: vec![log],
                     },
                 ),
-                Err(error) => emit(
+                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                    emit(
+                        &event_tx,
+                        &waker,
+                        WorkerEvent::FkPeekLoaded {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            result: Err(DbError::Disconnected),
+                            logs: Vec::new(),
+                        },
+                    );
+                }
+                Err(SessionCallError::Operation { error, .. }) => emit(
                     &event_tx,
                     &waker,
                     WorkerEvent::FkPeekLoaded {

@@ -414,9 +414,11 @@ pub struct ImportUrlState {
 /// Modal state for prompting a password when `PasswordMode::AskEveryTime` is used.
 #[derive(Clone, Debug)]
 pub struct PasswordPromptState {
+    pub session_id: Option<SessionId>,
     pub connection_id: ConnectionId,
     pub connection_name: String,
     pub database_override: Option<String>,
+    pub preferred_schema: Option<String>,
     pub password: TextEdit,
     pub error: Option<String>,
 }
@@ -589,6 +591,7 @@ pub struct TableTabState {
     pub latest_structure_req: Option<RequestId>,
     pub page: Option<TablePage>,
     pub page_error: Option<String>,
+    pub reload_on_reconnect: bool,
     pub structure: Option<TableStructure>,
     pub structure_error: Option<String>,
     pub data_table: TableState,
@@ -644,6 +647,7 @@ impl TableTabState {
             latest_structure_req: structure_req,
             page: None,
             page_error: None,
+            reload_on_reconnect: false,
             structure: None,
             structure_error: None,
             data_table: TableState::new().key(format!("tv-data-{tid}")),
@@ -1055,13 +1059,24 @@ pub fn parse_tab_id(raw: &str) -> Option<TabId> {
         .map(TabId::new)
 }
 
+/// Preserved database, schema, and object selection used to restore workspace context on reconnect.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconnectContext {
+    pub active_database: Option<String>,
+    pub active_schema: Option<String>,
+    pub selected_object: Option<(String, String)>,
+}
+
 /// Self-contained state for a single database workspace session.
 pub struct SessionState {
     pub id: SessionId,
     pub profile: ConnectionProfile,
     pub session_password: Option<String>,
     pub latest_req_id: RequestId,
+    pub active_connect_req_id: RequestId,
+    pub pending_db_switch_req: Option<RequestId>,
     pub status: ConnectionState,
+    pub reconnect_context: ReconnectContext,
     pub sidebar_tab: SidebarTab,
     pub sidebar_search: TextEdit,
     pub show_system_schemas: bool,
@@ -1087,7 +1102,10 @@ impl SessionState {
             profile,
             session_password: None,
             latest_req_id: req_id,
+            active_connect_req_id: req_id,
+            pending_db_switch_req: None,
             status: ConnectionState::Connecting,
+            reconnect_context: ReconnectContext::default(),
             sidebar_tab: SidebarTab::Items,
             sidebar_search: TextEdit::new(""),
             show_system_schemas: false,
@@ -1104,6 +1122,30 @@ impl SessionState {
             saved_queries: Vec::new(),
             query_history: Vec::new(),
             query_seq: 1,
+        }
+    }
+
+    /// Updates `status` while snapshotting active database, schema, and object selection when leaving [`ConnectionState::Connected`].
+    pub fn set_status(&mut self, next: ConnectionState) {
+        if let ConnectionState::Connected(ref data) = self.status {
+            self.reconnect_context = ReconnectContext {
+                active_database: data.active_database.clone(),
+                active_schema: data.active_schema.clone(),
+                selected_object: data.selected_object.clone(),
+            };
+        }
+        self.status = next;
+    }
+
+    /// Returns the active database, schema, and object selection, or the last snapshotted context if disconnected.
+    pub fn current_reconnect_context(&self) -> ReconnectContext {
+        match &self.status {
+            ConnectionState::Connected(data) => ReconnectContext {
+                active_database: data.active_database.clone(),
+                active_schema: data.active_schema.clone(),
+                selected_object: data.selected_object.clone(),
+            },
+            _ => self.reconnect_context.clone(),
         }
     }
 
@@ -1145,7 +1187,6 @@ impl SessionState {
         self.console_height = CONSOLE_DEFAULT_HEIGHT;
         self.console_drag_saved_height = None;
     }
-
     pub fn active_tab(&self) -> Option<&WorkspaceTab> {
         let active = self.active_tab?;
         self.tabs.iter().find(|t| t.id == active)
@@ -1651,19 +1692,7 @@ impl AppState {
         self.connections
             .iter()
             .filter(|c| self.env_filter.is_none_or(|env| c.env == env))
-            .filter(|c| {
-                q.is_empty()
-                    || c.name.to_ascii_lowercase().contains(&q)
-                    || c.engine.label().to_ascii_lowercase().contains(&q)
-                    || c.host.to_ascii_lowercase().contains(&q)
-                    || c.user.to_ascii_lowercase().contains(&q)
-                    || c.database
-                        .as_deref()
-                        .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
-                    || c.file_path
-                        .as_ref()
-                        .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(&q))
-            })
+            .filter(|c| connection_matches_search(c, &q))
             .collect()
     }
 
@@ -1701,7 +1730,14 @@ impl AppState {
 
     pub fn open_new_connection_form(&mut self, tx: &mut Tx) {
         self.launcher_context_menu = None;
-        self.overlay = OverlayState::ConnectionForm(Box::new(ConnectionFormState::new_blank()));
+        let mut form = ConnectionFormState::new_blank();
+        if self.screen == Screen::Launcher
+            && let Some(env) = self.env_filter
+        {
+            form.env = env;
+            form.color = env.default_color();
+        }
+        self.overlay = OverlayState::ConnectionForm(Box::new(form));
         tx.focus_when_shown("form-name", true);
     }
 
@@ -1826,11 +1862,36 @@ impl AppState {
         self.folders = data.folders;
         self.connections = data.connections;
         self.launcher_selected = Some(profile.id);
+        if self.env_filter.is_some_and(|env| env != profile.env) {
+            self.env_filter = None;
+        }
+        let search_q = self.launcher_search.text.trim().to_ascii_lowercase();
+        if !connection_matches_search(&profile, &search_q) {
+            self.launcher_search = TextEdit::new("");
+        }
         self.persist_connections();
+
+        let password_update = if profile.password_mode == PasswordMode::None {
+            Some(None)
+        } else if password_touched || !secret.is_empty() {
+            Some((!secret.is_empty()).then(|| secret.clone()))
+        } else {
+            None
+        };
 
         for session in self.sessions.values_mut() {
             if session.profile.id == profile.id {
                 session.profile = profile.clone();
+                if let Some(ref updated_pw) = password_update {
+                    session.session_password = updated_pw.clone();
+                }
+                if let Some(worker) = &self.worker {
+                    worker.send(WorkerCmd::UpdateSessionProfile {
+                        session_id: session.id,
+                        profile: profile.clone(),
+                        password_update: password_update.clone(),
+                    });
+                }
             }
         }
 
@@ -1967,7 +2028,18 @@ impl AppState {
         {
             self.screen = Screen::Workspace(existing_sid);
             self.overlay = OverlayState::None;
-            self.sync_window_title(tx);
+            let should_reconnect = self.worker.is_some()
+                && self.sessions.get(&existing_sid).is_some_and(|sess| {
+                    matches!(
+                        sess.status,
+                        ConnectionState::Disconnected { .. } | ConnectionState::Failed(_)
+                    )
+                });
+            if should_reconnect {
+                self.reconnect_active(tx);
+            } else {
+                self.sync_window_title(tx);
+            }
             return;
         }
 
@@ -1980,9 +2052,11 @@ impl AppState {
             && explicit_password.is_none()
         {
             self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
+                session_id: None,
                 connection_id,
                 connection_name: profile.name.clone(),
                 database_override,
+                preferred_schema: None,
                 password: TextEdit::new(""),
                 error: None,
             });
@@ -2012,6 +2086,7 @@ impl AppState {
                 profile,
                 prompt_password: explicit_password,
                 database: database_override,
+                preferred_schema: None,
             });
         }
     }
@@ -2021,8 +2096,40 @@ impl AppState {
             return;
         };
         let pw = prompt.password.text.clone();
+        let session_id = prompt.session_id;
         let connection_id = prompt.connection_id;
         let database_override = prompt.database_override.clone();
+        let preferred_schema = prompt.preferred_schema.clone();
+        if let Some(sid) = session_id
+            && self.sessions.contains_key(&sid)
+        {
+            let req_id = self.alloc_req_id();
+            let profile = {
+                let Some(session) = self.sessions.get_mut(&sid) else {
+                    return;
+                };
+                session.session_password = Some(pw.clone());
+                session.latest_req_id = req_id;
+                session.active_connect_req_id = req_id;
+                session.pending_db_switch_req = None;
+                session.set_status(ConnectionState::Reconnecting);
+                session.profile.clone()
+            };
+            self.overlay = OverlayState::None;
+            self.screen = Screen::Workspace(sid);
+            self.sync_window_title(tx);
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCmd::Connect {
+                    session_id: sid,
+                    req_id,
+                    profile,
+                    prompt_password: Some(pw),
+                    database: database_override,
+                    preferred_schema,
+                });
+            }
+            return;
+        }
         self.start_or_focus_connection(connection_id, Some(pw), database_override, tx);
     }
 
@@ -2030,6 +2137,7 @@ impl AppState {
         let Screen::Workspace(session_id) = self.screen else {
             return;
         };
+        let has_worker = self.worker.is_some();
         let req_id = self.alloc_req_id();
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
@@ -2037,22 +2145,35 @@ impl AppState {
         session.latest_req_id = req_id;
         let profile = session.profile.clone();
         let prompt_password = session.session_password.clone();
-        if let ConnectionState::Connected(ref mut data) = session.status {
-            data.active_database = Some(database.clone());
-            data.selected_object = None;
-            data.expanded_columns.clear();
+
+        if has_worker && matches!(session.status, ConnectionState::Connected(_)) {
+            session.pending_db_switch_req = Some(req_id);
         } else {
-            session.status = ConnectionState::Connecting;
+            session.active_connect_req_id = req_id;
+            session.pending_db_switch_req = has_worker.then_some(req_id);
+            if let ConnectionState::Connected(ref mut data) = session.status {
+                data.active_database = Some(database.clone());
+                data.selected_object = None;
+                data.expanded_columns.clear();
+            } else {
+                session.set_status(ConnectionState::Connecting);
+                session.reconnect_context = ReconnectContext {
+                    active_database: Some(database.clone()),
+                    active_schema: None,
+                    selected_object: None,
+                };
+            }
+            session.tabs.retain(|t| matches!(t.content, TabContent::Query(_)));
+            if let Some(active) = session.active_tab
+                && !session.tabs.iter().any(|t| t.id == active)
+            {
+                session.active_tab = session.tabs.last().map(|t| t.id);
+            }
+            session.tab_drag = TabDragState::new();
+            self.sync_window_title(tx);
         }
-        session.tabs.retain(|t| matches!(t.content, TabContent::Query(_)));
-        if let Some(active) = session.active_tab
-            && !session.tabs.iter().any(|t| t.id == active)
-        {
-            session.active_tab = session.tabs.last().map(|t| t.id);
-        }
-        session.tab_drag = TabDragState::new();
+
         self.overlay = OverlayState::None;
-        self.sync_window_title(tx);
 
         if let Some(worker) = &self.worker {
             worker.send(WorkerCmd::SelectDatabase {
@@ -2073,6 +2194,7 @@ impl AppState {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
+        let connect_req_id = session.active_connect_req_id;
         session.latest_req_id = req_id;
         session.schema_dropdown_open = false;
         if let ConnectionState::Connected(ref mut data) = session.status {
@@ -2084,6 +2206,7 @@ impl AppState {
             worker.send(WorkerCmd::SelectSchema {
                 session_id,
                 req_id,
+                connect_req_id,
                 schema,
             });
         }
@@ -3017,6 +3140,7 @@ impl AppState {
             };
             let engine = session.profile.engine;
             let policy = session.profile.safety;
+            let connect_req_id = session.active_connect_req_id;
             let Some(tab_id) = session.active_tab else {
                 return;
             };
@@ -3047,10 +3171,10 @@ impl AppState {
             tab.committing = true;
             tab.commit_req_id = Some(req_id);
             tab.commit_error = None;
-            Some((tab_id, stmts))
+            Some((tab_id, connect_req_id, stmts))
         };
 
-        let Some((tab_id, statements)) = dispatch else {
+        let Some((tab_id, connect_req_id, statements)) = dispatch else {
             return;
         };
         if let Some(worker) = &self.worker {
@@ -3058,6 +3182,7 @@ impl AppState {
                 session_id,
                 tab_id,
                 req_id,
+                connect_req_id,
                 statements,
             });
         } else if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
@@ -3586,6 +3711,7 @@ impl AppState {
             };
             let connection_id = session.profile.id;
             let connection_name = session.profile.name.clone();
+            let connect_req_id = session.active_connect_req_id;
             let database = session
                 .status
                 .as_connected()
@@ -3601,7 +3727,7 @@ impl AppState {
             tab.batch_cancelled = false;
             tab.show_explain = false;
             tab.limit_dropdown_open = false;
-            (connection_id, connection_name, database)
+            (connect_req_id, connection_id, connection_name, database)
         };
 
         if let Some(worker) = &self.worker {
@@ -3609,9 +3735,10 @@ impl AppState {
                 session_id,
                 tab_id,
                 req_id,
-                connection_id: dispatch.0,
-                connection_name: dispatch.1,
-                database: dispatch.2,
+                connect_req_id: dispatch.0,
+                connection_id: dispatch.1,
+                connection_name: dispatch.2,
+                database: dispatch.3,
                 statements,
                 executed_sql_text,
                 row_limit,
@@ -3635,22 +3762,25 @@ impl AppState {
         analyze: bool,
     ) {
         let req_id = self.alloc_req_id();
-        if let Some(tab) = self
-            .sessions
-            .get_mut(&session_id)
-            .and_then(|s| s.tab_mut(tab_id))
-            .and_then(WorkspaceTab::as_query_mut)
-        {
-            tab.explain_loading = self.worker.is_some();
-            tab.explain_req_id = self.worker.as_ref().map(|_| req_id);
-            tab.explain_error = None;
-            tab.show_explain = true;
-        }
+        let connect_req_id = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let cid = session.active_connect_req_id;
+            if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut) {
+                tab.explain_loading = self.worker.is_some();
+                tab.explain_req_id = self.worker.as_ref().map(|_| req_id);
+                tab.explain_error = None;
+                tab.show_explain = true;
+            }
+            cid
+        };
         if let Some(worker) = &self.worker {
             worker.send(WorkerCmd::ExplainSql {
                 session_id,
                 tab_id,
                 req_id,
+                connect_req_id,
                 statement,
                 analyze,
             });
@@ -3669,8 +3799,10 @@ impl AppState {
         }
         if !tab.cancelling {
             tab.cancelling = true;
-            if let Some(worker) = &self.worker {
-                worker.send(WorkerCmd::CancelQuery { session_id });
+            if let Some(req_id) = tab.active_req_id
+                && let Some(worker) = &self.worker
+            {
+                worker.send(WorkerCmd::CancelQuery { session_id, req_id });
             }
         }
         true
@@ -3901,11 +4033,13 @@ impl AppState {
             .status
             .as_connected()
             .and_then(|c| c.active_schema.clone());
+        let connect_req_id = session.active_connect_req_id;
         session.latest_req_id = req_id;
         if let Some(worker) = &self.worker {
             worker.send(WorkerCmd::ReloadWorkspace {
                 session_id,
                 req_id,
+                connect_req_id,
                 active_schema,
             });
         }
@@ -3919,20 +4053,22 @@ impl AppState {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        let active_db = session
-            .status
-            .as_connected()
-            .and_then(|c| c.active_database.clone())
+        let ctx = session.current_reconnect_context();
+        let active_db = ctx
+            .active_database
             .or_else(|| session.profile.database.clone());
+        let preferred_schema = ctx.active_schema;
         let profile = session.profile.clone();
         let pw = session.session_password.clone();
         if profile.engine != DbEngine::Sqlite && profile.password_mode == PasswordMode::AskEveryTime && pw.is_none() {
             let conn_id = profile.id;
             let name = profile.name.clone();
             self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
+                session_id: Some(session_id),
                 connection_id: conn_id,
                 connection_name: name,
                 database_override: active_db,
+                preferred_schema,
                 password: TextEdit::new(""),
                 error: None,
             });
@@ -3940,7 +4076,9 @@ impl AppState {
             return;
         }
         session.latest_req_id = req_id;
-        session.status = ConnectionState::Reconnecting;
+        session.active_connect_req_id = req_id;
+        session.pending_db_switch_req = None;
+        session.set_status(ConnectionState::Reconnecting);
         self.sync_window_title(tx);
         if let Some(worker) = &self.worker {
             worker.send(WorkerCmd::Connect {
@@ -3949,6 +4087,7 @@ impl AppState {
                 profile,
                 prompt_password: pw,
                 database: active_db,
+                preferred_schema,
             });
         }
     }
@@ -3957,10 +4096,14 @@ impl AppState {
         let Screen::Workspace(session_id) = self.screen else {
             return;
         };
+        let req_id = self.alloc_req_id();
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        session.status = ConnectionState::Disconnected { reason: None };
+        session.latest_req_id = req_id;
+        session.active_connect_req_id = req_id;
+        session.pending_db_switch_req = None;
+        session.set_status(ConnectionState::Disconnected { reason: None });
         session.session_password = None;
         if let Some(worker) = &self.worker {
             worker.send(WorkerCmd::Disconnect { session_id });
@@ -4047,6 +4190,64 @@ impl AppState {
         }
     }
 
+    fn handle_session_disconnected(
+        &mut self,
+        session_id: SessionId,
+        connect_req_id: RequestId,
+        error: tv_core::DbError,
+        tx: &mut Tx,
+    ) {
+        let prompt_info = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            if session.active_connect_req_id != connect_req_id {
+                return;
+            }
+            if matches!(
+                session.status,
+                ConnectionState::Disconnected { .. } | ConnectionState::Failed(_)
+            ) {
+                return;
+            }
+            if error.is_auth_failure() && session.profile.password_mode == PasswordMode::AskEveryTime {
+                let ctx = session.current_reconnect_context();
+                session.session_password = None;
+                session.set_status(ConnectionState::Disconnected {
+                    reason: Some(error.to_string()),
+                });
+                Some((
+                    session.profile.id,
+                    session.profile.name.clone(),
+                    ctx.active_database.or_else(|| session.profile.database.clone()),
+                    ctx.active_schema,
+                ))
+            } else {
+                session.set_status(ConnectionState::Disconnected {
+                    reason: Some(error.to_string()),
+                });
+                None
+            }
+        };
+
+        if let Some((conn_id, name, db, schema)) = prompt_info {
+            self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
+                session_id: Some(session_id),
+                connection_id: conn_id,
+                connection_name: name,
+                database_override: db,
+                preferred_schema: schema,
+                password: TextEdit::new(""),
+                error: Some(error.to_string()),
+            });
+            tx.focus_when_shown("password-prompt-input", true);
+        }
+
+        if self.screen == Screen::Workspace(session_id) {
+            self.sync_window_title(tx);
+        }
+    }
+
     fn handle_worker_event(&mut self, event: WorkerEvent, tx: &mut Tx) {
         match event {
             WorkerEvent::Connected {
@@ -4060,28 +4261,138 @@ impl AppState {
                 objects,
                 logs,
             } => {
-                let Some(session) = self.sessions.get_mut(&session_id) else {
-                    return;
+                let mut page_reloads: Vec<(TabId, PageRequest, RequestId)> = Vec::new();
+                let mut struct_reloads: Vec<(TabId, String, String, RequestId)> = Vec::new();
+                let conn_id = {
+                    let Some(session) = self.sessions.get_mut(&session_id) else {
+                        return;
+                    };
+                    if session.active_connect_req_id != req_id {
+                        return;
+                    }
+                    session.latest_req_id = req_id;
+                    session.pending_db_switch_req = None;
+                    append_logs(&mut session.console_entries, logs);
+
+                    let restored_selected = session
+                        .reconnect_context
+                        .selected_object
+                        .clone()
+                        .filter(|(s, n)| objects.iter().any(|o| o.schema == *s && o.name == *n));
+
+                    session.set_status(ConnectionState::Connected(Box::new(ConnectedData {
+                        server_version: server_info.version,
+                        databases,
+                        active_database: active_database.clone(),
+                        schemas,
+                        active_schema,
+                        objects,
+                        expanded_columns: HashMap::new(),
+                        selected_object: restored_selected,
+                    })));
+                    session.profile.id
                 };
-                if session.latest_req_id != req_id {
-                    return;
-                }
-                append_logs(&mut session.console_entries, logs);
-                session.status = ConnectionState::Connected(Box::new(ConnectedData {
-                    server_version: server_info.version,
-                    databases,
-                    active_database,
-                    schemas,
-                    active_schema,
-                    objects,
-                    expanded_columns: HashMap::new(),
-                    selected_object: None,
-                }));
-                let conn_id = session.profile.id;
+
+                let mut persisted_conn_change = false;
                 if let Some(profile) = self.connections.iter_mut().find(|c| c.id == conn_id) {
                     profile.last_connected_at = Some(chrono::Utc::now());
+                    persisted_conn_change = true;
+                }
+                if persisted_conn_change {
                     self.persist_connections();
                 }
+
+                if active_database.is_some() && self.worker.is_some() {
+                    let mut req_ids_needed = Vec::new();
+                    if let Some(session) = self.sessions.get(&session_id) {
+                        let active_tab_id = session.active_tab;
+                        for tab in &session.tabs {
+                            if let TabContent::Table(t) = &tab.content {
+                                let is_active = Some(tab.id) == active_tab_id;
+                                let reload_table = t.reload_on_reconnect && !t.staged.has_changes();
+                                let need_page =
+                                    (reload_table || (is_active && t.page.is_none())) && !t.page_loading;
+                                let need_struct =
+                                    (is_active || reload_table) && t.structure.is_none() && !t.structure_loading;
+                                if need_page || need_struct {
+                                    req_ids_needed.push((tab.id, need_page, need_struct));
+                                }
+                            }
+                        }
+                    }
+
+                    let mut allocated = Vec::with_capacity(req_ids_needed.len());
+                    for (tab_id, need_page, need_struct) in req_ids_needed {
+                        let p_req = need_page.then(|| self.alloc_req_id());
+                        let s_req = need_struct.then(|| self.alloc_req_id());
+                        allocated.push((tab_id, p_req, s_req));
+                    }
+
+                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                        for (tab_id, p_req, s_req) in allocated {
+                            if let Some(t) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) {
+                                if let Some(rid) = p_req {
+                                    t.page_loading = true;
+                                    t.page_error = None;
+                                    t.reload_on_reconnect = false;
+                                    t.latest_page_req = Some(rid);
+                                    page_reloads.push((tab_id, t.page_request(), rid));
+                                }
+                                if let Some(rid) = s_req {
+                                    t.structure_loading = true;
+                                    t.structure_error = None;
+                                    t.latest_structure_req = Some(rid);
+                                    struct_reloads.push((
+                                        tab_id,
+                                        t.schema.clone(),
+                                        t.object_name.clone(),
+                                        rid,
+                                    ));
+                                }
+                                if t.commit_error.as_deref() == Some("database session is disconnected") {
+                                    t.commit_error = None;
+                                }
+                            }
+                        }
+                        if let Some(q) = session.active_query_tab_mut() {
+                            if q.batch_error.as_deref().is_some_and(|e| {
+                                e == "database session is disconnected"
+                                    || e == "Disconnected from database"
+                                    || e.starts_with("Database is not connected.")
+                            }) {
+                                q.batch_error = None;
+                            }
+                            if q.explain_error.as_deref().is_some_and(|e| {
+                                e == "database session is disconnected"
+                                    || e == "Disconnected from database"
+                                    || e.starts_with("Database is not connected.")
+                            }) {
+                                q.explain_error = None;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(worker) = &self.worker {
+                    for (tab_id, request, req_id) in page_reloads {
+                        worker.send(WorkerCmd::FetchTablePage {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            request,
+                        });
+                    }
+                    for (tab_id, schema, table, req_id) in struct_reloads {
+                        worker.send(WorkerCmd::DescribeTable {
+                            session_id,
+                            tab_id,
+                            req_id,
+                            schema,
+                            table,
+                        });
+                    }
+                }
+
                 if self.screen == Screen::Workspace(session_id) {
                     self.sync_window_title(tx);
                 }
@@ -4092,39 +4403,61 @@ impl AppState {
                 req_id,
                 error,
             } => {
-                let Some(session) = self.sessions.get_mut(&session_id) else {
-                    return;
-                };
-                if session.latest_req_id != req_id {
-                    return;
-                }
-                if error.is_auth_failure() && session.profile.password_mode == PasswordMode::AskEveryTime {
-                    let conn_id = session.profile.id;
-                    let name = session.profile.name.clone();
-                    let db = session.profile.database.clone();
-                    session.session_password = None;
-                    session.status = ConnectionState::Disconnected {
-                        reason: Some(error.to_string()),
+                let prompt_info = {
+                    let Some(session) = self.sessions.get_mut(&session_id) else {
+                        return;
                     };
+                    if session.active_connect_req_id != req_id {
+                        return;
+                    }
+                    session.pending_db_switch_req = None;
+                    if error.is_auth_failure() && session.profile.password_mode == PasswordMode::AskEveryTime {
+                        let ctx = session.current_reconnect_context();
+                        session.session_password = None;
+                        session.set_status(ConnectionState::Disconnected {
+                            reason: Some(error.to_string()),
+                        });
+                        Some((
+                            session.profile.id,
+                            session.profile.name.clone(),
+                            ctx.active_database.or_else(|| session.profile.database.clone()),
+                            ctx.active_schema,
+                        ))
+                    } else {
+                        session.set_status(ConnectionState::Failed(error.to_string()));
+                        None
+                    }
+                };
+                if let Some((conn_id, name, db, schema)) = prompt_info {
                     self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
+                        session_id: Some(session_id),
                         connection_id: conn_id,
                         connection_name: name,
                         database_override: db,
+                        preferred_schema: schema,
                         password: TextEdit::new(""),
                         error: Some(error.to_string()),
                     });
                     tx.focus_when_shown("password-prompt-input", true);
-                } else {
-                    session.status = ConnectionState::Failed(error.to_string());
                 }
                 if self.screen == Screen::Workspace(session_id) {
                     self.sync_window_title(tx);
                 }
             }
 
+            WorkerEvent::SessionDisconnected {
+                session_id,
+                connect_req_id,
+                error,
+            } => {
+                self.handle_session_disconnected(session_id, connect_req_id, error, tx);
+            }
+
             WorkerEvent::SchemasAndObjectsLoaded {
                 session_id,
                 req_id,
+                is_db_switch,
+                server_version,
                 databases,
                 active_database,
                 schemas,
@@ -4132,39 +4465,77 @@ impl AppState {
                 objects,
                 logs,
             } => {
-                let Some(session) = self.sessions.get_mut(&session_id) else {
-                    return;
-                };
-                if session.latest_req_id != req_id {
-                    return;
-                }
-                append_logs(&mut session.console_entries, logs);
-                let db_changed = session
-                    .status
-                    .as_connected()
-                    .and_then(|c| c.active_database.as_deref())
-                    != Some(active_database.as_str());
-                if let ConnectionState::Connected(ref mut data) = session.status {
-                    data.databases = databases;
-                    data.active_database = Some(active_database);
-                    data.schemas = schemas;
-                    data.active_schema = active_schema;
-                    data.objects = objects;
-                    data.expanded_columns.clear();
+                let mut clear_password_prompt = false;
+                let in_current_screen = {
+                    let Some(session) = self.sessions.get_mut(&session_id) else {
+                        return;
+                    };
+                    let matches_pending = session.pending_db_switch_req == Some(req_id);
+                    if is_db_switch {
+                        if !matches_pending && req_id.get() <= session.active_connect_req_id.get() {
+                            return;
+                        }
+                        if matches_pending {
+                            session.pending_db_switch_req = None;
+                        }
+                        session.active_connect_req_id = req_id;
+                        session.latest_req_id = req_id;
+                        clear_password_prompt = true;
+                    } else if session.latest_req_id != req_id {
+                        return;
+                    }
+                    append_logs(&mut session.console_entries, logs);
+                    let db_changed = is_db_switch
+                        || session
+                            .status
+                            .as_connected()
+                            .and_then(|c| c.active_database.as_deref())
+                            != Some(active_database.as_str());
+                    if let ConnectionState::Connected(ref mut data) = session.status {
+                        if let Some(version) = server_version {
+                            data.server_version = version;
+                        }
+                        data.databases = databases;
+                        data.active_database = Some(active_database);
+                        data.schemas = schemas;
+                        data.active_schema = active_schema;
+                        data.objects = objects;
+                        data.expanded_columns.clear();
+                        if db_changed {
+                            data.selected_object = None;
+                        }
+                    } else if is_db_switch {
+                        session.set_status(ConnectionState::Connected(Box::new(ConnectedData {
+                            server_version: server_version.unwrap_or_default(),
+                            databases,
+                            active_database: Some(active_database),
+                            schemas,
+                            active_schema,
+                            objects,
+                            expanded_columns: HashMap::new(),
+                            selected_object: None,
+                        })));
+                    }
                     if db_changed {
-                        data.selected_object = None;
+                        session.tabs.retain(|t| matches!(t.content, TabContent::Query(_)));
+                        if let Some(active) = session.active_tab
+                            && !session.tabs.iter().any(|t| t.id == active)
+                        {
+                            session.active_tab = session.tabs.last().map(|t| t.id);
+                        }
+                        session.tab_drag = TabDragState::new();
                     }
+                    self.screen == Screen::Workspace(session_id)
+                };
+                if clear_password_prompt
+                    && matches!(
+                        &self.overlay,
+                        OverlayState::PasswordPrompt(prompt) if prompt.session_id == Some(session_id)
+                    )
+                {
+                    self.overlay = OverlayState::None;
                 }
-                if db_changed {
-                    session.tabs.retain(|t| matches!(t.content, TabContent::Query(_)));
-                    if let Some(active) = session.active_tab
-                        && !session.tabs.iter().any(|t| t.id == active)
-                    {
-                        session.active_tab = session.tabs.last().map(|t| t.id);
-                    }
-                    session.tab_drag = TabDragState::new();
-                }
-                if self.screen == Screen::Workspace(session_id) {
+                if in_current_screen {
                     self.sync_window_title(tx);
                 }
             }
@@ -4202,14 +4573,20 @@ impl AppState {
                     return;
                 };
                 append_logs(&mut session.console_entries, logs);
-                if let ConnectionState::Connected(ref mut data) = session.status {
-                    let key = (schema, object);
-                    if data.expanded_columns.contains_key(&key) {
-                        let next = match columns {
-                            Ok(cols) => ColumnLoadState::Loaded(cols),
-                            Err(err) => ColumnLoadState::Error(err.to_string()),
-                        };
-                        data.expanded_columns.insert(key, next);
+                if let ConnectionState::Connected(ref mut data) = session.status
+                    && let std::collections::hash_map::Entry::Occupied(mut entry) =
+                        data.expanded_columns.entry((schema, object))
+                {
+                    match columns {
+                        Ok(cols) => {
+                            entry.insert(ColumnLoadState::Loaded(cols));
+                        }
+                        Err(tv_core::DbError::Disconnected) => {
+                            entry.remove();
+                        }
+                        Err(err) => {
+                            entry.insert(ColumnLoadState::Error(err.to_string()));
+                        }
                     }
                 }
             }
@@ -4240,6 +4617,7 @@ impl AppState {
                         tab.page = Some(page);
                         tab.page_error = None;
                         tab.filter_error = None;
+                        tab.reload_on_reconnect = false;
                         tab.editing_cell = None;
                         tab.staged.clear();
                         tab.rebuild_diff_state();
@@ -4259,12 +4637,7 @@ impl AppState {
                     }
                     Err(err) => {
                         if matches!(err, tv_core::DbError::Disconnected) {
-                            session.status = ConnectionState::Disconnected {
-                                reason: Some(err.to_string()),
-                            };
-                            if self.screen == Screen::Workspace(session_id) {
-                                self.sync_window_title(tx);
-                            }
+                            tab.reload_on_reconnect = true;
                         } else if tab.applied_filter.is_some() && tab.page.is_some() {
                             tab.filter_error = Some(err.to_string());
                         } else {
@@ -4298,7 +4671,11 @@ impl AppState {
                         tab.structure_error = None;
                     }
                     Err(err) => {
-                        tab.structure_error = Some(err.to_string());
+                        if matches!(err, tv_core::DbError::Disconnected) {
+                            tab.structure_error = None;
+                        } else {
+                            tab.structure_error = Some(err.to_string());
+                        }
                     }
                 }
             }
@@ -4338,7 +4715,6 @@ impl AppState {
                         session.query_history.truncate(200);
                     }
                 }
-                let disconnected = matches!(result, Err(tv_core::DbError::Disconnected));
                 if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
                     && tab.active_req_id == Some(req_id)
                 {
@@ -4370,16 +4746,10 @@ impl AppState {
                         }
                         Err(err) => {
                             tab.batch_cancelled = matches!(err, tv_core::DbError::Cancelled);
-                            tab.batch_error = Some(err.to_string());
+                            if !matches!(err, tv_core::DbError::Disconnected) {
+                                tab.batch_error = Some(err.to_string());
+                            }
                         }
-                    }
-                }
-                if disconnected {
-                    session.status = ConnectionState::Disconnected {
-                        reason: Some("Disconnected from database".to_owned()),
-                    };
-                    if self.screen == Screen::Workspace(session_id) {
-                        self.sync_window_title(tx);
                     }
                 }
             }
@@ -4434,19 +4804,30 @@ impl AppState {
                 req_id,
                 error,
             } => {
-                let Some(session) = self.sessions.get_mut(&session_id) else {
-                    return;
-                };
-                if session.latest_req_id != req_id {
-                    return;
-                }
-                if matches!(error, tv_core::DbError::Disconnected) {
-                    session.status = ConnectionState::Disconnected {
-                        reason: Some(error.to_string()),
+                let mark_failed = {
+                    let Some(session) = self.sessions.get_mut(&session_id) else {
+                        return;
                     };
+                    let is_pending_switch = session.pending_db_switch_req == Some(req_id);
+                    if !is_pending_switch && session.latest_req_id != req_id {
+                        return;
+                    }
+                    if is_pending_switch {
+                        session.pending_db_switch_req = None;
+                    }
+                    if matches!(session.status, ConnectionState::Connecting) {
+                        session.set_status(ConnectionState::Failed(error.to_string()));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !matches!(error, tv_core::DbError::Disconnected) {
+                    self.set_notice(error.to_string(), true);
                 }
-                self.set_notice(error.to_string(), true);
-                if self.screen == Screen::Workspace(session_id) {
+                if (mark_failed || !matches!(error, tv_core::DbError::Disconnected))
+                    && self.screen == Screen::Workspace(session_id)
+                {
                     self.sync_window_title(tx);
                 }
             }
@@ -4492,72 +4873,69 @@ impl AppState {
                 result,
                 logs,
             } => {
-                let Some(session) = self.sessions.get_mut(&session_id) else {
-                    return;
-                };
-                append_logs(&mut session.console_entries, logs);
-                let mut reload_target: Option<(TabId, PageRequest, RequestId)> = None;
-                let mut disconnected = false;
+                let mut reload_target: Option<(TabId, PageRequest)> = None;
+                let mut notice: Option<(String, bool)> = None;
 
-                if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut)
-                    && tab.commit_req_id == Some(req_id)
                 {
-                    tab.committing = false;
-                    tab.commit_req_id = None;
-                    match result {
-                        Ok(outcome) => {
-                            let changes = tab.staged.change_count();
-                            tab.staged.clear();
-                            tab.diff_drawer_open = false;
-                            tab.commit_error = None;
-                            tab.editing_cell = None;
-                            tab.rebuild_diff_state();
-                            let next_req = self.alloc_req_id();
-                            if let Some(t) = self
-                                .sessions
-                                .get_mut(&session_id)
-                                .and_then(|s| s.tab_mut(tab_id))
-                                .and_then(WorkspaceTab::as_table_mut)
-                            {
-                                t.page_loading = true;
-                                t.latest_page_req = Some(next_req);
-                                reload_target = Some((tab_id, t.page_request(), next_req));
+                    let Some(session) = self.sessions.get_mut(&session_id) else {
+                        return;
+                    };
+                    append_logs(&mut session.console_entries, logs);
+
+                    if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut)
+                        && tab.commit_req_id == Some(req_id)
+                    {
+                        tab.committing = false;
+                        tab.commit_req_id = None;
+                        match result {
+                            Ok(outcome) => {
+                                let changes = tab.staged.change_count();
+                                tab.staged.clear();
+                                tab.diff_drawer_open = false;
+                                tab.commit_error = None;
+                                tab.editing_cell = None;
+                                tab.rebuild_diff_state();
+                                reload_target = Some((tab_id, tab.page_request()));
+                                notice = Some((
+                                    format!(
+                                        "Committed {changes} change(s) ({} rows affected · {} ms)",
+                                        outcome.total_rows_affected, outcome.elapsed_ms
+                                    ),
+                                    false,
+                                ));
                             }
-                            self.set_notice(
-                                format!(
-                                    "Committed {changes} change(s) ({} rows affected · {} ms)",
-                                    outcome.total_rows_affected, outcome.elapsed_ms
-                                ),
-                                false,
-                            );
-                        }
-                        Err(err) => {
-                            if matches!(err, tv_core::DbError::Disconnected) {
-                                disconnected = true;
+                            Err(err) => {
+                                let msg = err.to_string();
+                                tab.commit_error = Some(msg.clone());
+                                tab.diff_drawer_open = true;
+                                notice = Some((msg, true));
                             }
-                            let msg = err.to_string();
-                            tab.commit_error = Some(msg.clone());
-                            tab.diff_drawer_open = true;
-                            self.set_notice(msg, true);
                         }
                     }
                 }
 
-                if disconnected && let Some(sess) = self.sessions.get_mut(&session_id) {
-                    sess.status = ConnectionState::Disconnected {
-                        reason: Some("Disconnected from database".to_owned()),
-                    };
-                    if self.screen == Screen::Workspace(session_id) {
-                        self.sync_window_title(tx);
-                    }
+                if let Some((msg, is_err)) = notice {
+                    self.set_notice(msg, is_err);
                 }
-                if let (Some(worker), Some((tid, request, page_rid))) = (&self.worker, reload_target) {
-                    worker.send(WorkerCmd::FetchTablePage {
-                        session_id,
-                        tab_id: tid,
-                        req_id: page_rid,
-                        request,
-                    });
+                if let Some((tid, request)) = reload_target {
+                    let next_req = self.alloc_req_id();
+                    if let Some(t) = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .and_then(|s| s.tab_mut(tid))
+                        .and_then(WorkspaceTab::as_table_mut)
+                    {
+                        t.page_loading = true;
+                        t.latest_page_req = Some(next_req);
+                    }
+                    if let Some(worker) = &self.worker {
+                        worker.send(WorkerCmd::FetchTablePage {
+                            session_id,
+                            tab_id: tid,
+                            req_id: next_req,
+                            request,
+                        });
+                    }
                 }
             }
 
@@ -4572,7 +4950,6 @@ impl AppState {
                     return;
                 };
                 append_logs(&mut session.console_entries, logs);
-                let disconnected = matches!(result, Err(tv_core::DbError::Disconnected));
                 if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut)
                     && tab.explain_req_id == Some(req_id)
                 {
@@ -4585,16 +4962,10 @@ impl AppState {
                             tab.explain_error = None;
                         }
                         Err(err) => {
-                            tab.explain_error = Some(err.to_string());
+                            if !matches!(err, tv_core::DbError::Disconnected) {
+                                tab.explain_error = Some(err.to_string());
+                            }
                         }
-                    }
-                }
-                if disconnected {
-                    session.status = ConnectionState::Disconnected {
-                        reason: Some("Disconnected from database".to_owned()),
-                    };
-                    if self.screen == Screen::Workspace(session_id) {
-                        self.sync_window_title(tx);
                     }
                 }
             }
@@ -4621,7 +4992,11 @@ impl AppState {
                             peek.error = None;
                         }
                         Err(err) => {
-                            peek.error = Some(err.to_string());
+                            if matches!(err, tv_core::DbError::Disconnected) {
+                                tab.fk_peek = None;
+                            } else {
+                                peek.error = Some(err.to_string());
+                            }
                         }
                     }
                 }
@@ -4836,7 +5211,11 @@ impl AppState {
                         (None, None, _) => format!("{} — TableView", session.profile.name),
                     }
                 }
-                _ => format!("{} (Disconnected) — TableView", session.profile.name),
+                ConnectionState::Connecting => format!("{} (Connecting…) — TableView", session.profile.name),
+                ConnectionState::Reconnecting => format!("{} (Reconnecting…) — TableView", session.profile.name),
+                ConnectionState::Disconnected { .. } | ConnectionState::Failed(_) => {
+                    format!("{} (Disconnected) — TableView", session.profile.name)
+                }
             },
         };
         tx.set_title(title);
@@ -4926,4 +5305,18 @@ fn concise_sql_title(sql: &str, fallback_seq: u64) -> String {
         out.push('…');
     }
     out
+}
+
+fn connection_matches_search(c: &ConnectionProfile, query_lower: &str) -> bool {
+    query_lower.is_empty()
+        || c.name.to_ascii_lowercase().contains(query_lower)
+        || c.engine.label().to_ascii_lowercase().contains(query_lower)
+        || c.host.to_ascii_lowercase().contains(query_lower)
+        || c.user.to_ascii_lowercase().contains(query_lower)
+        || c.database
+            .as_deref()
+            .is_some_and(|d| d.to_ascii_lowercase().contains(query_lower))
+        || c.file_path
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(query_lower))
 }
