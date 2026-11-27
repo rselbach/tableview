@@ -9,9 +9,11 @@ workspace = true
 
 [dependencies]
 chrono.workspace = true
+directories.workspace = true
 rune.workspace = true
 rune-kit.workspace = true
 tokio.workspace = true
 tv-core.workspace = true
+tv-update.workspace = true
 url.workspace = true
 uuid.workspace = true

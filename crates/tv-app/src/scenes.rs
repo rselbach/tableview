@@ -15,6 +15,7 @@ use crate::state::{
     OverlayState, PendingProtectedAction, PickerKind, PickerState, QueryResultTabState, QueryTabState, RowKey,
     SafetyConfirmModalState, SaveQueryModalState, Screen, SessionState, SidebarTab, TableViewMode, WorkspaceTab,
 };
+use tv_update::UpdateStatus;
 
 /// Named headless scene entry registered on `AppSpec::scenes`.
 pub type SceneEntry = (&'static str, fn(&mut AppState));
@@ -44,6 +45,9 @@ pub const SCENES: &[SceneEntry] = &[
     ("workspace-safety-confirm", scene_workspace_safety_confirm),
     ("workspace-explain-plan", scene_workspace_explain_plan),
     ("workspace-export-modal", scene_workspace_export_modal),
+    ("launcher-update-ready", scene_launcher_update_ready),
+    ("workspace-update-ready", scene_workspace_update_ready),
+    ("workspace-update-downloading", scene_workspace_update_downloading),
 ];
 
 /// Builds deterministic Greendale Community College sample profiles for headless scenes and tests.
@@ -1219,4 +1223,34 @@ fn sample_logs() -> Vec<crate::state::ConsoleLogEntry> {
         error: exec.error,
     })
     .collect()
+}
+
+fn sample_ready_update_status() -> UpdateStatus {
+    UpdateStatus::Ready {
+        version: "0.2.0".to_owned(),
+        notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.2.0".to_owned()),
+        highlights: vec![
+            "Faster schema tree refresh across Greendale databases".to_owned(),
+            "Signed auto-updates with atomic bundle swap on restart".to_owned(),
+            "Cleaner staged diff gutter colors in light and dark themes".to_owned(),
+        ],
+    }
+}
+
+fn scene_launcher_update_ready(s: &mut AppState) {
+    reset_to_sample_state(s, true);
+    s.update.snapshot.status = sample_ready_update_status();
+}
+
+fn scene_workspace_update_ready(s: &mut AppState) {
+    setup_connected_workspace(s, true, TableViewMode::Data, Some(0));
+    s.update.snapshot.status = sample_ready_update_status();
+}
+
+fn scene_workspace_update_downloading(s: &mut AppState) {
+    setup_connected_workspace(s, false, TableViewMode::Data, None);
+    s.update.snapshot.status = UpdateStatus::Downloading {
+        version: "0.2.0".to_owned(),
+        percent: 64,
+    };
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build, sign, notarize, staple, verify, and package TableView as a macOS DMG.
+# Build, sign, notarize, staple, verify, and package TableView as a macOS DMG and update ZIP.
 # Usage: scripts/release-macos.sh [--skip-notarize] [--version X.Y.Z] [--build N]
 
 set -euo pipefail
@@ -7,6 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ROOT
 readonly SOURCE_PLIST="${ROOT}/packaging/macos/Info.plist"
+readonly UPDATE_REQUIREMENT="${ROOT}/crates/tv-update/update-requirement.txt"
 readonly BUILD_DIR="${ROOT}/build"
 readonly APP_DIR="${BUILD_DIR}/TableView.app"
 readonly VOLUME_NAME="TableView"
@@ -57,6 +58,7 @@ require_tools() {
       die "required command '${tool}' not found"
     fi
   done
+  [[ -f "${UPDATE_REQUIREMENT}" ]] || die "missing update requirement file ${UPDATE_REQUIREMENT}"
 }
 
 uses_apple_id() {
@@ -185,6 +187,46 @@ notarize_app() {
   rm -f "${submission}"
 }
 
+create_app_zip() {
+  local zip="$1"
+  rm -f "${zip}"
+  ditto -c -k --keepParent "${APP_DIR}" "${zip}"
+}
+
+verify_app_zip() {
+  local zip="$1"
+  local version="$2"
+  local build="$3"
+  local notarized="$4"
+  local unpack_dir="${STAGING}/unpack"
+
+  rm -rf "${unpack_dir}"
+  mkdir -p "${unpack_dir}"
+  ditto -x -k "${zip}" "${unpack_dir}"
+
+  local unpacked_app="${unpack_dir}/TableView.app"
+  [[ -d "${unpacked_app}" ]] || die "ZIP has no TableView.app"
+
+  local plist="${unpacked_app}/Contents/Info.plist"
+  local got_version
+  local got_build
+  got_version="$(plutil -extract CFBundleShortVersionString raw -o - "${plist}")"
+  got_build="$(plutil -extract CFBundleVersion raw -o - "${plist}")"
+  if [[ "${got_version}" != "${version}" || "${got_build}" != "${build}" ]]; then
+    die "ZIP holds ${got_version} (${got_build}), expected ${version} (${build})"
+  fi
+
+  codesign --verify --deep --strict --verbose=2 "${unpacked_app}"
+  if [[ "${notarized}" == "true" ]]; then
+    local req
+    req="$(<"${UPDATE_REQUIREMENT}")"
+    spctl --assess --type execute --verbose=2 "${unpacked_app}"
+    codesign --verify --deep --strict -R="${req}" "${unpacked_app}"
+  fi
+
+  rm -rf "${unpack_dir}"
+}
+
 create_dmg() {
   local dmg="$1"
   local identity="$2"
@@ -249,7 +291,10 @@ verify_dmg() {
 
   codesign --verify --deep --strict --verbose=2 "${mounted_app}"
   if [[ "${notarized}" == "true" ]]; then
+    local req
+    req="$(<"${UPDATE_REQUIREMENT}")"
     spctl --assess --type execute --verbose=2 "${mounted_app}"
+    codesign --verify --deep --strict -R="${req}" "${mounted_app}"
   fi
 
   hdiutil detach -quiet "${MOUNT_POINT}"
@@ -319,6 +364,11 @@ main() {
     echo "skipping notarization" >&2
   fi
 
+  local zip_name="TableView-${version}-macos-arm64.zip"
+  local zip="${BUILD_DIR}/${zip_name}"
+  create_app_zip "${zip}"
+  verify_app_zip "${zip}" "${version}" "${build}" "${notarize_dmg}"
+
   local dmg_name="TableView-${version}-macos-arm64.dmg"
   local dmg="${BUILD_DIR}/${dmg_name}"
   create_dmg "${dmg}" "${identity}"
@@ -329,10 +379,11 @@ main() {
 
   (
     cd "${BUILD_DIR}"
+    shasum -a 256 "${zip_name}" >"${zip_name}.sha256"
     shasum -a 256 "${dmg_name}" >"${dmg_name}.sha256"
   )
 
-  echo "built ${dmg} (${version} build ${build})"
+  echo "built ${dmg} and ${zip} (${version} build ${build})"
 }
 
 main "$@"

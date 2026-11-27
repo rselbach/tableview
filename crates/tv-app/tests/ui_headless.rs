@@ -2,10 +2,12 @@
 
 use rune::{Env, Key, KeyEvent, Mods, Runtime};
 use rune_kit::diff::DiffMode;
+use tv_app::platform::{Action, dispatch_action};
 use tv_app::scenes::{reset_to_sample_state, sample_store_data};
 use tv_app::state::{AppState, OverlayState, PickerKind, RowKey, Screen, TableViewMode};
 use tv_app::views;
 use tv_core::{EnvTag, ExportFormat, SafetyPolicy};
+use tv_update::{UpdateFailure, UpdateStatus};
 
 fn sample_runtime(dark: bool) -> Runtime<AppState> {
     let mut state = AppState::init_in_memory(sample_store_data());
@@ -798,4 +800,195 @@ fn milestone4_export_modal_switches_formats_and_copies() {
             .as_ref()
             .is_some_and(|(msg, is_err)| !is_err && msg.contains("Copied 8 rows as SQL INSERT"))
     );
+}
+
+fn has_text(rt: &Runtime<AppState>, expected: &str) -> bool {
+    rt.elements()
+        .iter()
+        .any(|e| e.text.as_deref() == Some(expected))
+}
+
+#[test]
+fn update_card_hidden_when_no_update_attention_needed() {
+    let mut rt = sample_runtime(true);
+    rt.frame(0.0);
+    assert!(rt.find("update-dock-card").is_none());
+
+    for status in [
+        UpdateStatus::Idle,
+        UpdateStatus::Checking,
+        UpdateStatus::UpToDate,
+        UpdateStatus::Failed(UpdateFailure::Check),
+        UpdateStatus::Failed(UpdateFailure::Verify),
+    ] {
+        rt.update(|s, _| s.update.snapshot.status = status);
+        rt.frame(0.0);
+        assert!(rt.find("update-dock-card").is_none());
+    }
+
+    apply_scene(&mut rt, "workspace-connected-light");
+    rt.frame(0.0);
+    assert!(rt.find("update-dock-card").is_none());
+    assert!(rt.find("sidebar-toggle-unread").is_none());
+}
+
+#[test]
+fn launcher_update_ready_renders_and_toggles_notes() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "launcher-update-ready");
+    rt.frame(0.1);
+
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(rt.find("update-card-restart-btn").is_some());
+    assert!(rt.find("update-card-notes").is_none());
+    assert!(has_text(&rt, "v0.2.0 Ready"));
+    assert!(has_text(&rt, "Restart TableView to update"));
+
+    let (nx, ny) = rt.find("update-card-notes-btn").expect("Notes toggle button");
+    rt.pointer_down(nx, ny);
+    rt.pointer_up(nx, ny);
+    rt.frame(0.1);
+
+    assert!(rt.find("update-card-notes").is_some());
+    assert!(rt.find("update-card-open-notes-btn").is_some());
+    assert!(rt.state.update.notes_expanded);
+
+    let (hx, hy) = rt.find("update-card-notes-btn").expect("Hide notes toggle button");
+    rt.pointer_down(hx, hy);
+    rt.pointer_up(hx, hy);
+    rt.frame(0.1);
+
+    assert!(rt.find("update-card-notes").is_none());
+    assert!(!rt.state.update.notes_expanded);
+
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::CheckForUpdates, tx));
+    });
+    assert_eq!(
+        rt.state.status_notice.as_ref(),
+        Some(&("TableView 0.2.0 is ready to install on restart.".to_owned(), false))
+    );
+}
+
+#[test]
+fn workspace_update_ready_persists_across_tabs_collapse_dot_and_staged_warning() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-update-ready");
+    rt.frame(0.2);
+
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(rt.find("sidebar-toggle-unread").is_some());
+
+    // Switch sidebar to Queries (segment1) and History (segment2); card stays docked.
+    for segment_suffix in ["segment1", "segment2"] {
+        let seg = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref().is_some_and(|k| k.ends_with(segment_suffix)))
+            .expect("sidebar tab segment");
+        rt.pointer_down(seg.rect[0] + seg.rect[2] / 2.0, seg.rect[1] + seg.rect[3] / 2.0);
+        rt.pointer_up(seg.rect[0] + seg.rect[2] / 2.0, seg.rect[1] + seg.rect[3] / 2.0);
+        rt.frame(0.1);
+        assert!(rt.find("update-dock-card").is_some());
+    }
+
+    // Collapse sidebar via Cmd+1 -> toggle keeps attention dot while sidebar closes.
+    rt.key(KeyEvent {
+        key: Key::Command('1'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.2);
+    assert!(!rt.state.active_session().expect("session").sidebar_pane.is_open());
+    assert!(rt.find("sidebar-toggle-unread").is_some());
+
+    // Reopen sidebar via Cmd+1.
+    rt.key(KeyEvent {
+        key: Key::Command('1'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.2);
+    assert!(rt.state.active_session().expect("session").sidebar_pane.is_open());
+    assert!(rt.find("update-dock-card").is_some());
+
+    // Stage an uncommitted row insert and confirm the staged-edits notice renders in the card.
+    let (ix, iy) = rt.find("table-insert-row-btn").expect("insert row btn");
+    rt.pointer_down(ix, iy);
+    rt.pointer_up(ix, iy);
+    rt.frame(0.2);
+    rt.key(KeyEvent::from(Key::Text("Britta Perry".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    assert!(rt.state.has_uncommitted_staged_edits());
+    assert!(has_text(&rt, "Uncommitted staged edits stay local until committed."));
+}
+
+#[test]
+fn update_card_renders_available_downloading_relaunch_and_os_warning_states() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "launcher-dark");
+    rt.frame(0.1);
+
+    // Available fallback (e.g. read-only mount) shows manual Download CTA and Notes toggle.
+    rt.update(|s, _| {
+        s.update.snapshot.status = UpdateStatus::Available {
+            version: "0.3.0".to_owned(),
+            download_url: "https://github.com/rselbach/tableview/releases/download/v0.3.0/TableView-0.3.0-macos-arm64.dmg".to_owned(),
+            notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.3.0".to_owned()),
+            highlights: vec!["Adds signed update feed support".to_owned()],
+        };
+    });
+    rt.frame(0.1);
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(rt.find("update-card-download-btn").is_some());
+    let (nx, ny) = rt.find("update-card-notes-btn").expect("notes btn");
+    rt.pointer_down(nx, ny);
+    rt.pointer_up(nx, ny);
+    rt.frame(0.1);
+    assert!(rt.find("update-card-notes").is_some());
+
+    // Downloading scene shows progress bar and percentage.
+    apply_scene(&mut rt, "workspace-update-downloading");
+    rt.frame(0.2);
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(rt.find("update-card-progress-track").is_some());
+    assert!(rt.find("sidebar-toggle-unread").is_some());
+    assert!(has_text(&rt, "Downloading v0.2.0"));
+    assert!(has_text(&rt, "64%"));
+
+    // Relaunch failure after swap tells the user to reopen manually and lights the collapsed dot.
+    rt.update(|s, _| {
+        s.update.snapshot.status = UpdateStatus::Failed(UpdateFailure::Relaunch {
+            version: "0.2.0".to_owned(),
+        });
+    });
+    rt.frame(0.1);
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(rt.find("sidebar-toggle-unread").is_some());
+    assert!(has_text(&rt, "v0.2.0 Installed"));
+    assert!(has_text(&rt, "Quit and reopen TableView to finish updating."));
+
+    // RequiresNewerOs warning is shown and can be dismissed.
+    rt.update(|s, _| {
+        s.update.snapshot.status = UpdateStatus::Failed(UpdateFailure::RequiresNewerOs {
+            version: "0.9.0".to_owned(),
+            minimum_os: "16.0".to_owned(),
+        });
+    });
+    rt.frame(0.1);
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(has_text(&rt, "v0.9.0 needs macOS 16.0+"));
+    let (dx, dy) = rt.find("update-card-dismiss-btn").expect("dismiss button");
+    rt.pointer_down(dx, dy);
+    rt.pointer_up(dx, dy);
+    rt.frame(0.1);
+    assert!(rt.state.update.dismissed_os_warning);
+    assert!(rt.find("update-dock-card").is_none());
 }

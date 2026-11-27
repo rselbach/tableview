@@ -16,6 +16,9 @@ use tv_core::{
 };
 use tv_core::sql::{cursor_line_col, format_sql, split_statements, statement_at_cursor};
 
+use tv_update::{UpdateFailure, UpdateStatus};
+
+use crate::update::{UpdateBridge, UpdateHostEvent, UpdateUiState, manual_check_notice};
 use crate::worker::{WorkerBridge, WorkerCmd, WorkerEvent};
 
 /// Active top-level screen in TableView's single-window shell.
@@ -1049,6 +1052,8 @@ pub struct AppState {
     pub appearance: ColorScheme,
     pub status_notice: Option<(String, bool)>,
     pub worker: Option<WorkerBridge>,
+    pub update: UpdateUiState,
+    pub update_bridge: Option<UpdateBridge>,
     next_session_id: u64,
     next_tab_id: u64,
     next_req_id: u64,
@@ -1073,7 +1078,16 @@ impl AppState {
             Err(_) => (PathBuf::from("connections.json"), StoreData::default()),
         };
         let mut state = Self::from_store_data(store_path, store_data, true);
-        state.worker = WorkerBridge::spawn();
+        let worker = WorkerBridge::spawn();
+        let update_bridge = worker
+            .as_ref()
+            .and_then(|w| UpdateBridge::start(&w.runtime_handle()));
+        state.worker = worker;
+        if let Some(ref bridge) = update_bridge {
+            state.update.running_version = bridge.running_version.clone();
+            state.update.snapshot = bridge.snapshot();
+        }
+        state.update_bridge = update_bridge;
         state
     }
 
@@ -1102,6 +1116,8 @@ impl AppState {
             appearance: ColorScheme::System,
             status_notice: None,
             worker: None,
+            update: UpdateUiState::default(),
+            update_bridge: None,
             next_session_id: 1,
             next_tab_id: 1,
             next_req_id: 1,
@@ -3669,17 +3685,57 @@ impl AppState {
     }
 
     pub fn apply_worker_events(&mut self, tx: &mut Tx) -> bool {
-        let Some(ref worker) = self.worker else {
-            return false;
-        };
-        let events = worker.drain_events();
-        if events.is_empty() {
-            return false;
+        let mut changed = false;
+        let update_events = self
+            .update_bridge
+            .as_ref()
+            .map(UpdateBridge::drain_events)
+            .unwrap_or_default();
+        for event in update_events {
+            self.handle_update_event(event, tx);
+            changed = true;
         }
-        for event in events {
-            self.handle_worker_event(event, tx);
+
+        let events = self
+            .worker
+            .as_ref()
+            .map(WorkerBridge::drain_events)
+            .unwrap_or_default();
+        if !events.is_empty() {
+            for event in events {
+                self.handle_worker_event(event, tx);
+            }
+            changed = true;
         }
-        true
+        changed
+    }
+
+    fn handle_update_event(&mut self, event: UpdateHostEvent, tx: &mut Tx) {
+        match event {
+            UpdateHostEvent::Changed(snapshot) => {
+                if update_version_key(&self.update.snapshot.status)
+                    != update_version_key(&snapshot.status)
+                {
+                    self.update.notes_expanded = false;
+                    self.update.dismissed_os_warning = false;
+                }
+                if self.update.manual_check_pending
+                    && let Some((msg, is_err)) = manual_check_notice(&snapshot.status)
+                {
+                    self.update.manual_check_pending = false;
+                    self.set_notice(msg, is_err);
+                }
+                self.update.snapshot = snapshot;
+            }
+            UpdateHostEvent::OpenUrl(url) => {
+                if tx.open_url(&url).is_err() {
+                    self.set_notice(format!("Could not open browser for {url}"), true);
+                }
+            }
+            UpdateHostEvent::Quit => {
+                tx.quit();
+            }
+        }
     }
 
     fn handle_worker_event(&mut self, event: WorkerEvent, tx: &mut Tx) {
@@ -4268,6 +4324,75 @@ impl AppState {
         self.status_notice = Some((message.into(), is_error));
     }
 
+    pub fn check_for_updates(&mut self) {
+        if let Some(ref bridge) = self.update_bridge {
+            self.update.manual_check_pending = true;
+            bridge.check_now();
+            self.set_notice("Checking for updates…", false);
+        } else {
+            let notice = manual_check_notice(&self.update.snapshot.status).unwrap_or_else(|| {
+                (
+                    format!(
+                        "TableView {} is running outside a packaged macOS app bundle; auto-updates are disabled.",
+                        self.update.running_version
+                    ),
+                    false,
+                )
+            });
+            self.set_notice(notice.0, notice.1);
+        }
+    }
+
+    pub fn restart_to_update(&mut self) {
+        if let Some(ref bridge) = self.update_bridge {
+            bridge.restart_to_update();
+        }
+    }
+
+    pub fn open_update_download(&mut self, tx: &mut Tx) {
+        if let Some(ref bridge) = self.update_bridge {
+            bridge.open_download();
+        } else if let UpdateStatus::Available { download_url, .. } = &self.update.snapshot.status {
+            let url = download_url.clone();
+            if tx.open_url(&url).is_err() {
+                self.set_notice(format!("Could not open browser for {url}"), true);
+            }
+        }
+    }
+
+    pub fn open_update_notes(&mut self, tx: &mut Tx) {
+        if let Some(ref bridge) = self.update_bridge {
+            bridge.open_notes();
+        } else if let UpdateStatus::Ready { notes_url: Some(url), .. }
+        | UpdateStatus::Available { notes_url: Some(url), .. } = &self.update.snapshot.status
+        {
+            let url = url.clone();
+            if tx.open_url(&url).is_err() {
+                self.set_notice(format!("Could not open browser for {url}"), true);
+            }
+        }
+    }
+
+    pub fn toggle_update_notes(&mut self) {
+        self.update.notes_expanded = !self.update.notes_expanded;
+    }
+
+    pub fn dismiss_update_os_warning(&mut self) {
+        self.update.dismissed_os_warning = true;
+    }
+
+    pub fn install_update_on_quit(&mut self) {
+        if let Some(ref bridge) = self.update_bridge {
+            let _installed = bridge.install_on_quit();
+        }
+    }
+
+    pub fn has_uncommitted_staged_edits(&self) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.tabs.iter().filter_map(WorkspaceTab::as_table).any(|tab| tab.staged.has_changes()))
+    }
+
     pub fn sync_window_title(&self, tx: &mut Tx) {
         let title = match self.active_session() {
             None => "TableView".to_owned(),
@@ -4294,6 +4419,18 @@ impl AppState {
             },
         };
         tx.set_title(title);
+    }
+}
+
+fn update_version_key(status: &UpdateStatus) -> Option<&str> {
+    match status {
+        UpdateStatus::Ready { version, .. }
+        | UpdateStatus::Available { version, .. }
+        | UpdateStatus::Downloading { version, .. }
+        | UpdateStatus::Installing { version } => Some(version.as_str()),
+        UpdateStatus::Failed(UpdateFailure::RequiresNewerOs { version, .. })
+        | UpdateStatus::Failed(UpdateFailure::Relaunch { version }) => Some(version.as_str()),
+        _ => None,
     }
 }
 

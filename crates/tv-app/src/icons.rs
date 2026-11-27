@@ -204,3 +204,9 @@ pub static EDIT_PENCIL: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M10.8 2.7L13.3 5.2L5.5 13H3V10.5L10.8 2.7Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>"#,
 };
+
+pub static UPDATE_CIRCLE: Icon = Icon {
+    name: "tv-update-circle",
+    view: 16.0,
+    body: r#"<circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.25" fill="none"/><path d="M8 10.6V5.4M5.7 7.6L8 5.3L10.3 7.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};

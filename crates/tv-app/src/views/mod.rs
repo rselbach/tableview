@@ -8,6 +8,7 @@ pub mod query_editor;
 pub mod safety_modal;
 pub mod staged_diff;
 pub mod table_grid;
+pub mod update_card;
 pub mod workspace;
 
 use rune::{Cx, El, ColorScheme, col, el, row, text};

@@ -15,7 +15,7 @@ use crate::state::{
     WorkspaceTab,
 };
 use crate::theme;
-use crate::views::{empty_cta, inspector, pill_badge, query_editor, staged_diff, table_grid};
+use crate::views::{empty_cta, inspector, pill_badge, query_editor, staged_diff, table_grid, update_card};
 
 /// Builds the full database workspace screen (`SplitView` + environment strip + console).
 pub fn build(
@@ -32,7 +32,7 @@ pub fn build(
 
     let sid = session.id;
     let toolbar = build_toolbar(s, session, k);
-    let sidebar = build_sidebar(session, k, layer);
+    let sidebar = build_sidebar(s, session, k, layer);
     let inspector_pane = inspector::build(session, k);
     let main = build_main_pane(s, session, k, cx, layer);
 
@@ -50,7 +50,12 @@ pub fn build(
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .flat_main(true)
-        .sidebar_toggle(SidebarToggle::new().in_header().shortcut("mod+1"))
+        .sidebar_toggle(
+            SidebarToggle::new()
+                .in_header()
+                .unread(s.update.snapshot.status.needs_sidebar_dot())
+                .shortcut("mod+1"),
+        )
         .reduced_motion(cx.is_reduced_motion())
         .build(k);
 
@@ -291,7 +296,7 @@ fn build_status_pill(session: &SessionState, k: &Kit) -> El {
     }
 }
 
-fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
+fn build_sidebar(s: &AppState, session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &k.c;
     let tabs = SegmentedControl::new(&["Items", "Queries", "History"], Some(session.sidebar_tab.index()))
         .label("Sidebar section")
@@ -370,6 +375,7 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
         .label("Database objects")
         .header(tabs)
         .header(search_row);
+    let mut tab_footer: Option<El> = None;
 
     match session.sidebar_tab {
         SidebarTab::Items => match &session.status {
@@ -446,7 +452,7 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
                         .build(k, layer);
 
                     let count = session.filtered_objects().len();
-                    sb = sb.footer(
+                    tab_footer = Some(
                         row()
                             .w_full()
                             .gap(8.0)
@@ -489,7 +495,7 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
                     sb = sb.child(build_saved_query_item(q, selected, k));
                 }
             }
-            sb = sb.footer(
+            tab_footer = Some(
                 row()
                     .w_full()
                     .gap(8.0)
@@ -535,7 +541,7 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
                     sb = sb.child(build_history_item(entry, k));
                 }
             }
-            sb = sb.footer(
+            tab_footer = Some(
                 row()
                     .w_full()
                     .gap(8.0)
@@ -552,6 +558,13 @@ fn build_sidebar(session: &SessionState, k: &Kit, layer: &mut Vec<El>) -> El {
                     .child(text(format!("{total}")).font(k.ty.small).color(c.text_faint)),
             );
         }
+    }
+
+    if let Some(card) = update_card::build(s, k) {
+        sb = sb.footer(card);
+    }
+    if let Some(footer) = tab_footer {
+        sb = sb.footer(footer);
     }
 
     sb.build(k)

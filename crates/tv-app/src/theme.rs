@@ -131,3 +131,40 @@ pub fn swatch_color(color: AccentColor, dark: bool) -> Color {
         AccentColor::Purple => oklch(0.70, 0.14, 298.0),
     }
 }
+
+/// Visual tokens for the docked auto-update card in the launcher rail and workspace sidebar.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateCardPalette {
+    pub bg: Color,
+    pub fg: Color,
+    pub muted: Color,
+    pub border: Color,
+    pub dot: Color,
+    pub accent_bg: Color,
+    pub accent_fg: Color,
+}
+
+/// Resolves blue accent tokens for the docked auto-update card in dark or light mode.
+pub fn update_card_colors(dark: bool) -> UpdateCardPalette {
+    if dark {
+        UpdateCardPalette {
+            bg: oklch(0.255, 0.055, 240.0),
+            fg: oklch(0.87, 0.08, 240.0),
+            muted: oklch(0.72, 0.02, 245.0),
+            border: oklch(0.46, 0.105, 240.0),
+            dot: oklch(0.66, 0.145, 240.0),
+            accent_bg: oklch(0.62, 0.155, 240.0),
+            accent_fg: oklch(0.99, 0.002, 240.0),
+        }
+    } else {
+        UpdateCardPalette {
+            bg: oklch(0.935, 0.042, 245.0),
+            fg: oklch(0.35, 0.14, 245.0),
+            muted: oklch(0.46, 0.02, 245.0),
+            border: oklch(0.75, 0.10, 245.0),
+            dot: oklch(0.52, 0.16, 245.0),
+            accent_bg: oklch(0.52, 0.16, 245.0),
+            accent_fg: oklch(0.99, 0.002, 245.0),
+        }
+    }
+}

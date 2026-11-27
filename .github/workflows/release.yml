@@ -65,8 +65,11 @@ jobs:
       - name: Lint release scripts
         run: shellcheck scripts/bundle-macos-app.sh scripts/release-macos.sh
 
+      - name: Check feed verification script
+        run: python3 -m py_compile scripts/verify-published-feeds.py
+
   build-macos:
-    name: Build, sign, and notarize macOS DMG
+    name: Build, sign, and notarize macOS ZIP and DMG
     needs: check
     runs-on: macos-26
     timeout-minutes: 45
@@ -120,6 +123,7 @@ jobs:
       - name: Lint and test
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked -p tv-update
           cargo test --locked -p tv-core --lib --test core_unit
           cargo test --locked -p tv-app
 
@@ -164,7 +168,7 @@ jobs:
             echo "SIGNING_KEYCHAIN_PATH=${keychain_path}"
           } >>"${GITHUB_ENV}"
 
-      - name: Build, sign, notarize, and package DMG
+      - name: Build, sign, notarize, and package ZIP and DMG
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -175,11 +179,13 @@ jobs:
             --version "${{ needs.check.outputs.version }}" \
             --build "${GITHUB_RUN_NUMBER}"
 
-      - name: Upload DMG artifact
+      - name: Upload release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tableview-macos-arm64
           path: |
+            build/TableView-${{ needs.check.outputs.version }}-macos-arm64.zip
+            build/TableView-${{ needs.check.outputs.version }}-macos-arm64.zip.sha256
             build/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg
             build/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256
           retention-days: 7
@@ -211,16 +217,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download DMG artifact
+      - name: Download release artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: tableview-macos-arm64
           path: release
 
-      - name: Verify checksum
+      - name: Verify checksums
         run: |
           (
             cd release
+            sha256sum -c "TableView-${{ needs.check.outputs.version }}-macos-arm64.zip.sha256"
             sha256sum -c "TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256"
           )
 
@@ -232,5 +239,147 @@ jobs:
           overwrite_files: false
           fail_on_unmatched_files: true
           files: |
+            release/TableView-${{ needs.check.outputs.version }}-macos-arm64.zip
+            release/TableView-${{ needs.check.outputs.version }}-macos-arm64.zip.sha256
             release/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg
             release/TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256
+
+  update-feed:
+    name: Sign and verify update feed
+    needs: [check, build-macos, publish]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.check.outputs.prerelease != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Validate signing secret
+        env:
+          SPARKLE_EDDSA_PRIVATE_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+        run: |
+          if [[ -z "${SPARKLE_EDDSA_PRIVATE_KEY}" ]]; then
+            echo "::error::repository secret SPARKLE_EDDSA_PRIVATE_KEY is not set" >&2
+            exit 1
+          fi
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tableview-macos-arm64
+          path: release
+
+      - name: Verify checksums
+        run: |
+          (
+            cd release
+            sha256sum -c "TableView-${{ needs.check.outputs.version }}-macos-arm64.zip.sha256"
+            sha256sum -c "TableView-${{ needs.check.outputs.version }}-macos-arm64.dmg.sha256"
+          )
+
+      - name: Fetch release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json body -q .body > "${RUNNER_TEMP}/release-notes.md" \
+            || : > "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-update-tool
+
+      - name: Build update tool
+        run: cargo build --locked --release -p tv-update --bin tv-update-tool
+
+      - name: Sign update feed
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          BUILD: ${{ github.run_number }}
+          SIGNING_KEY: ${{ secrets.SPARKLE_EDDSA_PRIVATE_KEY }}
+        run: |
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          zip="TableView-${VERSION}-macos-arm64.zip"
+          dmg="TableView-${VERSION}-macos-arm64.dmg"
+          minimum_os="$(python3 -c 'import plistlib; print(plistlib.load(open("packaging/macos/Info.plist", "rb"))["LSMinimumSystemVersion"])')"
+          mkdir -p _site
+          target/release/tv-update-tool sign-feed \
+            --version "${VERSION}" \
+            --build "${BUILD}" \
+            --arch arm64 \
+            --minimum-os "${minimum_os}" \
+            --published-at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            --notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --notes "${RUNNER_TEMP}/release-notes.md" \
+            --zip "release/${zip}" \
+            --zip-url "${base}/${zip}" \
+            --dmg "release/${dmg}" \
+            --dmg-url "${base}/${dmg}" \
+            --out _site/update.json <<<"${SIGNING_KEY}"
+          touch _site/.nojekyll
+
+      - name: Verify published release assets against signed feed
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if target/release/tv-update-tool verify-feed _site/update.json \
+              --version "${VERSION}" --build "${BUILD}" --arch arm64 --download; then
+              exit 0
+            fi
+            echo "verification attempt ${attempt} failed; retrying" >&2
+            sleep 15
+          done
+          echo "::error::published release assets do not match the signed feed" >&2
+          exit 1
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        with:
+          path: _site
+          retention-days: 90
+
+  deploy-feeds:
+    name: Publish update feed to GitHub Pages
+    needs: update-feed
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download Pages artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: github-pages
+          path: published
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+
+      - name: Verify published feed
+        run: python3 scripts/verify-published-feeds.py published/artifact.tar

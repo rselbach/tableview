@@ -31,6 +31,7 @@ pub enum Action {
     Reconnect,
     Disconnect,
     ShowLauncher,
+    CheckForUpdates,
     SetColorScheme(ColorScheme),
     CycleColorScheme,
     DismissOverlay,
@@ -343,6 +344,10 @@ pub fn dispatch_action(s: &mut AppState, action: Action, tx: &mut Tx) -> bool {
             s.sync_window_title(tx);
             true
         }
+        Action::CheckForUpdates => {
+            s.check_for_updates();
+            true
+        }
         Action::SetColorScheme(scheme) => {
             s.appearance = scheme;
             tx.set_color_scheme(scheme);
@@ -401,6 +406,11 @@ pub fn native_menu_items() -> Vec<MenuItem<AppState>> {
             s.sync_window_title(tx);
         })
         .id("tv-about"),
+        MenuItem::new("Check for Updates…", |s: &mut AppState, tx| {
+            dispatch_action(s, Action::CheckForUpdates, tx);
+        })
+        .id("tv-check-updates")
+        .after("tv-about"),
         item_with_shortcut("conn-new", "New Connection…", "Connection", "mod+n", |s, tx| {
             dispatch_action(s, Action::NewConnection, tx);
         }),

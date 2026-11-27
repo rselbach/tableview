@@ -271,6 +271,7 @@ pub struct WorkerBridge {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCmd>,
     event_rx: mpsc::Receiver<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
+    runtime_handle: tokio::runtime::Handle,
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -279,6 +280,7 @@ impl WorkerBridge {
     pub fn spawn() -> Option<Self> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
         let waker: Arc<std::sync::Mutex<Option<Waker>>> = Arc::new(std::sync::Mutex::new(None));
         let worker_waker = Arc::clone(&waker);
 
@@ -292,16 +294,26 @@ impl WorkerBridge {
                 else {
                     return;
                 };
+                if handle_tx.send(rt.handle().clone()).is_err() {
+                    return;
+                }
                 rt.block_on(worker_loop(cmd_rx, event_tx, worker_waker));
             })
             .ok()?;
+
+        let runtime_handle = handle_rx.recv().ok()?;
 
         Some(Self {
             cmd_tx,
             event_rx,
             waker,
+            runtime_handle,
             _thread: Some(thread),
         })
+    }
+
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime_handle.clone()
     }
 
     pub fn set_waker(&self, waker: Waker) {

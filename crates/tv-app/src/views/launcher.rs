@@ -9,7 +9,7 @@ use crate::icons;
 use crate::platform::{self, Action};
 use crate::state::{AppState, Screen};
 use crate::theme;
-use crate::views::{empty_cta, pill_badge};
+use crate::views::{empty_cta, pill_badge, update_card};
 
 /// Builds the integrated Connection Launcher screen.
 pub fn build(s: &AppState, k: &Kit, cx: &Cx<AppState>, layer: &mut Vec<El>) -> El {
@@ -51,7 +51,11 @@ fn build_left_rail(s: &AppState, k: &Kit, top_inset: f32) -> El {
             col().key("launcher-title-col")
                 .gap(1.0)
                 .child(text("TableView").font(k.ty.body_medium).color(c.text_base))
-                .child(text("v0.1.0 · PostgreSQL").font(k.ty.small).color(c.text_muted)),
+                .child(
+                    text(format!("v{} · PostgreSQL", s.update.running_version))
+                        .font(k.ty.small)
+                        .color(c.text_muted),
+                ),
         );
 
     let actions = col()
@@ -166,6 +170,27 @@ fn build_left_rail(s: &AppState, k: &Kit, top_inset: f32) -> El {
                 .build(k),
         );
 
+    let mut rail_inner = col()
+        .key("launcher-rail-inner")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .px(16.0)
+        .pb(16.0)
+        .gap(16.0)
+        .child(brand)
+        .child(actions)
+        .child(Divider::horizontal().build(k))
+        .child(filters)
+        .child(sessions_section)
+        .child(spacer());
+
+    if let Some(card) = update_card::build(s, k) {
+        rail_inner = rail_inner.child(card);
+    }
+
+    rail_inner = rail_inner.child(theme_picker);
+
     col()
         .key("launcher-rail")
         .w(248.0)
@@ -174,23 +199,7 @@ fn build_left_rail(s: &AppState, k: &Kit, top_inset: f32) -> El {
         .fill(c.bg_base)
         .border_sides([0.0, 1.0, 0.0, 0.0], c.border_muted)
         .child(header_drag)
-        .child(
-            col()
-                .key("launcher-rail-inner")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .px(16.0)
-                .pb(16.0)
-                .gap(16.0)
-                .child(brand)
-                .child(actions)
-                .child(Divider::horizontal().build(k))
-                .child(filters)
-                .child(sessions_section)
-                .child(spacer())
-                .child(theme_picker),
-        )
+        .child(rail_inner)
 }
 
 fn env_filter_row(label: &str, env: Option<EnvTag>, count: usize, active: bool, k: &Kit) -> El {
