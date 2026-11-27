@@ -2565,6 +2565,7 @@ impl AppState {
             tab_mut.fk_peek = None;
             tab_mut.row_menu = None;
         }
+        tx.scroll_into_view("inline-editor-anchor");
         tx.focus_when_shown("inline-cell-editor", true);
         true
     }

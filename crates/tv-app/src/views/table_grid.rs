@@ -17,7 +17,8 @@ use tv_core::{
 use crate::icons;
 use crate::platform;
 use crate::state::{
-    AppState, FkPeekState, RowKey, SessionState, TabContent, TableTabState, TableViewMode, parse_tab_id,
+    ActiveCellEdit, AppState, FkPeekState, RowKey, SessionState, TabContent, TableTabState, TableViewMode,
+    parse_tab_id,
 };
 use crate::views::{empty_cta, format_bytes, pill_badge};
 
@@ -423,6 +424,24 @@ fn build_data_grid(
     let mono_font = k.ty.mono;
     let small_font = k.ty.small;
     let radius_xs = k.radius.xs;
+    let anchor_rect = tab
+        .editing_cell
+        .as_ref()
+        .and_then(|_| rune::memo::window_layout("inline-editor-anchor"));
+    let editor_size = tab
+        .editing_cell
+        .as_ref()
+        .and_then(|_| rune::memo::layout_size("inline-editor-wrap"));
+    let win_size = tab
+        .editing_cell
+        .as_ref()
+        .and_then(|_| rune::memo::layout_size("tv-app-base"));
+    let grid_rect = tab
+        .editing_cell
+        .as_ref()
+        .and_then(|_| rune::memo::layout("data-grid-clip"));
+    let header_h = rune_kit::TableStyle::from_kit(k).header_height;
+    let frozen_w = tab.data_table.column_width("#").unwrap_or(56.0);
 
     let mut table = Table::new(
         |s: &AppState| s.active_data_table(),
@@ -536,45 +555,16 @@ fn build_data_grid(
                 && editing.row_key == row_key
                 && editing.col_idx == col_idx
             {
-                let mut ed_row = row()
-                    .key("inline-editor-wrap")
+                let anchor = row()
+                    .key("inline-editor-anchor")
                     .w_full()
                     .h(24.0)
                     .px(4.0)
-                    .gap(4.0)
                     .center_y()
                     .radius(radius_xs)
-                    .fill(null_bg)
-                    .border(1.0, text_accent)
-                    .child(
-                        text_input(&editing.edit, mono_font)
-                            .key("inline-cell-editor")
-                            .label(format!("Edit {}", col_meta.name))
-                            .grow(1.0)
-                            .min_w(0.0)
-                            .color(text_base)
-                            .caret(text_accent, text_accent.alpha(0.24))
-                            .on_edit(AppState::inline_cell_edit_mut)
-                            .on_submit(|s: &mut AppState, _| s.commit_inline_cell_edit()),
-                    );
-                if col_meta.nullable {
-                    ed_row = ed_row.child(
-                        row()
-                            .key("inline-null-btn")
-                            .role("button")
-                            .label("Set NULL")
-                            .focusable(true)
-                            .h(16.0)
-                            .px(4.0)
-                            .center()
-                            .radius(radius_xs)
-                            .fill(null_bg)
-                            .border(0.5, null_border)
-                            .on_press(move |s: &mut AppState| s.stage_cell_null(row_key, col_idx))
-                            .child(text("NULL").font(small_font).color(null_fg)),
-                    );
-                }
-                return Cell::el(ed_row);
+                    .fill(text_accent.alpha(0.10))
+                    .border(1.0, text_accent.alpha(0.55));
+                return Cell::el(anchor);
             }
 
             let is_draft_default = matches!(row_key, RowKey::Draft(id) if tab
@@ -751,6 +741,43 @@ fn build_data_grid(
     } else {
         built
     };
+
+    let visible_anchor = anchor_rect.filter(|&[ax, ay, aw, ah]| {
+        grid_rect.is_none_or(|[gx, gy, gw, gh]| {
+            ax + aw > gx + frozen_w
+                && ax < gx + gw
+                && ay + ah > gy
+                && ay < gy + gh
+        })
+    });
+    let min_y = grid_rect.map_or(INLINE_EDITOR_WINDOW_MARGIN, |[_, gy, _, _]| {
+        (gy + header_h).max(INLINE_EDITOR_WINDOW_MARGIN)
+    });
+
+    let mut grid_host = col()
+        .key("data-grid-clip")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(grid_host);
+    if tab.editing_cell.is_some() && visible_anchor.is_none() {
+        grid_host = grid_host.on_any_press(|s: &mut AppState, _btn, _p, _| {
+            s.cancel_inline_cell_edit();
+        });
+    }
+
+    if let Some(ref editing) = tab.editing_cell
+        && let Some(col_meta) = page.columns.get(editing.col_idx)
+        && let Some(anchor) = visible_anchor
+    {
+        let bounds = InlineEditorBounds {
+            anchor,
+            min_y,
+            editor_size,
+            win_size,
+        };
+        mount_inline_cell_editor(editing, col_meta, bounds, k, layer);
+    }
 
     if let Some(ref peek) = tab.fk_peek {
         mount_fk_peek_popover(peek, k, layer);
@@ -1064,6 +1091,151 @@ fn mount_fk_peek_popover(peek: &FkPeekState, k: &Kit, layer: &mut Vec<El>) {
         Placement::BottomEnd,
         6.0,
     ));
+}
+
+const INLINE_EDITOR_WINDOW_MARGIN: f32 = 8.0;
+
+fn inline_editor_layout(text: &str, nullable: bool, anchor_w: f32, win_w: f32) -> (f32, bool) {
+    const CHAR_W: f32 = 8.0;
+    const MIN_EDITOR_W: f32 = 160.0;
+    const MAX_SINGLE_LINE_W: f32 = 460.0;
+    const MULTILINE_MIN_W: f32 = 340.0;
+    const MULTILINE_MAX_W: f32 = 520.0;
+
+    let has_newline = text.contains('\n');
+    let longest_line_chars = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    let null_btn_reserve = if nullable { 52.0 } else { 0.0 };
+    let single_line_needed_w = longest_line_chars as f32 * CHAR_W + 26.0 + null_btn_reserve;
+    let max_allowed_w = (win_w - INLINE_EDITOR_WINDOW_MARGIN * 2.0).max(200.0);
+    let single_cap = MAX_SINGLE_LINE_W.min(max_allowed_w);
+    let is_multiline = has_newline || single_line_needed_w > single_cap;
+
+    let box_w = if is_multiline {
+        let multi_cap = MULTILINE_MAX_W.min(max_allowed_w);
+        single_line_needed_w.max(anchor_w).max(MULTILINE_MIN_W).min(multi_cap)
+    } else {
+        single_line_needed_w.max(anchor_w).max(MIN_EDITOR_W).min(single_cap)
+    };
+    (box_w, is_multiline)
+}
+
+struct InlineEditorBounds {
+    anchor: [f32; 4],
+    min_y: f32,
+    editor_size: Option<[f32; 2]>,
+    win_size: Option<[f32; 2]>,
+}
+
+fn mount_inline_cell_editor(
+    editing: &ActiveCellEdit,
+    col_meta: &ColumnMeta,
+    bounds: InlineEditorBounds,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) {
+    let c = &k.c;
+    let [ax, ay, aw, _ah] = bounds.anchor;
+    let [win_w, win_h] = bounds.win_size.unwrap_or([1280.0, 800.0]);
+    let min_y = bounds.min_y;
+    let editor_size = bounds.editor_size;
+    let (box_w, is_multiline) = inline_editor_layout(&editing.edit.text, col_meta.nullable, aw, win_w);
+
+    let field = text_input(&editing.edit, k.ty.mono)
+        .key("inline-cell-editor")
+        .label(format!("Edit {}", col_meta.name))
+        .w_full()
+        .color(c.text_base)
+        .caret(c.text_accent, c.text_accent.alpha(0.24))
+        .on_edit(AppState::inline_cell_edit_mut)
+        .on_submit(|s: &mut AppState, _| s.commit_inline_cell_edit());
+    // Keep the slot path identical across single-line and multi-line states so typing past
+    // the threshold never drops input focus.
+    let field_slot = el()
+        .key("inline-editor-field-slot")
+        .grow(1.0)
+        .min_w(0.0)
+        .child(rune::auto_grow(field, 1, 8));
+
+    let mut body = row()
+        .key("inline-editor-body")
+        .w_full()
+        .px(7.0)
+        .py(4.0)
+        .gap(6.0)
+        .child(field_slot);
+
+    if col_meta.nullable {
+        let row_key = editing.row_key;
+        let col_idx = editing.col_idx;
+        body = body.child(
+            row()
+                .key("inline-null-btn")
+                .role("button")
+                .label("Set NULL")
+                .focusable(true)
+                .mt(1.0)
+                .h(16.0)
+                .px(4.0)
+                .center()
+                .radius(k.radius.xs)
+                .fill(c.layer_02)
+                .border(0.5, c.border_muted)
+                .hover(c.hover)
+                .on_press(move |s: &mut AppState| s.stage_cell_null(row_key, col_idx))
+                .child(text("NULL").font(k.ty.small).color(c.text_faint)),
+        );
+    }
+
+    let mut card = col().w(box_w).child(body);
+    if is_multiline {
+        card = card.child(
+            row()
+                .key("inline-editor-footer")
+                .w_full()
+                .h(22.0)
+                .px(8.0)
+                .center_y()
+                .border_sides([1.0, 0.0, 0.0, 0.0], c.border_muted)
+                .child(
+                    text("Enter to stage · Shift+Enter newline · Esc cancel")
+                        .font(k.ty.small)
+                        .color(c.text_faint)
+                        .truncate()
+                        .shrink(),
+                ),
+        );
+    }
+
+    let box_h_est = editor_size.map_or(if is_multiline { 68.0 } else { 28.0 }, |[_, h]| h);
+    let x = ax.clamp(
+        INLINE_EDITOR_WINDOW_MARGIN,
+        (win_w - box_w - INLINE_EDITOR_WINDOW_MARGIN).max(INLINE_EDITOR_WINDOW_MARGIN),
+    );
+    let y = (ay - 2.0).clamp(
+        min_y,
+        (win_h - box_h_est - INLINE_EDITOR_WINDOW_MARGIN).max(min_y),
+    );
+
+    let card = k
+        .elevate(
+            card.radius(k.radius.sm)
+                .fill(c.surface_raised)
+                .border(1.5, c.text_accent),
+            &k.elevation.md,
+        )
+        .key("inline-editor-wrap")
+        .absolute(x, y)
+        .preserve_focus_on_press(true)
+        .on_key_preview(platform::handle_global_key)
+        .on_any_press(move |s: &mut AppState, _btn, p, tx| {
+            let h = editor_size.map_or(box_h_est, |[_, h]| h);
+            if p.x < 0.0 || p.y < 0.0 || p.x > box_w || p.y > h {
+                s.cancel_inline_cell_edit();
+            } else {
+                tx.live_only();
+            }
+        });
+    layer.push(card);
 }
 
 fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit) -> El {

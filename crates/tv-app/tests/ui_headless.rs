@@ -648,6 +648,277 @@ fn milestone4_inline_editing_insert_delete_and_staged_diff_drawer() {
 }
 
 #[test]
+fn inline_cell_editor_closes_on_outside_click() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    rt.frame(0.5);
+
+    let begin_email_edit = |rt: &mut Runtime<AppState>| {
+        rt.update(|s, tx| {
+            assert!(s.begin_cell_edit(RowKey::Existing(0), 3, tx));
+        });
+        rt.frame(0.2);
+        assert!(rt.find("inline-cell-editor").is_some());
+        assert!(rt.find("inline-null-btn").is_some());
+    };
+
+    // 1. Clicking inside the inline text input keeps the editor open.
+    begin_email_edit(&mut rt);
+    let (ex, ey) = rt.find("inline-cell-editor").expect("inline cell editor");
+    rt.pointer_down(ex, ey);
+    rt.pointer_up(ex, ey);
+    rt.frame(0.1);
+    assert!(rt.find("inline-cell-editor").is_some());
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .editing_cell
+            .is_some()
+    );
+
+    // 2. Clicking empty space below rows closes the editor without staging an edit.
+    let data_view = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("data-view-root"))
+        .expect("data-view-root");
+    let empty_x = data_view.rect[0] + data_view.rect[2] * 0.5;
+    let empty_y = data_view.rect[1] + data_view.rect[3] - 24.0;
+    rt.pointer_down(empty_x, empty_y);
+    rt.pointer_up(empty_x, empty_y);
+    rt.frame(0.1);
+    assert!(rt.find("inline-cell-editor").is_none());
+    let tab = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert!(tab.editing_cell.is_none());
+    assert!(tab.staged.is_empty());
+
+    // 3. Clicking an inspector edit button closes col 3 and switches directly to col 2.
+    begin_email_edit(&mut rt);
+    let (ix, iy) = rt.find("inspector/edit/2").expect("inspector edit full_name");
+    rt.pointer_down(ix, iy);
+    rt.pointer_up(ix, iy);
+    rt.frame(0.2);
+    assert!(rt.find("inline-cell-editor").is_some());
+    let editing = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab")
+        .editing_cell
+        .as_ref()
+        .expect("editing switched to col 2");
+    assert_eq!(editing.col_idx, 2);
+
+    // 4. Clicking the WHERE filter bar closes the editor and gives focus to the filter input.
+    let (fx, fy) = rt.find("table-filter-input").expect("table filter input");
+    rt.pointer_down(fx, fy);
+    rt.pointer_up(fx, fy);
+    rt.frame(0.1);
+    assert!(rt.find("inline-cell-editor").is_none());
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .editing_cell
+            .is_none()
+    );
+    rt.key(KeyEvent::from(Key::Text("gpa > 3.0".to_owned())));
+    rt.frame(0.0);
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .filter_input
+            .text,
+        "gpa > 3.0"
+    );
+
+    // 5. Clicking in the sidebar closes the editor.
+    begin_email_edit(&mut rt);
+    let (sx, sy) = rt
+        .find("sidebar/obj/public.students/toggle")
+        .expect("students sidebar toggle");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    rt.frame(0.1);
+    assert!(rt.find("inline-cell-editor").is_none());
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .editing_cell
+            .is_none()
+    );
+
+    // 6. With the floating overlay active over `email`, clicking the unobstructed NULL button stages NULL.
+    begin_email_edit(&mut rt);
+    let (nx, ny) = rt.find("inline-null-btn").expect("inline NULL button");
+    rt.pointer_down(nx, ny);
+    rt.pointer_up(nx, ny);
+    rt.frame(0.1);
+    assert!(rt.find("inline-cell-editor").is_none());
+    let tab_after = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert!(tab_after.editing_cell.is_none());
+    assert_eq!(tab_after.staged.update_count(), 1);
+
+    // 7. Clicking an open inspector area outside `inline-editor-wrap` closes the editor without staging.
+    begin_email_edit(&mut rt);
+    let inspector = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("inspector-pane-inner"))
+        .expect("inspector-pane-inner");
+    let insp_x = inspector.rect[0] + inspector.rect[2] * 0.5;
+    let insp_y = inspector.rect[1] + inspector.rect[3] - 24.0;
+    rt.pointer_down(insp_x, insp_y);
+    rt.pointer_up(insp_x, insp_y);
+    rt.frame(0.1);
+    assert!(rt.find("inline-cell-editor").is_none());
+    let tab_insp = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert!(tab_insp.editing_cell.is_none());
+    assert_eq!(tab_insp.staged.update_count(), 1);
+}
+
+#[test]
+fn inline_cell_editor_expands_for_long_and_multiline_values() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    rt.frame(0.5);
+
+    let elem_rect = |rt: &Runtime<AppState>, key: &str| {
+        rt.elements()
+            .into_iter()
+            .find(|el| el.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("missing element {key}"))
+            .rect
+    };
+
+    // 1. Editing a 36-char UUID expands horizontally past the column width on a single line.
+    rt.update(|s, tx| {
+        assert!(s.begin_cell_edit(RowKey::Existing(0), 1, tx));
+    });
+    rt.frame(0.2);
+
+    let anchor_rect = elem_rect(&rt, "inline-editor-anchor");
+    let wrap_rect = elem_rect(&rt, "inline-editor-wrap");
+    let editor_rect = elem_rect(&rt, "inline-cell-editor");
+    assert!(
+        wrap_rect[2] > anchor_rect[2],
+        "floating editor width {} should exceed cell anchor width {}",
+        wrap_rect[2],
+        anchor_rect[2]
+    );
+    assert!(
+        wrap_rect[3] <= 34.0,
+        "UUID editor should stay single-line, got height {}",
+        wrap_rect[3]
+    );
+    assert!(rt.find("inline-editor-footer").is_none());
+    assert!(
+        editor_rect[1] + editor_rect[3] <= wrap_rect[1] + wrap_rect[3] + 0.5,
+        "editor text {:?} overflowed wrap {:?}",
+        editor_rect,
+        wrap_rect
+    );
+
+    // 2. Escape cancels the floating editor cleanly.
+    rt.key(KeyEvent::from(Key::Escape));
+    rt.frame(0.1);
+    assert!(rt.find("inline-editor-wrap").is_none());
+    assert!(
+        rt.state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab")
+            .editing_cell
+            .is_none()
+    );
+
+    // 3. Typing a long >70-char string dynamically expands into multi-line mode without losing focus.
+    rt.update(|s, tx| {
+        assert!(s.begin_cell_edit(RowKey::Existing(0), 2, tx));
+    });
+    rt.frame(0.2);
+    rt.key(KeyEvent::from(Key::Text(
+        "Troy Barnes and Abed Nadir in the Morning at Greendale Community College Study Room F".to_owned(),
+    )));
+    rt.frame(0.1);
+
+    let multi_wrap = elem_rect(&rt, "inline-editor-wrap");
+    let multi_editor = elem_rect(&rt, "inline-cell-editor");
+    assert!(multi_wrap[2] >= 340.0, "expected >= 340 width, got {}", multi_wrap[2]);
+    assert!(multi_wrap[3] > 48.0, "expected multi-line height > 48, got {}", multi_wrap[3]);
+    assert!(rt.find("inline-editor-footer").is_some());
+    assert!(
+        multi_editor[1] + multi_editor[3] <= multi_wrap[1] + multi_wrap[3] + 0.5,
+        "multi-line editor {:?} overflowed wrap {:?}",
+        multi_editor,
+        multi_wrap
+    );
+    assert!(multi_wrap[0] >= 8.0);
+    assert!(multi_wrap[0] + multi_wrap[2] <= 1272.5);
+    assert!(multi_wrap[1] + multi_wrap[3] <= 792.5);
+
+    // 4. Shift+Enter inserts a newline while keeping focus; Enter commits the staged edit.
+    rt.key(KeyEvent {
+        key: Key::Enter,
+        mods: Mods {
+            shift: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Text("Second line".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    let tab = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert!(tab.editing_cell.is_none());
+    assert_eq!(tab.staged.update_count(), 1);
+    match tab.staged.effective_existing_cell(0, 2) {
+        Some(tv_core::StagedCellValue::Literal(val)) => {
+            assert!(
+                val.contains("\nSecond line"),
+                "expected Shift+Enter newline in staged value, got {val:?}"
+            );
+        }
+        other => panic!("expected staged literal update, got {other:?}"),
+    }
+}
+
+#[test]
 fn milestone4_safety_policies_block_and_gate_production_destructive_writes() {
     let mut rt = sample_runtime(true);
     apply_scene(&mut rt, "workspace-sql-editor-dark");
