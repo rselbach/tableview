@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::Local;
 use rune::{ColorScheme, FileDialogOptions, PointerPress, TextEdit, Tx};
@@ -21,6 +22,28 @@ use tv_update::{UpdateFailure, UpdateStatus};
 
 use crate::update::{UpdateBridge, UpdateHostEvent, UpdateUiState, manual_check_notice};
 use crate::worker::{WorkerBridge, WorkerCmd, WorkerEvent};
+
+pub const STATUS_NOTICE_DURATION_SECS: f64 = 4.0;
+pub const STATUS_NOTICE_ERROR_DURATION_SECS: f64 = 6.0;
+pub const STATUS_NOTICE_LEAVE_GRACE_SECS: f64 = 1.5;
+
+/// Countdown state for the transient status toast banner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StatusNoticeTimer {
+    Pending { duration: f64 },
+    Running { due: f64 },
+    Paused { remaining: f64 },
+    Pinned,
+}
+
+/// Active status toast message and its auto-dismiss lifecycle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusNotice {
+    pub message: String,
+    pub is_error: bool,
+    pub hovered: bool,
+    pub timer: StatusNoticeTimer,
+}
 
 /// Active top-level screen in TableView's single-window shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1053,7 +1076,7 @@ pub struct AppState {
     pub screen: Screen,
     pub overlay: OverlayState,
     pub appearance: ColorScheme,
-    pub status_notice: Option<(String, bool)>,
+    pub status_notice: Option<StatusNotice>,
     pub worker: Option<WorkerBridge>,
     pub update: UpdateUiState,
     pub update_bridge: Option<UpdateBridge>,
@@ -4388,7 +4411,85 @@ impl AppState {
     }
 
     pub fn set_notice(&mut self, message: impl Into<String>, is_error: bool) {
-        self.status_notice = Some((message.into(), is_error));
+        let was_hovered = self.status_notice.as_ref().is_some_and(|n| n.hovered);
+        let duration = if is_error {
+            STATUS_NOTICE_ERROR_DURATION_SECS
+        } else {
+            STATUS_NOTICE_DURATION_SECS
+        };
+        let timer = if was_hovered {
+            StatusNoticeTimer::Paused { remaining: duration }
+        } else {
+            StatusNoticeTimer::Pending { duration }
+        };
+        self.status_notice = Some(StatusNotice {
+            message: message.into(),
+            is_error,
+            hovered: was_hovered,
+            timer,
+        });
+    }
+
+    pub fn dismiss_status_notice(&mut self) {
+        self.status_notice = None;
+    }
+
+    pub fn pin_status_notice(&mut self, tx: &mut Tx) {
+        if let Some(ref mut notice) = self.status_notice {
+            notice.timer = StatusNoticeTimer::Pinned;
+        }
+        tx.live_only();
+    }
+
+    pub fn hover_status_notice(&mut self, hovered: bool, tx: &mut Tx) {
+        if let Some(ref mut notice) = self.status_notice {
+            notice.hovered = hovered;
+            let now = tx.clock();
+            if hovered {
+                notice.timer = match notice.timer {
+                    StatusNoticeTimer::Pending { duration } => StatusNoticeTimer::Paused { remaining: duration },
+                    StatusNoticeTimer::Running { due } => StatusNoticeTimer::Paused {
+                        remaining: (due - now).max(0.0),
+                    },
+                    StatusNoticeTimer::Paused { remaining } => StatusNoticeTimer::Paused { remaining },
+                    StatusNoticeTimer::Pinned => StatusNoticeTimer::Pinned,
+                };
+            } else if let StatusNoticeTimer::Paused { remaining } = notice.timer {
+                let left = remaining.max(STATUS_NOTICE_LEAVE_GRACE_SECS);
+                notice.timer = StatusNoticeTimer::Running { due: now + left };
+                tx.wake_after(Duration::from_secs_f64(left));
+            }
+        }
+        tx.live_only();
+    }
+
+    pub fn tick_status_notice(&mut self, now: f64, tx: &mut Tx) -> bool {
+        let Some(ref mut notice) = self.status_notice else {
+            return false;
+        };
+        match notice.timer {
+            StatusNoticeTimer::Pending { duration } => {
+                notice.timer = StatusNoticeTimer::Running { due: now + duration };
+                tx.wake_after(Duration::from_secs_f64(duration));
+                false
+            }
+            StatusNoticeTimer::Running { due } => {
+                if now + 1e-3 >= due {
+                    self.status_notice = None;
+                    true
+                } else {
+                    tx.wake_after(Duration::from_secs_f64((due - now).max(0.0)));
+                    false
+                }
+            }
+            StatusNoticeTimer::Paused { .. } | StatusNoticeTimer::Pinned => false,
+        }
+    }
+
+    pub fn poll(&mut self, now: f64, tx: &mut Tx) -> bool {
+        let mut changed = self.apply_worker_events(tx);
+        changed |= self.tick_status_notice(now, tx);
+        changed
     }
 
     pub fn check_for_updates(&mut self) {

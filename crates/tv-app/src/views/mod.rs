@@ -79,12 +79,14 @@ pub fn view(s: &AppState, cx: &mut Cx<AppState>) -> El {
         }
     }
 
-    if let Some((message, is_error)) = &s.status_notice {
-        let dot_color = if *is_error { k.c.danger.fg } else { k.c.success.fg };
-        let toast = Toast::new("tv-notice", message)
+    if let Some(notice) = &s.status_notice {
+        let dot_color = if notice.is_error { k.c.danger.fg } else { k.c.success.fg };
+        let toast = Toast::new("tv-notice", &notice.message)
             .lead(el().size(8.0, 8.0).radius(4.0).fill(dot_color))
-            .on_close(|s: &mut AppState| s.status_notice = None)
-            .build(&k);
+            .on_close(AppState::dismiss_status_notice)
+            .build(&k)
+            .on_hover_change(AppState::hover_status_notice)
+            .on_background_press_tx(AppState::pin_status_notice);
         layer.push(ToastRegion::new().toast(toast).build(&k));
     }
 

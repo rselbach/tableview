@@ -26,7 +26,7 @@ pub fn run() {
                 update.set_waker(waker);
             }
         }),
-        poll: Some(|s, _, tx| s.apply_worker_events(tx)),
+        poll: Some(AppState::poll),
         on_key: Some(platform::handle_global_key),
         ..AppSpec::new("TableView", (1280.0, 800.0), AppState::init_default, views::view)
     };

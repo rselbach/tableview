@@ -14,6 +14,7 @@ fn sample_runtime(dark: bool) -> Runtime<AppState> {
     reset_to_sample_state(&mut state, dark);
     let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(dark, 1.0));
     rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
     rt
 }
 
@@ -1069,7 +1070,7 @@ fn milestone4_export_modal_switches_formats_and_copies() {
         rt.state
             .status_notice
             .as_ref()
-            .is_some_and(|(msg, is_err)| !is_err && msg.contains("Copied 8 rows as SQL INSERT"))
+            .is_some_and(|n| !n.is_error && n.message.contains("Copied 8 rows as SQL INSERT"))
     );
 }
 
@@ -1135,10 +1136,9 @@ fn launcher_update_ready_renders_and_toggles_notes() {
     rt.update(|s, tx| {
         assert!(dispatch_action(s, Action::CheckForUpdates, tx));
     });
-    assert_eq!(
-        rt.state.status_notice.as_ref(),
-        Some(&("TableView 0.2.0 is ready to install on restart.".to_owned(), false))
-    );
+    let notice = rt.state.status_notice.as_ref().expect("status notice");
+    assert_eq!(notice.message, "TableView 0.2.0 is ready to install on restart.");
+    assert!(!notice.is_error);
 }
 
 #[test]
@@ -1405,4 +1405,111 @@ fn settings_dialog_updates_controls_and_persists_appearance() {
         .load()
         .expect("load updated settings");
     assert_eq!(reloaded.appearance, AppearancePreference::Dark);
+}
+
+#[test]
+fn status_notice_auto_dismisses_unless_hovered_or_clicked() {
+    let mut rt = sample_runtime(false);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    rt.frame(0.1);
+
+    // 1. Standard status notice stays visible before 4s, then auto-dismisses past 4s.
+    rt.update(|s, _| {
+        s.set_notice("Committed 1 change(s) (1 rows affected · 4 ms)", false);
+    });
+    rt.frame(0.1);
+    assert!(rt.state.status_notice.is_some());
+    assert!(rt.find("tv-notice").is_some());
+
+    rt.frame(3.0);
+    assert!(rt.state.status_notice.is_some(), "notice must remain before 4s");
+
+    rt.frame(1.5);
+    assert!(rt.state.status_notice.is_none(), "notice must auto-dismiss after 4s");
+    rt.frame(0.5);
+    assert!(rt.find("tv-notice").is_none());
+
+    // 2. Error notice stays visible longer (~6s) before auto-dismissing.
+    rt.update(|s, _| {
+        s.set_notice("Failed to commit staged changes", true);
+    });
+    rt.frame(0.1);
+    rt.frame(4.5);
+    assert!(rt.state.status_notice.is_some(), "error notice must remain at 4.6s");
+    rt.frame(2.0);
+    assert!(rt.state.status_notice.is_none(), "error notice must auto-dismiss after 6s");
+    rt.frame(0.5);
+
+    // 3. Hovering pauses the timer; leaving resumes with remaining/grace duration.
+    rt.update(|s, _| {
+        s.set_notice("Copied row as JSON", false);
+    });
+    rt.frame(0.1);
+    let (tx, ty) = rt.find("tv-notice").expect("tv-notice");
+    rt.pointer_move(tx, ty);
+    rt.frame(0.1);
+    rt.frame(5.0);
+    rt.frame(5.0);
+    assert!(rt.state.status_notice.is_some(), "hovered notice must not auto-dismiss");
+    assert!(rt.find("tv-notice").is_some());
+
+    rt.pointer_move(10.0, 10.0);
+    rt.frame(0.1);
+    rt.frame(4.5);
+    rt.frame(0.5);
+    assert!(rt.state.status_notice.is_none(), "notice must auto-dismiss after pointer leaves");
+
+    // 4. Clicking the toast body pins it open even after moving the pointer away until closed.
+    rt.update(|s, _| {
+        s.set_notice("Copied DDL to clipboard", false);
+    });
+    rt.frame(0.1);
+    let toast_rect = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("tv-notice"))
+        .expect("tv-notice")
+        .rect;
+    let body_x = toast_rect[0] + 40.0;
+    let body_y = toast_rect[1] + toast_rect[3] * 0.5;
+    rt.pointer_down(body_x, body_y);
+    rt.pointer_up(body_x, body_y);
+    rt.frame(0.1);
+    rt.pointer_move(10.0, 10.0);
+    rt.frame(0.1);
+    rt.frame(10.0);
+    rt.frame(10.0);
+    assert!(rt.state.status_notice.is_some(), "clicked notice must remain pinned");
+    assert!(rt.find("tv-notice").is_some());
+
+    let (cx, cy) = rt.find("tv-notice/top/close").expect("tv-notice close button");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    rt.frame(0.5);
+    assert!(rt.state.status_notice.is_none());
+    assert!(rt.find("tv-notice").is_none());
+
+    // 5. Replacing a pinned notice starts a fresh auto-dismiss timer.
+    rt.update(|s, _| {
+        s.set_notice("Pinned notice", false);
+    });
+    rt.frame(0.1);
+    let toast_rect = rt
+        .elements()
+        .into_iter()
+        .find(|el| el.key.as_deref() == Some("tv-notice"))
+        .expect("tv-notice")
+        .rect;
+    rt.pointer_down(toast_rect[0] + 40.0, toast_rect[1] + toast_rect[3] * 0.5);
+    rt.pointer_up(toast_rect[0] + 40.0, toast_rect[1] + toast_rect[3] * 0.5);
+    rt.frame(0.1);
+    rt.pointer_move(10.0, 10.0);
+    rt.frame(0.1);
+
+    rt.update(|s, _| {
+        s.set_notice("Replacement notice", false);
+    });
+    rt.frame(0.1);
+    rt.frame(4.5);
+    assert!(rt.state.status_notice.is_none(), "replacement notice must auto-dismiss");
 }
