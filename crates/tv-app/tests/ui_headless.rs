@@ -8,7 +8,7 @@ use tv_app::state::{AppState, OverlayState, PickerKind, RowKey, Screen, TableVie
 use tv_app::views;
 use tv_core::{
     AppearancePreference, ConnectionProfile, DbEngine, EnvTag, ExplainPlan, ExportFormat, SafetyPolicy,
-    SettingsStore,
+    SettingsStore, StoreData,
 };
 use tv_update::{UpdateFailure, UpdateStatus};
 
@@ -1743,4 +1743,200 @@ fn sqlite_workspace_hides_schema_dropdown_and_disables_multi_db_switching() {
     assert!(rt.find("explain-pane-root").is_some());
     assert!(rt.find("explain-copy-btn").is_some());
     assert!(rt.find("explain-analyze-btn").is_none());
+}
+
+fn empty_runtime(dark: bool) -> Runtime<AppState> {
+    let mut state = AppState::init_in_memory(StoreData::default());
+    state.appearance = if dark { ColorScheme::Dark } else { ColorScheme::Light };
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(dark, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+    rt
+}
+
+fn click_button_by_label(rt: &mut Runtime<AppState>, label: &str) {
+    let el = rt
+        .elements()
+        .into_iter()
+        .find(|el| !el.exiting && !el.inert && el.role == "button" && el.label.as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("expected button with label {label:?}"));
+    let x = el.rect[0] + el.rect[2] * 0.5;
+    let y = el.rect[1] + el.rect[3] * 0.5;
+    rt.pointer_down(x, y);
+    rt.pointer_up(x, y);
+}
+
+#[test]
+fn launcher_creating_first_connection_updates_empty_list_immediately() {
+    let mut rt = empty_runtime(true);
+    rt.frame(0.0);
+    assert!(rt.find("launcher-empty").is_some());
+
+    click_button_by_label(&mut rt, "New Connection");
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::ConnectionForm(_)));
+
+    rt.key(KeyEvent::from(Key::Text("greendale_local".to_owned())));
+    rt.frame(0.0);
+    click_button_by_label(&mut rt, "Save");
+    rt.frame(0.1);
+    rt.frame(0.5);
+
+    assert_eq!(rt.state.connections.len(), 1);
+    let id = rt.state.connections[0].id;
+    assert!(rt.find("launcher-empty").is_none());
+    assert!(rt.find(&format!("launcher/conn/{id}")).is_some());
+    assert!(has_text(&rt, "greendale_local"));
+}
+
+#[test]
+fn launcher_new_connection_respects_and_reconciles_filters() {
+    let mut rt = empty_runtime(true);
+    rt.frame(0.0);
+
+    // 1. Selecting an environment filter prefills new connection forms with that environment.
+    let (dx, dy) = rt.find("launcher/filter/Development").expect("Development filter");
+    rt.pointer_down(dx, dy);
+    rt.pointer_up(dx, dy);
+    rt.frame(0.1);
+
+    rt.key(KeyEvent {
+        key: Key::Command('n'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    match &rt.state.overlay {
+        OverlayState::ConnectionForm(form) => {
+            assert_eq!(form.env, EnvTag::Development);
+            assert_eq!(form.color, EnvTag::Development.default_color());
+        }
+        other => panic!("expected ConnectionForm, got {other:?}"),
+    }
+
+    rt.key(KeyEvent::from(Key::Text("study_room_dev".to_owned())));
+    rt.frame(0.0);
+    click_button_by_label(&mut rt, "Save");
+    rt.frame(0.1);
+    rt.frame(0.5);
+
+    let dev_id = rt
+        .state
+        .connections
+        .iter()
+        .find(|c| c.name == "study_room_dev")
+        .expect("study_room_dev saved")
+        .id;
+    assert_eq!(rt.state.env_filter, Some(EnvTag::Development));
+    assert!(rt.find("launcher-empty").is_none());
+    assert!(rt.find(&format!("launcher/conn/{dev_id}")).is_some());
+    assert!(has_text(&rt, "study_room_dev"));
+
+    // 2. Importing a URL whose inferred env differs from the active env filter resets to All Connections.
+    let (px, py) = rt.find("launcher/filter/Production").expect("Production filter");
+    rt.pointer_down(px, py);
+    rt.pointer_up(px, py);
+    rt.frame(0.1);
+    assert!(rt.find("launcher-empty").is_some());
+
+    rt.key(KeyEvent {
+        key: Key::Command('i'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    rt.key(KeyEvent::from(Key::Text("sqlite:///tmp/greendale_campus.db".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+    click_button_by_label(&mut rt, "Save");
+    rt.frame(0.1);
+    rt.frame(0.5);
+
+    let sqlite_id = rt
+        .state
+        .connections
+        .iter()
+        .find(|c| c.name == "greendale_campus")
+        .expect("greendale_campus saved")
+        .id;
+    assert_eq!(rt.state.env_filter, None);
+    assert!(rt.find("launcher-empty").is_none());
+    assert!(rt.find(&format!("launcher/conn/{sqlite_id}")).is_some());
+    assert!(has_text(&rt, "greendale_campus"));
+
+    // 3. Changing the form's environment away from the active filter reconciles to All Connections on save.
+    let (px, py) = rt.find("launcher/filter/Production").expect("Production filter");
+    rt.pointer_down(px, py);
+    rt.pointer_up(px, py);
+    rt.frame(0.1);
+    assert!(rt.find("launcher-empty").is_some());
+
+    rt.key(KeyEvent {
+        key: Key::Command('n'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    rt.update(|s, _| {
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.env = EnvTag::Staging;
+            form.color = EnvTag::Staging.default_color();
+        }
+    });
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Text("campus_staging".to_owned())));
+    rt.frame(0.0);
+    click_button_by_label(&mut rt, "Save");
+    rt.frame(0.1);
+    rt.frame(0.5);
+
+    let staging_id = rt
+        .state
+        .connections
+        .iter()
+        .find(|c| c.name == "campus_staging")
+        .expect("campus_staging saved")
+        .id;
+    assert_eq!(rt.state.env_filter, None);
+    assert!(rt.find("launcher-empty").is_none());
+    assert!(rt.find(&format!("launcher/conn/{staging_id}")).is_some());
+    assert!(has_text(&rt, "campus_staging"));
+
+    // 4. A non-matching launcher search is cleared on save so the new connection is immediately visible.
+    rt.update(|s, _| s.launcher_search = rune::TextEdit::new("dean_pelton_nonexistent"));
+    rt.frame(0.1);
+    assert!(rt.find("launcher-empty").is_some());
+
+    rt.key(KeyEvent {
+        key: Key::Command('n'),
+        mods: Mods {
+            cmd: true,
+            ..Default::default()
+        },
+    });
+    rt.frame(0.1);
+    rt.key(KeyEvent::from(Key::Text("troy_barnes_local".to_owned())));
+    rt.frame(0.0);
+    click_button_by_label(&mut rt, "Save");
+    rt.frame(0.1);
+    rt.frame(0.5);
+
+    let local_id = rt
+        .state
+        .connections
+        .iter()
+        .find(|c| c.name == "troy_barnes_local")
+        .expect("troy_barnes_local saved")
+        .id;
+    assert!(rt.state.launcher_search.text.is_empty());
+    assert!(rt.find("launcher-empty").is_none());
+    assert!(rt.find(&format!("launcher/conn/{local_id}")).is_some());
+    assert!(has_text(&rt, "troy_barnes_local"));
 }

@@ -1565,19 +1565,7 @@ impl AppState {
         self.connections
             .iter()
             .filter(|c| self.env_filter.is_none_or(|env| c.env == env))
-            .filter(|c| {
-                q.is_empty()
-                    || c.name.to_ascii_lowercase().contains(&q)
-                    || c.engine.label().to_ascii_lowercase().contains(&q)
-                    || c.host.to_ascii_lowercase().contains(&q)
-                    || c.user.to_ascii_lowercase().contains(&q)
-                    || c.database
-                        .as_deref()
-                        .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
-                    || c.file_path
-                        .as_ref()
-                        .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(&q))
-            })
+            .filter(|c| connection_matches_search(c, &q))
             .collect()
     }
 
@@ -1615,7 +1603,14 @@ impl AppState {
 
     pub fn open_new_connection_form(&mut self, tx: &mut Tx) {
         self.launcher_context_menu = None;
-        self.overlay = OverlayState::ConnectionForm(Box::new(ConnectionFormState::new_blank()));
+        let mut form = ConnectionFormState::new_blank();
+        if self.screen == Screen::Launcher
+            && let Some(env) = self.env_filter
+        {
+            form.env = env;
+            form.color = env.default_color();
+        }
+        self.overlay = OverlayState::ConnectionForm(Box::new(form));
         tx.focus_when_shown("form-name", true);
     }
 
@@ -1740,6 +1735,13 @@ impl AppState {
         self.folders = data.folders;
         self.connections = data.connections;
         self.launcher_selected = Some(profile.id);
+        if self.env_filter.is_some_and(|env| env != profile.env) {
+            self.env_filter = None;
+        }
+        let search_q = self.launcher_search.text.trim().to_ascii_lowercase();
+        if !connection_matches_search(&profile, &search_q) {
+            self.launcher_search = TextEdit::new("");
+        }
         self.persist_connections();
 
         for session in self.sessions.values_mut() {
@@ -4840,4 +4842,18 @@ fn concise_sql_title(sql: &str, fallback_seq: u64) -> String {
         out.push('…');
     }
     out
+}
+
+fn connection_matches_search(c: &ConnectionProfile, query_lower: &str) -> bool {
+    query_lower.is_empty()
+        || c.name.to_ascii_lowercase().contains(query_lower)
+        || c.engine.label().to_ascii_lowercase().contains(query_lower)
+        || c.host.to_ascii_lowercase().contains(query_lower)
+        || c.user.to_ascii_lowercase().contains(query_lower)
+        || c.database
+            .as_deref()
+            .is_some_and(|d| d.to_ascii_lowercase().contains(query_lower))
+        || c.file_path
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(query_lower))
 }
