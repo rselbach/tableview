@@ -21,7 +21,6 @@ use crate::transport::{TransferError, Transport};
 #[derive(Debug, Clone, Copy)]
 pub struct Schedule {
     pub launch_delay: Duration,
-    pub poll: Duration,
     pub interval: Duration,
     pub restart_refresh: Duration,
 }
@@ -30,8 +29,7 @@ impl Default for Schedule {
     fn default() -> Self {
         Self {
             launch_delay: Duration::from_secs(10),
-            poll: Duration::from_secs(60 * 60),
-            interval: Duration::from_secs(24 * 60 * 60),
+            interval: Duration::from_secs(60 * 60),
             restart_refresh: Duration::from_secs(5),
         }
     }
@@ -348,7 +346,6 @@ impl Worker {
 
         let schedule = self.config.schedule;
         let mut next = Instant::now() + schedule.launch_delay;
-        let mut launch_check = true;
         loop {
             let command = tokio::select! {
                 command = commands.recv() => match command {
@@ -356,17 +353,18 @@ impl Worker {
                     None => return,
                 },
                 () = tokio::time::sleep_until(next), if self.config.background_checks => {
-                    next = Instant::now() + schedule.poll;
-                    let due = self.background_check_due(launch_check);
-                    launch_check = false;
-                    if !due {
+                    next = Instant::now() + schedule.interval;
+                    if !self.shared.lock().prefs.automatic_checks {
                         continue;
                     }
                     Command::Check
                 }
             };
             match command {
-                Command::Check => self.check().await,
+                Command::Check => {
+                    self.check().await;
+                    next = Instant::now() + schedule.interval;
+                }
                 Command::Restart(reply) => {
                     let (relaunching, replacement) = self.restart().await;
                     if reply.send(relaunching).is_err() {
@@ -382,15 +380,6 @@ impl Worker {
             }
             self.shared.finished.fetch_add(1, Ordering::SeqCst);
         }
-    }
-
-    fn background_check_due(&self, launch_check: bool) -> bool {
-        let state = self.shared.lock();
-        let old_enough = state.prefs.last_check_time().is_none_or(|last| {
-            last.elapsed()
-                .is_ok_and(|age| age >= self.config.schedule.interval)
-        });
-        state.prefs.automatic_checks && (launch_check || old_enough)
     }
 
     async fn check(&self) {
@@ -778,7 +767,6 @@ mod tests {
         async fn with(build: u64, replaceable: bool, background_checks: bool, dir: tempfile::TempDir) -> Self {
             let schedule = Schedule {
                 launch_delay: Duration::from_millis(50),
-                poll: Duration::from_millis(50),
                 interval: Duration::from_secs(3600),
                 restart_refresh: Duration::from_secs(5),
             };
@@ -1034,5 +1022,49 @@ mod tests {
         fixture.server.behave(ZIP_PATH, Behavior::Hang);
         let replied = tokio::time::timeout(Duration::from_secs(5), fixture.restart()).await;
         assert_eq!(replied, Ok(false));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_checks_run_on_launch_and_repeat_on_interval() {
+        assert_eq!(Schedule::default().launch_delay, Duration::from_secs(10));
+        assert_eq!(Schedule::default().interval, Duration::from_secs(60 * 60));
+
+        let schedule = Schedule {
+            launch_delay: Duration::from_millis(50),
+            interval: Duration::from_millis(100),
+            restart_refresh: Duration::from_secs(5),
+        };
+        let fixture = Fixture::scheduled(41, true, true, tempfile::tempdir().unwrap(), schedule).await;
+        fixture.publish(41);
+
+        for _ in 0..500 {
+            if fixture.updater.shared.finished.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(fixture.updater.shared.finished.load(Ordering::SeqCst) >= 1);
+        assert_eq!(fixture.updater.snapshot().status, UpdateStatus::UpToDate);
+        assert_eq!(fixture.server.requests("/update.json").len(), 1);
+
+        fixture.publish(42);
+        for _ in 0..500 {
+            if fixture.updater.shared.finished.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(fixture.updater.shared.finished.load(Ordering::SeqCst) >= 2);
+        assert!(matches!(
+            fixture.updater.snapshot().status,
+            UpdateStatus::Ready { ref version, .. } if version == "0.2.42"
+        ));
+        assert!(fixture.server.requests("/update.json").len() >= 2);
+
+        fixture.updater.set_automatic_checks(false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let count = fixture.server.requests("/update.json").len();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(fixture.server.requests("/update.json").len(), count);
     }
 }
