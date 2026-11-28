@@ -355,6 +355,9 @@ jobs:
     needs: update-feed
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: pages-stable-feed
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: read
@@ -374,6 +377,9 @@ jobs:
         with:
           name: github-pages
           path: published
+
+      - name: Verify candidate feed advances published build
+        run: python3 scripts/verify-published-feeds.py --check-advance published/artifact.tar
 
       - name: Deploy to GitHub Pages
         id: deployment

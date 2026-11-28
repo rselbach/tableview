@@ -1226,8 +1226,8 @@ fn update_card_renders_available_downloading_relaunch_and_os_warning_states() {
     rt.update(|s, _| {
         s.update.snapshot.status = UpdateStatus::Available {
             version: "0.3.0".to_owned(),
-            download_url: "https://github.com/rselbach/tableview/releases/download/v0.3.0/TableView-0.3.0-macos-arm64.dmg".to_owned(),
-            notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.3.0".to_owned()),
+            download_url: "https://github.com/rselbach/TableView/releases/download/v0.3.0/TableView-0.3.0-macos-arm64.dmg".to_owned(),
+            notes_url: Some("https://github.com/rselbach/TableView/releases/tag/v0.3.0".to_owned()),
             highlights: vec!["Adds signed update feed support".to_owned()],
         };
     });
@@ -1260,6 +1260,19 @@ fn update_card_renders_available_downloading_relaunch_and_os_warning_states() {
     assert!(rt.find("sidebar-toggle-unread").is_some());
     assert!(has_text(&rt, "v0.2.0 Installed"));
     assert!(has_text(&rt, "Quit and reopen TableView to finish updating."));
+
+    // Startup recovery state when an earlier restart-to-update failed and older build booted.
+    rt.update(|s, _| {
+        s.update.snapshot.status = UpdateStatus::Failed(UpdateFailure::RelaunchRecovery {
+            version: "0.2.0".to_owned(),
+            log_path: "/tmp/relaunch.log".to_owned(),
+        });
+    });
+    rt.frame(0.1);
+    assert!(rt.find("update-dock-card").is_some());
+    assert!(rt.find("sidebar-toggle-unread").is_some());
+    assert!(rt.find("update-card-retry-btn").is_some());
+    assert!(has_text(&rt, "v0.2.0 Update Incomplete"));
 
     // RequiresNewerOs warning is shown and can be dismissed.
     rt.update(|s, _| {

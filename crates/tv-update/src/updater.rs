@@ -60,6 +60,9 @@ pub trait Host: Send + Sync {
 /// Bundle staging and replacement abstraction (implemented by [`MacInstaller`]).
 pub trait Installer: Send + Sync {
     fn replaceable(&self) -> bool;
+    fn bundle_path(&self) -> Option<PathBuf> {
+        None
+    }
     fn remove_leftovers(&self);
     fn stage(&self, zip: &Path, release: &Release) -> Result<Staged, InstallError>;
     fn apply(&self, staged: &Staged, relaunch: bool) -> Result<(), ApplyError>;
@@ -72,6 +75,7 @@ pub struct MacInstaller {
     build: u64,
     os_version: OsVersion,
     open_args: Vec<OsString>,
+    state_dir: Option<PathBuf>,
 }
 
 impl MacInstaller {
@@ -81,13 +85,23 @@ impl MacInstaller {
             build,
             os_version,
             open_args,
+            state_dir: None,
         }
+    }
+
+    pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
+        self.state_dir = Some(state_dir);
+        self
     }
 }
 
 impl Installer for MacInstaller {
     fn replaceable(&self) -> bool {
         install::replaceable(&self.bundle)
+    }
+
+    fn bundle_path(&self) -> Option<PathBuf> {
+        Some(std::fs::canonicalize(&self.bundle).unwrap_or_else(|_| self.bundle.clone()))
     }
 
     fn remove_leftovers(&self) {
@@ -100,7 +114,14 @@ impl Installer for MacInstaller {
     }
 
     fn apply(&self, staged: &Staged, relaunch: bool) -> Result<(), ApplyError> {
-        install::apply(staged, self.build, std::process::id(), &self.open_args, relaunch)
+        install::apply_with_diagnostics(
+            staged,
+            self.build,
+            std::process::id(),
+            &self.open_args,
+            relaunch,
+            self.state_dir.as_deref(),
+        )
     }
 
     fn discard(&self, staged: &Staged) {
@@ -341,8 +362,30 @@ struct Worker {
 
 impl Worker {
     async fn run(self, mut commands: mpsc::UnboundedReceiver<Command>) {
+        let state_dir = self.config.state_dir.clone();
+        let running_build = self.config.build;
+        let bundle = self.installer.bundle_path();
         let cleaner = self.installer.clone();
-        drop(tokio::task::spawn_blocking(move || cleaner.remove_leftovers()).await);
+        let relaunch_failure = tokio::task::spawn_blocking(move || match bundle.as_deref() {
+            Some(path) => install::reconcile_relaunch_on_startup(&state_dir, path, running_build, || {
+                cleaner.remove_leftovers();
+            }),
+            None => {
+                cleaner.remove_leftovers();
+                None
+            }
+        })
+        .await
+        .unwrap_or(None);
+
+        if let Some(failure) = relaunch_failure {
+            // Keep the backup staging folder and diagnostics until the target build launches
+            // or a later update replaces them.
+            self.shared.set_status(UpdateStatus::Failed(UpdateFailure::RelaunchRecovery {
+                version: failure.version,
+                log_path: failure.log_path.display().to_string(),
+            }));
+        }
 
         let schedule = self.config.schedule;
         let mut next = Instant::now() + schedule.launch_delay;
@@ -620,6 +663,10 @@ impl Worker {
 }
 
 fn prune(downloads: &Path, keep: Option<&str>) {
+    prune_with(downloads, keep, |_| {});
+}
+
+fn prune_with(downloads: &Path, keep: Option<&str>, mut on_remove: impl FnMut(&Path)) {
     let Ok(entries) = std::fs::read_dir(downloads) else {
         return;
     };
@@ -634,13 +681,18 @@ fn prune(downloads: &Path, keep: Option<&str>) {
         if keep.is_some_and(|keep| name_str.starts_with(keep)) {
             continue;
         }
-        if name_str.ends_with(".download") {
-            let lock_path = downloads.join(format!("{name_str}.lock"));
-            let Ok(Some(_lock)) = crate::transport::try_lock_download(&lock_path) else {
-                continue;
-            };
-        }
-        drop(std::fs::remove_file(entry.path()));
+        let path = entry.path();
+        let _lock = if name_str.ends_with(".download") {
+            let lock_path = crate::transport::download_lock_path(&path);
+            match crate::transport::try_lock_download(&lock_path) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) | Err(_) => continue,
+            }
+        } else {
+            None
+        };
+        on_remove(&path);
+        drop(std::fs::remove_file(&path));
     }
 }
 
@@ -679,6 +731,7 @@ mod tests {
 
     struct FakeInstaller {
         replaceable: bool,
+        bundle_path: Option<PathBuf>,
         stage_error: Mutex<Option<InstallError>>,
         apply_error: Mutex<Option<ApplyError>>,
         log: Mutex<Vec<String>>,
@@ -688,6 +741,7 @@ mod tests {
         fn new(replaceable: bool) -> Self {
             Self {
                 replaceable,
+                bundle_path: Some(PathBuf::from("/Applications/TableView.app")),
                 stage_error: Mutex::new(None),
                 apply_error: Mutex::new(None),
                 log: Mutex::new(Vec::new()),
@@ -702,6 +756,10 @@ mod tests {
     impl Installer for FakeInstaller {
         fn replaceable(&self) -> bool {
             self.replaceable
+        }
+
+        fn bundle_path(&self) -> Option<PathBuf> {
+            self.bundle_path.clone()
         }
 
         fn remove_leftovers(&self) {
@@ -826,7 +884,7 @@ mod tests {
                 version: format!("0.2.{build}"),
                 build,
                 published_at: "2026-11-26T12:00:00Z".to_owned(),
-                notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.2.0".to_owned()),
+                notes_url: Some("https://github.com/rselbach/TableView/releases/tag/v0.2.0".to_owned()),
                 highlights: vec!["Faster Greendale grid scrolling".to_owned()],
                 artifacts: vec![zip, dmg],
             };
@@ -886,7 +944,7 @@ mod tests {
             status,
             UpdateStatus::Ready {
                 version: "0.2.42".to_owned(),
-                notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.2.0".to_owned()),
+                notes_url: Some("https://github.com/rselbach/TableView/releases/tag/v0.2.0".to_owned()),
                 highlights: vec!["Faster Greendale grid scrolling".to_owned()],
             }
         );
@@ -895,7 +953,7 @@ mod tests {
         fixture.updater.open_notes();
         assert_eq!(
             *fixture.host.opened.lock().unwrap(),
-            vec!["https://github.com/rselbach/tableview/releases/tag/v0.2.0"]
+            vec!["https://github.com/rselbach/TableView/releases/tag/v0.2.0"]
         );
 
         assert!(fixture.restart().await);
@@ -930,7 +988,7 @@ mod tests {
             UpdateStatus::Available {
                 version: "0.2.42".to_owned(),
                 download_url: fixture.server.url(DMG_PATH),
-                notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.2.0".to_owned()),
+                notes_url: Some("https://github.com/rselbach/TableView/releases/tag/v0.2.0".to_owned()),
                 highlights: vec!["Faster Greendale grid scrolling".to_owned()],
             }
         );
@@ -1066,5 +1124,134 @@ mod tests {
         let count = fixture.server.requests("/update.json").len();
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_eq!(fixture.server.requests("/update.json").len(), count);
+    }
+
+    #[test]
+    fn prune_skips_locked_downloads_and_removes_unlocked_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked_dl = dir.path().join("aaaa.download");
+        let unlocked_dl = dir.path().join("bbbb.download");
+        let kept_dl = dir.path().join("cccc.download");
+        std::fs::write(&locked_dl, b"in-flight").unwrap();
+        std::fs::write(&unlocked_dl, b"stale").unwrap();
+        std::fs::write(&kept_dl, b"keep-me").unwrap();
+
+        let locked_lock = crate::transport::download_lock_path(&locked_dl);
+        let guard = crate::transport::try_lock_download(&locked_lock)
+            .unwrap()
+            .expect("lock acquired");
+
+        let mut removed_while_locked = Vec::new();
+        prune_with(dir.path(), Some("cccc"), |path| {
+            let lock_path = crate::transport::download_lock_path(path);
+            let contended = crate::transport::try_lock_download(&lock_path).unwrap();
+            assert!(
+                contended.is_none(),
+                "download lock must remain held across removal of {}",
+                path.display()
+            );
+            removed_while_locked.push(path.to_path_buf());
+        });
+
+        assert_eq!(removed_while_locked, vec![unlocked_dl.clone()]);
+        assert!(locked_dl.exists(), "locked download must not be pruned");
+        assert!(!unlocked_dl.exists(), "unlocked download must be pruned");
+        assert!(kept_dl.exists(), "kept download must not be pruned");
+        assert!(locked_lock.exists(), "lock file must not be removed");
+        drop(guard);
+
+        prune(dir.path(), Some("cccc"));
+        assert!(!locked_dl.exists(), "released download should now prune");
+        assert!(locked_lock.exists(), "lock file stays intact");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_reports_unrecovered_relaunch_failure_and_clears_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_bundle = PathBuf::from("/Applications/TableView.app");
+        let log_path = dir.path().join("relaunch-test-42.log");
+        let marker_path = install::relaunch_marker_path(dir.path(), &primary_bundle);
+        let marker = install::RelaunchFailure {
+            version: "0.2.42".to_owned(),
+            build: 42,
+            installed: primary_bundle.clone(),
+            backup_path: PathBuf::from("/Applications/.tableview-update-42/unpack/TableView.app"),
+            log_path: log_path.clone(),
+            reason: "open failed".to_owned(),
+        };
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        // A separate copy at a different bundle path must neither clear nor report this marker.
+        let other_host = Arc::new(FakeHost::default());
+        let mut other_installer = FakeInstaller::new(true);
+        other_installer.bundle_path = Some(PathBuf::from("/Applications/TableView-Copy.app"));
+        let other_installer = Arc::new(other_installer);
+        let other_config = Config {
+            feed_url: "http://127.0.0.1:9/update.json".to_owned(),
+            origins: Origins::github(),
+            public_key: signing_key().verifying_key(),
+            build: 42,
+            os_version: OsVersion::parse("14.0").unwrap(),
+            state_dir: dir.path().to_path_buf(),
+            background_checks: false,
+            automatic_default: true,
+            schedule: Schedule::default(),
+            user_agent: "TableView/test".to_owned(),
+        };
+        let other_updater = Updater::start(
+            other_config,
+            other_installer.clone(),
+            other_host,
+            &Handle::current(),
+        )
+        .unwrap();
+        for _ in 0..200 {
+            if !other_installer.log().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(other_installer.log(), ["clean"]);
+        assert!(marker_path.exists());
+        drop(other_updater);
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let old_marker_path = install::relaunch_marker_path(old_dir.path(), &primary_bundle);
+        let old_log_path = old_dir.path().join("relaunch-test-42.log");
+        let old_marker = install::RelaunchFailure {
+            log_path: old_log_path.clone(),
+            ..marker.clone()
+        };
+        std::fs::write(&old_marker_path, serde_json::to_vec(&old_marker).unwrap()).unwrap();
+        let old_fixture = Fixture::with(41, true, false, old_dir).await;
+        let status = old_fixture
+            .settle(|s| matches!(s, UpdateStatus::Failed(UpdateFailure::RelaunchRecovery { .. })))
+            .await;
+        assert_eq!(
+            status,
+            UpdateStatus::Failed(UpdateFailure::RelaunchRecovery {
+                version: "0.2.42".to_owned(),
+                log_path: old_log_path.display().to_string(),
+            })
+        );
+        assert!(
+            old_fixture.logged("clean").is_empty(),
+            "leftover backup must not be deleted on failed relaunch startup"
+        );
+        assert!(old_marker_path.exists());
+
+        // Retrying a check from RelaunchRecovery can still find and stage the update cleanly.
+        old_fixture.publish(42);
+        assert!(matches!(old_fixture.check().await, UpdateStatus::Ready { .. }));
+
+        let new_fixture = Fixture::with(42, true, false, dir).await;
+        for _ in 0..200 {
+            if !new_fixture.logged("clean").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(new_fixture.logged("clean"), ["clean"]);
+        assert!(!marker_path.exists());
     }
 }

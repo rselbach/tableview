@@ -5270,7 +5270,10 @@ fn update_version_key(status: &UpdateStatus) -> Option<&str> {
         | UpdateStatus::Downloading { version, .. }
         | UpdateStatus::Installing { version } => Some(version.as_str()),
         UpdateStatus::Failed(UpdateFailure::RequiresNewerOs { version, .. })
-        | UpdateStatus::Failed(UpdateFailure::Relaunch { version }) => Some(version.as_str()),
+        | UpdateStatus::Failed(UpdateFailure::Relaunch { version })
+        | UpdateStatus::Failed(UpdateFailure::RelaunchRecovery { version, .. }) => {
+            Some(version.as_str())
+        }
         _ => None,
     }
 }

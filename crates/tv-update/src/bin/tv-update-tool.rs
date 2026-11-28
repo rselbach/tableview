@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn sealed_feed_with_test_key_fails_verify_feed() {
         let dir = tempfile::tempdir().unwrap();
-        let url = "https://github.com/rselbach/tableview/releases/download/v0.2.0/TableView-0.2.0-macos-arm64";
+        let url = "https://github.com/rselbach/TableView/releases/download/v0.2.0/TableView-0.2.0-macos-arm64";
         let artifact = |kind: &str| Artifact {
             os: tv_update::OS.to_owned(),
             arch: tv_update::ARCH.to_owned(),

@@ -112,12 +112,10 @@ impl UpdateBridge {
             updater: Arc::clone(&updater_slot),
         });
 
-        let installer = Arc::new(MacInstaller::new(
-            bundle.path,
-            bundle.build,
-            bundle.os_version,
-            Vec::new(),
-        ));
+        let installer = Arc::new(
+            MacInstaller::new(bundle.path, bundle.build, bundle.os_version, Vec::new())
+                .with_state_dir(state_dir.clone()),
+        );
         let config = Config {
             feed_url: tv_update::FEED_URL.to_owned(),
             origins: Origins::github(),

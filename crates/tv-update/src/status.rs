@@ -15,6 +15,8 @@ pub enum UpdateFailure {
     Install,
     /// The new bundle is already in place, but relaunch scheduling failed.
     Relaunch { version: String },
+    /// A previous restart-to-update did not launch the target build at this path.
+    RelaunchRecovery { version: String, log_path: String },
     /// The latest release requires a newer macOS version.
     RequiresNewerOs { version: String, minimum_os: String },
 }
@@ -78,6 +80,7 @@ impl UpdateStatus {
                 | Self::Installing { .. }
                 | Self::Available { .. }
                 | Self::Failed(UpdateFailure::Relaunch { .. })
+                | Self::Failed(UpdateFailure::RelaunchRecovery { .. })
         )
     }
 
@@ -99,6 +102,9 @@ impl UpdateStatus {
             }
             UpdateFailure::Relaunch { version } => format!(
                 "TableView {version} is installed, but TableView couldn't restart itself. Quit and reopen it to finish."
+            ),
+            UpdateFailure::RelaunchRecovery { version, log_path } => format!(
+                "TableView {version} didn't finish restarting. Check for updates to try again, or inspect {log_path}."
             ),
             UpdateFailure::RequiresNewerOs { version, minimum_os } => {
                 format!("TableView {version} requires macOS {minimum_os} or later.")

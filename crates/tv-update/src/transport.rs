@@ -129,11 +129,11 @@ impl Transport {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|error| io_error("create", dir, &error))?;
-        let lock_path = dir.join(format!("{}.download.lock", artifact.sha256));
+        let part = dir.join(format!("{}.download", artifact.sha256));
+        let lock_path = download_lock_path(&part);
         let lock = tokio::task::spawn_blocking(move || lock_download(&lock_path))
             .await
             .map_err(|error| TransferError::Io(format!("could not lock update download: {error}")))??;
-        let part = dir.join(format!("{}.download", artifact.sha256));
         let mut retried_exact_corrupt = false;
         loop {
             let mut last = None;
@@ -331,6 +331,12 @@ fn lock_download(path: &Path) -> Result<std::fs::File, TransferError> {
     Ok(file)
 }
 
+pub(crate) fn download_lock_path(download_path: &Path) -> PathBuf {
+    let mut lock_name = download_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    PathBuf::from(lock_name)
+}
+
 pub(crate) fn try_lock_download(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     let file = open_download_lock(path)?;
     match file.try_lock() {
@@ -434,7 +440,7 @@ pub(crate) mod tests {
 
         pub(crate) fn origins(&self) -> Origins {
             Origins {
-                artifact_prefix: format!("{}/releases/", self.base),
+                artifact_prefixes: vec![format!("{}/releases/", self.base)],
                 redirect_hosts: vec!["127.0.0.1".to_owned()],
                 https_only: false,
             }

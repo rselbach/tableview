@@ -83,7 +83,7 @@ impl Release {
 /// Allowed origins for release artifacts and HTTP redirects.
 #[derive(Debug, Clone)]
 pub struct Origins {
-    pub artifact_prefix: String,
+    pub artifact_prefixes: Vec<String>,
     pub redirect_hosts: Vec<String>,
     pub https_only: bool,
 }
@@ -92,7 +92,12 @@ impl Origins {
     /// TableView's GitHub Releases and Pages hosts.
     pub fn github() -> Self {
         Self {
-            artifact_prefix: "https://github.com/rselbach/tableview/releases/download/".to_owned(),
+            artifact_prefixes: [
+                "https://github.com/rselbach/TableView/releases/download/",
+                "https://github.com/rselbach/tableview/releases/download/",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             redirect_hosts: [
                 "github.com",
                 "objects.githubusercontent.com",
@@ -110,15 +115,21 @@ impl Origins {
         let Ok(parsed) = Url::parse(url) else {
             return false;
         };
+        let Some(prefix) = self
+            .artifact_prefixes
+            .iter()
+            .find(|prefix| url.starts_with(prefix.as_str()))
+        else {
+            return false;
+        };
         self.allows_scheme(&parsed)
             && parsed.as_str() == url
-            && url.starts_with(&self.artifact_prefix)
-            && url.len() > self.artifact_prefix.len()
+            && url.len() > prefix.len()
             && parsed.username().is_empty()
             && parsed.password().is_none()
             && parsed.query().is_none()
             && parsed.fragment().is_none()
-            && !url[self.artifact_prefix.len()..]
+            && !url[prefix.len()..]
                 .split('/')
                 .any(|seg| seg.is_empty() || seg == ".." || seg.eq_ignore_ascii_case("%2e%2e"))
     }
@@ -279,7 +290,10 @@ fn valid_notes_url(notes: &str) -> bool {
     let Ok(parsed) = Url::parse(notes) else {
         return false;
     };
-    let rest = parsed.path().strip_prefix("/rselbach/tableview/");
+    let rest = parsed
+        .path()
+        .strip_prefix("/rselbach/TableView/")
+        .or_else(|| parsed.path().strip_prefix("/rselbach/tableview/"));
     parsed.scheme() == "https"
         && parsed.username().is_empty()
         && parsed.password().is_none()
@@ -402,7 +416,7 @@ mod tests {
             kind: kind.to_owned(),
             minimum_os: minimum_os.to_owned(),
             url: format!(
-                "https://github.com/rselbach/tableview/releases/download/v0.2.0/TableView-0.2.0-macos-arm64.{kind}"
+                "https://github.com/rselbach/TableView/releases/download/v0.2.0/TableView-0.2.0-macos-arm64.{kind}"
             ),
             size: 1024,
             sha256: SHA.to_owned(),
@@ -417,7 +431,7 @@ mod tests {
             version: "0.2.0".to_owned(),
             build: 42,
             published_at: "2026-11-26T12:00:00Z".to_owned(),
-            notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.2.0".to_owned()),
+            notes_url: Some("https://github.com/rselbach/TableView/releases/tag/v0.2.0".to_owned()),
             highlights: vec!["Faster virtualized grid scrolling for Greendale tables".to_owned()],
             artifacts: vec![artifact(KIND_APP_ZIP, "14.0"), artifact(KIND_DMG, "14.0")],
         }
@@ -483,7 +497,7 @@ mod tests {
                 (
                     |r| {
                         r.artifacts[0].url =
-                            "https://greendale.edu/rselbach/tableview/releases/download/x.zip".to_owned()
+                            "https://greendale.edu/rselbach/TableView/releases/download/x.zip".to_owned()
                     },
                     false,
                 ),
@@ -549,24 +563,35 @@ mod tests {
     #[test]
     fn artifact_and_notes_urls_stay_on_tableview_github() {
         let origins = Origins::github();
-        assert!(origins.allows_artifact(
-            "https://github.com/rselbach/tableview/releases/download/v0.2.0/TableView-0.2.0.zip"
-        ));
+        for good in [
+            "https://github.com/rselbach/TableView/releases/download/v0.2.0/TableView-0.2.0.zip",
+            "https://github.com/rselbach/tableview/releases/download/v0.3.0/TableView-0.3.0-macos-arm64.zip",
+        ] {
+            assert!(origins.allows_artifact(good), "{good}");
+        }
         for bad in [
-            "http://github.com/rselbach/tableview/releases/download/v0.2.0/x.zip",
+            "http://github.com/rselbach/TableView/releases/download/v0.2.0/x.zip",
+            "https://github.com/rselbach/TableView/releases/download/",
             "https://github.com/rselbach/tableview/releases/download/",
-            "https://github.com/rselbach/tableview/releases/download/../../evil/x.zip",
-            "https://github.com/rselbach/tableview/releases/download/v2/%2e%2e/x.zip",
-            "https://github.com/rselbach/tableview/releases/download/v2/x.zip?token=1",
-            "https://github.com/rselbach/tableview-evil/releases/download/v2/x.zip",
+            "https://github.com/rselbach/TableView/releases/download/../../evil/x.zip",
+            "https://github.com/rselbach/TableView/releases/download/v2/%2e%2e/x.zip",
+            "https://github.com/rselbach/TableView/releases/download/v2/x.zip?token=1",
+            "https://github.com/rselbach/TableView-evil/releases/download/v2/x.zip",
+            "https://github.com/rselbach/TABLEVIEW/releases/download/v0.2.0/x.zip",
         ] {
             assert!(!origins.allows_artifact(bad), "{bad}");
         }
-        assert!(valid_notes_url(
-            "https://github.com/rselbach/tableview/releases/tag/v0.2.0"
+        for good_notes in [
+            "https://github.com/rselbach/TableView/releases/tag/v0.2.0",
+            "https://github.com/rselbach/tableview/releases/tag/v0.3.0",
+        ] {
+            assert!(valid_notes_url(good_notes), "{good_notes}");
+        }
+        assert!(!valid_notes_url(
+            "https://github.com/rselbach/TableView/releases/tag/v0.2.0?foo=bar"
         ));
         assert!(!valid_notes_url(
-            "https://github.com/rselbach/tableview/releases/tag/v0.2.0?foo=bar"
+            "https://github.com/rselbach/TABLEVIEW/releases/tag/v0.2.0"
         ));
         assert!(!valid_notes_url("https://greendale.edu/notes"));
     }

@@ -184,6 +184,42 @@ pub fn build(s: &AppState, k: &Kit) -> Option<El> {
                         .wrap(),
                 ),
         ),
+        UpdateStatus::Failed(UpdateFailure::RelaunchRecovery { version, .. }) => Some(
+            col()
+                .key("update-dock-card")
+                .w_full()
+                .padding(9.0)
+                .gap(5.0)
+                .radius(k.radius.md)
+                .fill(c.warning.bg)
+                .border(1.0, c.warning.border)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .center_y()
+                        .child(icon(&icons::UPDATE_CIRCLE, 12.0).color(c.warning.fg))
+                        .child(
+                            text(format!("v{version} Update Incomplete"))
+                                .font(k.ty.small_medium)
+                                .color(c.warning.fg)
+                                .truncate(),
+                        ),
+                )
+                .child(
+                    text("The last update didn't finish restarting. Check again to retry.")
+                        .font(k.ty.small)
+                        .color(c.text_base)
+                        .wrap(),
+                )
+                .child(accent_cta(
+                    "update-card-retry-btn",
+                    "Check Again",
+                    pal,
+                    k,
+                    |s, _| s.check_for_updates(),
+                )),
+        ),
         UpdateStatus::Failed(UpdateFailure::RequiresNewerOs { version, minimum_os })
             if !s.update.dismissed_os_warning =>
         {

@@ -1343,7 +1343,7 @@ fn sample_logs() -> Vec<crate::state::ConsoleLogEntry> {
 fn sample_ready_update_status() -> UpdateStatus {
     UpdateStatus::Ready {
         version: "0.2.0".to_owned(),
-        notes_url: Some("https://github.com/rselbach/tableview/releases/tag/v0.2.0".to_owned()),
+        notes_url: Some("https://github.com/rselbach/TableView/releases/tag/v0.2.0".to_owned()),
         highlights: vec![
             "Faster schema tree refresh across Greendale databases".to_owned(),
             "Signed auto-updates with atomic bundle swap on restart".to_owned(),

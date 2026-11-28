@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{Access, CWD, FlockOperation, RenameFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::feed::{OsVersion, Release};
 
@@ -27,10 +28,18 @@ const RELAUNCH_WAIT_TENTHS: u32 = 600;
 const WAITER: &str = r#"pid="$1"; shift; i=0
 while /bin/kill -0 "$pid" 2>/dev/null; do
   i=$((i + 1))
-  if [ "$i" -gt "$WAIT_TENTHS" ]; then exit 1; fi
+  if [ "$i" -gt "$WAIT_TENTHS" ]; then
+    printf 'relaunch timed out after %s tenths waiting for pid %s; previous bundle at %s\n' "$WAIT_TENTHS" "$pid" "${TV_BACKUP_PATH:-}" >&2
+    exit 1
+  fi
   /bin/sleep 0.1
 done
-exec "$@""#;
+"$@"
+status=$?
+if [ "$status" -ne 0 ]; then
+  printf 'relaunch command failed with exit code %s; target=%s; previous bundle at %s\n' "$status" "${TV_TARGET_APP:-}" "${TV_BACKUP_PATH:-}" >&2
+  exit "$status"
+fi"#;
 
 /// Metadata about the currently executing signed macOS `.app` bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +200,129 @@ impl Staged {
 struct Receipt {
     installed: PathBuf,
     build: u64,
+}
+
+/// Persisted record written when post-swap relaunch times out or exits non-zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaunchFailure {
+    pub version: String,
+    pub build: u64,
+    pub installed: PathBuf,
+    pub backup_path: PathBuf,
+    pub log_path: PathBuf,
+    pub reason: String,
+}
+
+fn bundle_tag(installed: &Path) -> String {
+    let canonical = fs::canonicalize(installed).unwrap_or_else(|_| installed.to_path_buf());
+    let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+    digest[..8].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Returns the per-bundle pending relaunch marker path managed by the updater.
+pub fn relaunch_marker_path(state_dir: &Path, installed: &Path) -> PathBuf {
+    state_dir.join(format!("relaunch-pending-{}.json", bundle_tag(installed)))
+}
+
+fn relaunch_lock_path(state_dir: &Path, installed: &Path) -> PathBuf {
+    state_dir.join(format!("relaunch-{}.lock", bundle_tag(installed)))
+}
+
+fn lock_relaunch_state(state_dir: &Path, installed: &Path) -> Result<fs::File, InstallError> {
+    let lock_path = relaunch_lock_path(state_dir, installed);
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| failed("open", &lock_path, &error))?;
+    rustix::fs::flock(&file, FlockOperation::LockExclusive)
+        .map_err(|error| InstallError::Failed(format!("could not lock {}: {error}", lock_path.display())))?;
+    Ok(file)
+}
+
+/// Reads any persisted pending/failed relaunch marker scoped to `installed` in `state_dir`.
+pub fn load_relaunch_failure(state_dir: &Path, installed: &Path) -> Option<RelaunchFailure> {
+    let bytes = fs::read(relaunch_marker_path(state_dir, installed)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Removes any persisted pending/failed relaunch marker scoped to `installed` in `state_dir`.
+pub fn clear_relaunch_failure(state_dir: &Path, installed: &Path) {
+    drop(fs::remove_file(relaunch_marker_path(state_dir, installed)));
+}
+
+/// Reconciles any pending/failed relaunch marker and runs `cleanup` under the same per-bundle lock.
+///
+/// Returns `Some(failure)` without running `cleanup` if the marker belongs to a higher target build
+/// (`running_build < failure.build`); otherwise clears confirmed diagnostics, runs `cleanup` while
+/// holding the lock, and returns `None`.
+pub fn reconcile_relaunch_on_startup(
+    state_dir: &Path,
+    installed: &Path,
+    running_build: u64,
+    cleanup: impl FnOnce(),
+) -> Option<RelaunchFailure> {
+    if fs::create_dir_all(state_dir).is_err() {
+        return None;
+    }
+    let Ok(_lock) = lock_relaunch_state(state_dir, installed) else {
+        return load_relaunch_failure(state_dir, installed)
+            .filter(|failure| running_build < failure.build);
+    };
+    if let Some(failure) = load_relaunch_failure(state_dir, installed) {
+        if running_build < failure.build {
+            return Some(failure);
+        }
+        clear_relaunch_failure(state_dir, installed);
+        let prefix = format!("relaunch-{}-", bundle_tag(installed));
+        if let Ok(entries) = fs::read_dir(state_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if let Some(name_str) = name.to_str()
+                    && let Some(rest) = name_str.strip_prefix(&prefix)
+                    && name_str.ends_with(".log")
+                    && let Some(log_build_str) = rest.split('-').next()
+                    && let Ok(log_build) = log_build_str.parse::<u64>()
+                    && log_build <= running_build
+                {
+                    drop(fs::remove_file(entry.path()));
+                }
+            }
+        }
+    }
+    cleanup();
+    None
+}
+
+fn write_relaunch_marker(marker_path: &Path, json: &[u8]) -> Result<(), InstallError> {
+    let tmp = marker_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    }
+    let write_res = options.open(&tmp).and_then(|mut file| {
+        file.write_all(json)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    });
+    if let Err(error) = write_res {
+        drop(fs::remove_file(&tmp));
+        return Err(failed("write", marker_path, &error));
+    }
+    fs::rename(&tmp, marker_path).map_err(|error| {
+        drop(fs::remove_file(&tmp));
+        failed("rename", marker_path, &error)
+    })
 }
 
 /// Returns whether `bundle` sits in a writable non-translocated directory.
@@ -359,15 +491,33 @@ pub fn apply(
     open_args: &[OsString],
     relaunch: bool,
 ) -> Result<(), ApplyError> {
+    apply_with_diagnostics(staged, running_build, pid, open_args, relaunch, None)
+}
+
+/// Atomically swaps `staged` with `installed`, optionally recording relaunch diagnostics in `state_dir`.
+pub fn apply_with_diagnostics(
+    staged: &Staged,
+    running_build: u64,
+    pid: u32,
+    open_args: &[OsString],
+    relaunch: bool,
+    state_dir: Option<&Path>,
+) -> Result<(), ApplyError> {
     let mut command = vec![OsString::from("/usr/bin/open")];
     command.extend(open_args.iter().cloned());
     command.push(staged.installed.clone().into_os_string());
     apply_with(staged, running_build, &swap, || {
-        if relaunch {
-            run_after_exit(pid, &command)
-        } else {
-            Ok(())
+        if !relaunch {
+            return Ok(());
         }
+        let diag = state_dir.map(|dir| RelaunchDiag {
+            version: staged.version(),
+            target_build: staged.build(),
+            installed: &staged.installed,
+            backup_path: &staged.app,
+            state_dir: dir,
+        });
+        run_after_exit_with_wait(pid, &command, RELAUNCH_WAIT_TENTHS, diag)
     })
 }
 
@@ -447,22 +597,107 @@ fn check_owned(staged: &Staged) -> Result<(), InstallError> {
     }
 }
 
+struct RelaunchDiag<'a> {
+    version: &'a str,
+    target_build: u64,
+    installed: &'a Path,
+    backup_path: &'a Path,
+    state_dir: &'a Path,
+}
+
+fn create_relaunch_log(
+    state_dir: &Path,
+    installed: &Path,
+    target_build: u64,
+) -> Result<(PathBuf, fs::File), InstallError> {
+    static ATTEMPT: AtomicU32 = AtomicU32::new(0);
+    let tag = bundle_tag(installed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    let pid = std::process::id();
+    for _ in 0..16 {
+        let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let log_path = state_dir.join(format!("relaunch-{tag}-{target_build}-{pid}-{nanos:x}-{attempt}.log"));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+        }
+        match options.open(&log_path) {
+            Ok(file) => return Ok((log_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(failed("open", &log_path, &error)),
+        }
+    }
+    Err(InstallError::Failed("could not create a relaunch log file".to_owned()))
+}
+
 /// Launches a detached `/bin/sh` process waiting for `pid` to exit before executing `command`.
 pub fn run_after_exit(pid: u32, command: &[OsString]) -> Result<(), InstallError> {
-    Command::new("/bin/sh")
-        .arg("-c")
+    run_after_exit_with_wait(pid, command, RELAUNCH_WAIT_TENTHS, None)
+}
+
+fn run_after_exit_with_wait(
+    pid: u32,
+    command: &[OsString],
+    wait_tenths: u32,
+    diag: Option<RelaunchDiag<'_>>,
+) -> Result<(), InstallError> {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
         .arg(WAITER)
         .arg("tableview-relaunch")
         .arg(pid.to_string())
         .args(command)
-        .env("WAIT_TENTHS", RELAUNCH_WAIT_TENTHS.to_string())
+        .env("WAIT_TENTHS", wait_tenths.to_string())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map(drop)
-        .map_err(|error| InstallError::Failed(format!("could not start the relauncher: {error}")))
+        .process_group(0);
+
+    let mut _diag_lock = None;
+    let mut pending_target: Option<(&Path, PathBuf)> = None;
+    if let Some(diag) = diag {
+        fs::create_dir_all(diag.state_dir).map_err(|error| failed("create", diag.state_dir, &error))?;
+        let canonical_installed =
+            fs::canonicalize(diag.installed).unwrap_or_else(|_| diag.installed.to_path_buf());
+        _diag_lock = Some(lock_relaunch_state(diag.state_dir, &canonical_installed)?);
+        let (log_path, log_file) =
+            create_relaunch_log(diag.state_dir, &canonical_installed, diag.target_build)?;
+        let marker_path = relaunch_marker_path(diag.state_dir, &canonical_installed);
+
+        let stderr_file = log_file.try_clone().map_err(|error| failed("clone", &log_path, &error))?;
+        let pending_record = serde_json::to_vec(&RelaunchFailure {
+            version: diag.version.to_owned(),
+            build: diag.target_build,
+            installed: canonical_installed.clone(),
+            backup_path: diag.backup_path.to_path_buf(),
+            log_path: log_path.clone(),
+            reason: format!(
+                "relaunch did not confirm startup for build {} ({})",
+                diag.target_build, diag.version
+            ),
+        })
+        .map_err(|error| InstallError::Failed(format!("could not encode pending record: {error}")))?;
+        write_relaunch_marker(&marker_path, &pending_record)?;
+
+        cmd.stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(stderr_file))
+            .env("TV_BACKUP_PATH", diag.backup_path)
+            .env("TV_TARGET_APP", &canonical_installed);
+        pending_target = Some((diag.state_dir, canonical_installed));
+    } else {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
+    cmd.spawn().map(drop).map_err(|error| {
+        if let Some((dir, installed)) = pending_target {
+            clear_relaunch_failure(dir, &installed);
+        }
+        InstallError::Failed(format!("could not start the relauncher: {error}"))
+    })
 }
 
 fn swap(a: &Path, b: &Path) -> Result<(), InstallError> {
@@ -1140,5 +1375,240 @@ pub(crate) mod tests {
 
         remove_staging_folder(&locked).unwrap();
         assert!(!locked.exists());
+    }
+
+    #[test]
+    fn relaunch_failure_and_timeout_record_log_and_marker() {
+        let root = scratch();
+        let state_dir = root.path().join("state");
+        let installed = root.path().join("Applications/TableView.app");
+        let other_installed = root.path().join("Applications/TableView Copy.app");
+        let backup = root.path().join("Applications/.tableview-update-42/unpack/TableView.app");
+
+        assert_ne!(
+            relaunch_marker_path(&state_dir, &installed),
+            relaunch_marker_path(&state_dir, &other_installed)
+        );
+
+        let mut exited = Command::new("/usr/bin/true").spawn().unwrap();
+        exited.wait().unwrap();
+        run_after_exit_with_wait(
+            exited.id(),
+            &[OsString::from("/usr/bin/false")],
+            20,
+            Some(RelaunchDiag {
+                version: "0.2.42",
+                target_build: 42,
+                installed: &installed,
+                backup_path: &backup,
+                state_dir: &state_dir,
+            }),
+        )
+        .unwrap();
+
+        let failure = load_relaunch_failure(&state_dir, &installed).expect("pending marker written");
+        assert_eq!(failure.build, 42);
+        assert_eq!(failure.backup_path, backup);
+        assert!(load_relaunch_failure(&state_dir, &other_installed).is_none());
+
+        let log_path = failure.log_path.clone();
+        let started = Instant::now();
+        let log = loop {
+            let text = fs::read_to_string(&log_path).unwrap_or_default();
+            if text.contains("relaunch command failed with exit code 1") {
+                break text;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "log missing exit failure: {text}");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        assert!(log.contains(&backup.display().to_string()), "{log}");
+
+        // A subsequent attempt for the same bundle uses a distinct log file so an earlier
+        // delayed helper cannot overwrite the newer attempt's log.
+        run_after_exit_with_wait(
+            exited.id(),
+            &[OsString::from("/usr/bin/true")],
+            20,
+            Some(RelaunchDiag {
+                version: "0.2.42",
+                target_build: 42,
+                installed: &installed,
+                backup_path: &backup,
+                state_dir: &state_dir,
+            }),
+        )
+        .unwrap();
+        let second = load_relaunch_failure(&state_dir, &installed).expect("second pending marker");
+        assert_ne!(second.log_path, log_path);
+        assert!(log_path.exists());
+        assert!(second.log_path.exists());
+
+        // Reconciling at build 42 clears logs <= 42 and the build 42 marker, holds the
+        // per-bundle lock across cleanup, and preserves higher-build (43) diagnostics.
+        let other_marker = relaunch_marker_path(&state_dir, &other_installed);
+        fs::write(&other_marker, b"{}").unwrap();
+        let build_43_log = create_relaunch_log(&state_dir, &installed, 43).unwrap().0;
+        let lock_path = relaunch_lock_path(&state_dir, &installed);
+        let assert_lock_held = || {
+            let probe = fs::OpenOptions::new().read(true).write(true).open(&lock_path).unwrap();
+            assert!(
+                rustix::fs::flock(&probe, FlockOperation::NonBlockingLockExclusive).is_err(),
+                "per-bundle relaunch lock must remain held across cleanup"
+            );
+        };
+        let mut cleaned = false;
+        assert!(
+            reconcile_relaunch_on_startup(&state_dir, &installed, 42, || {
+                assert_lock_held();
+                cleaned = true;
+            })
+            .is_none()
+        );
+        assert!(cleaned);
+        assert!(load_relaunch_failure(&state_dir, &installed).is_none());
+        assert!(!log_path.exists());
+        assert!(!second.log_path.exists());
+        assert!(build_43_log.exists(), "log for higher build 43 must survive build 42 cleanup");
+        assert!(other_marker.exists());
+
+        // Even with no marker present, cleanup still runs under the per-bundle lock.
+        let mut no_marker_cleaned = false;
+        assert!(
+            reconcile_relaunch_on_startup(&state_dir, &installed, 42, || {
+                assert_lock_held();
+                no_marker_cleaned = true;
+            })
+            .is_none()
+        );
+        assert!(no_marker_cleaned);
+
+        // If the state directory cannot be established, cleanup must be skipped rather than run unlocked.
+        let blocked_state = root.path().join("not-a-directory");
+        fs::write(&blocked_state, b"file").unwrap();
+        let mut skipped_unlocked = true;
+        assert!(
+            reconcile_relaunch_on_startup(&blocked_state, &installed, 42, || {
+                skipped_unlocked = false;
+            })
+            .is_none()
+        );
+        assert!(skipped_unlocked, "cleanup must never run when state dir cannot be locked");
+
+        // If a newer build (43) publishes its marker before build 42 reconciles, build 42
+        // sees build 43 under the shared lock, skips cleanup, and deletes neither marker nor log.
+        run_after_exit_with_wait(
+            exited.id(),
+            &[OsString::from("/usr/bin/true")],
+            20,
+            Some(RelaunchDiag {
+                version: "0.2.43",
+                target_build: 43,
+                installed: &installed,
+                backup_path: &backup,
+                state_dir: &state_dir,
+            }),
+        )
+        .unwrap();
+        let racing = load_relaunch_failure(&state_dir, &installed).unwrap();
+        let mut skipped_cleanup = true;
+        let seen = reconcile_relaunch_on_startup(&state_dir, &installed, 42, || {
+            skipped_cleanup = false;
+        })
+        .expect("must report build 43");
+        assert!(skipped_cleanup, "cleanup must not run when higher-build marker is active");
+        assert_eq!(seen.build, 43);
+        assert!(load_relaunch_failure(&state_dir, &installed).is_some());
+        assert!(racing.log_path.exists());
+        let mut confirmed_cleanup = false;
+        assert!(
+            reconcile_relaunch_on_startup(&state_dir, &installed, 43, || {
+                assert_lock_held();
+                confirmed_cleanup = true;
+            })
+            .is_none()
+        );
+        assert!(confirmed_cleanup);
+        assert!(load_relaunch_failure(&state_dir, &installed).is_none());
+        assert!(!racing.log_path.exists());
+        assert!(!build_43_log.exists());
+
+        // Even when the launch command itself exits 0 (e.g. `open` before app crash),
+        // the pending marker remains until the updated build confirms startup.
+        let state_crash = root.path().join("state-crash");
+        let done = root.path().join("launch-done");
+        run_after_exit_with_wait(
+            exited.id(),
+            &[OsString::from("/usr/bin/touch"), done.clone().into_os_string()],
+            20,
+            Some(RelaunchDiag {
+                version: "0.2.42",
+                target_build: 42,
+                installed: &installed,
+                backup_path: &backup,
+                state_dir: &state_crash,
+            }),
+        )
+        .unwrap();
+        let started = Instant::now();
+        while !done.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(done.exists());
+        let pending = load_relaunch_failure(&state_crash, &installed).expect("pending marker must remain");
+        assert!(pending.reason.contains("did not confirm startup"), "{pending:?}");
+
+        // A delayed helper timing out writes only to its own attempt log and never recreates
+        // a cleared marker or clobbers a newer attempt's log.
+        let state_timeout = root.path().join("state-timeout");
+        let mut sleeper = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        run_after_exit_with_wait(
+            sleeper.id(),
+            &[OsString::from("/usr/bin/true")],
+            2,
+            Some(RelaunchDiag {
+                version: "0.2.42",
+                target_build: 42,
+                installed: &installed,
+                backup_path: &backup,
+                state_dir: &state_timeout,
+            }),
+        )
+        .unwrap();
+        let first_timeout = load_relaunch_failure(&state_timeout, &installed).unwrap();
+
+        clear_relaunch_failure(&state_timeout, &installed);
+        run_after_exit_with_wait(
+            exited.id(),
+            &[OsString::from("/usr/bin/false")],
+            20,
+            Some(RelaunchDiag {
+                version: "0.2.43",
+                target_build: 43,
+                installed: &installed,
+                backup_path: &backup,
+                state_dir: &state_timeout,
+            }),
+        )
+        .unwrap();
+        let newer = load_relaunch_failure(&state_timeout, &installed).unwrap();
+        assert_ne!(newer.log_path, first_timeout.log_path);
+
+        let started = Instant::now();
+        let timeout_log = loop {
+            let text = fs::read_to_string(&first_timeout.log_path).unwrap_or_default();
+            if text.contains("relaunch timed out") {
+                break text;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "timeout log missing: {text}");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        drop(sleeper.kill());
+        drop(sleeper.wait());
+
+        assert!(timeout_log.contains("relaunch timed out"), "{timeout_log}");
+        let latest = load_relaunch_failure(&state_timeout, &installed).expect("newer marker untouched");
+        assert_eq!(latest.build, 43);
+        let newer_log = fs::read_to_string(&newer.log_path).unwrap_or_default();
+        assert!(!newer_log.contains("relaunch timed out"), "{newer_log}");
     }
 }

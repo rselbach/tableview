@@ -14,7 +14,7 @@ pub use status::{UpdateAction, UpdateFailure, UpdateSnapshot, UpdateStatus};
 pub use updater::{Config, Host, Installer, MacInstaller, Schedule, Updater};
 
 /// Signed release feed served on GitHub Pages.
-pub const FEED_URL: &str = "https://rselbach.github.io/tableview/update.json";
+pub const FEED_URL: &str = "https://rselbach.github.io/TableView/update.json";
 
 /// Release signing Ed25519 public key (base64).
 pub const PUBLIC_KEY: &str = "2obyIySbPw8xSuXQwzSw2sCbOixUww08jk95se82unc=";
