@@ -207,11 +207,70 @@ impl ConnectionStore {
         &self.path
     }
 
-    /// Loads saved connections from disk, returning empty defaults if the file does not exist yet.
+    /// Loads saved connections from disk, returning empty defaults when the file does not exist yet.
     pub fn load(&self) -> Result<StoreData, StorageError> {
         match fs::read_to_string(&self.path) {
             Ok(raw) => serde_json::from_str(&raw).map_err(|e| StorageError::Parse(e.to_string())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StoreData::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                check_missing_or_dangling_symlink(&self.path, "connections file")?;
+                Ok(StoreData::default())
+            }
+            Err(err) => Err(StorageError::Io(err.to_string())),
+        }
+    }
+
+    /// Moves an existing corrupt or unreadable store out of the way to a unique sibling backup path
+    /// and initializes an empty store in its place.
+    pub fn backup_and_reset(&self) -> Result<Option<PathBuf>, StorageError> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {
+                let parent = self
+                    .path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let file_name = self
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("connections.json");
+                let stamp = Utc::now().timestamp_millis();
+                let mut backup_path = None;
+                for attempt in 0u32..1000 {
+                    let suffix = if attempt == 0 {
+                        format!("{file_name}.backup-{stamp}")
+                    } else {
+                        format!("{file_name}.backup-{stamp}-{attempt}")
+                    };
+                    let candidate = parent.join(suffix);
+                    match fs::symlink_metadata(&candidate) {
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            backup_path = Some(candidate);
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(err) => return Err(StorageError::Io(err.to_string())),
+                    }
+                }
+                let backup_path = backup_path.ok_or_else(|| {
+                    StorageError::Io("unable to allocate unique backup path for connections file".to_owned())
+                })?;
+                fs::rename(&self.path, &backup_path).map_err(|e| StorageError::Io(e.to_string()))?;
+                if let Err(save_err) = self.save(&StoreData::default()) {
+                    if let Err(restore_err) = fs::rename(&backup_path, &self.path) {
+                        return Err(StorageError::Io(format!(
+                            "{save_err}; also failed to restore backup from {}: {restore_err}",
+                            backup_path.display()
+                        )));
+                    }
+                    return Err(save_err);
+                }
+                Ok(Some(backup_path))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.save(&StoreData::default())?;
+                Ok(None)
+            }
             Err(err) => Err(StorageError::Io(err.to_string())),
         }
     }
@@ -253,23 +312,10 @@ impl SettingsStore {
     pub fn load(&self) -> Result<AppSettings, StorageError> {
         match fs::read_to_string(&self.path) {
             Ok(raw) => serde_json::from_str(&raw).map_err(|e| StorageError::Parse(e.to_string())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match fs::symlink_metadata(&self.path) {
-                Ok(_) => Err(StorageError::Io(format!(
-                    "settings file {} is a dangling symbolic link",
-                    self.path.display()
-                ))),
-                Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
-                    if path_or_ancestor_is_dangling_symlink(&self.path) {
-                        Err(StorageError::Io(format!(
-                            "settings path {} traverses a dangling symbolic link",
-                            self.path.display()
-                        )))
-                    } else {
-                        Ok(AppSettings::default())
-                    }
-                }
-                Err(meta_err) => Err(StorageError::Io(meta_err.to_string())),
-            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                check_missing_or_dangling_symlink(&self.path, "settings file")?;
+                Ok(AppSettings::default())
+            }
             Err(err) => Err(StorageError::Io(err.to_string())),
         }
     }
@@ -277,6 +323,26 @@ impl SettingsStore {
     /// Atomically writes settings via a temporary sibling file and rename.
     pub fn save(&self, settings: &AppSettings) -> Result<(), StorageError> {
         atomic_write_json(&self.path, settings)
+    }
+}
+
+fn check_missing_or_dangling_symlink(path: &Path, label: &str) -> Result<(), StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(StorageError::Io(format!(
+            "{label} {} is a dangling symbolic link",
+            path.display()
+        ))),
+        Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
+            if path_or_ancestor_is_dangling_symlink(path) {
+                Err(StorageError::Io(format!(
+                    "{label} {} traverses a dangling symbolic link",
+                    path.display()
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        Err(meta_err) => Err(StorageError::Io(meta_err.to_string())),
     }
 }
 

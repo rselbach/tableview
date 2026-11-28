@@ -334,8 +334,7 @@ fn build_main_panel(s: &AppState, k: &Kit, layer: &mut Vec<El>) -> El {
             )
             .separator()
             .item(MenuItem::new("Delete").danger(true).on_select(move |s: &mut AppState| {
-                s.launcher_context_menu = None;
-                s.overlay = crate::state::OverlayState::DeleteConfirm(id);
+                s.open_delete_confirm(id);
             }))
             .on_close(|s: &mut AppState| s.launcher_context_menu = None)
             .build(k, layer)
@@ -343,19 +342,82 @@ fn build_main_panel(s: &AppState, k: &Kit, layer: &mut Vec<El>) -> El {
         list_body
     };
 
-    col()
+    let mut main_col = col()
         .key("launcher-main")
         .grow(1.0)
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
         .fill(c.bg_deep)
-        .child(top_bar)
-        .child(menu_wrapped_body)
+        .child(top_bar);
+    if let Some(ref err) = s.store_load_error {
+        main_col = main_col.child(build_store_load_banner(s, err, k));
+    }
+    main_col.child(menu_wrapped_body)
+}
+
+fn build_store_load_banner(s: &AppState, err: &str, k: &Kit) -> El {
+    let c = &k.c;
+    let mut actions = row().gap(8.0).center_y().child(
+        Button::new("Retry Load")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut AppState| s.retry_load_connections())
+            .build(k)
+            .key("launcher-store-retry"),
+    );
+    if s.persist_enabled {
+        actions = actions.child(
+            Button::new("Back Up & Start Fresh")
+                .variant(ButtonVariant::Danger)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut AppState| s.backup_and_reset_connection_store())
+                .build(k)
+                .key("launcher-store-reset"),
+        );
+    }
+
+    row()
+        .key("launcher-store-error")
+        .w_full()
+        .px(18.0)
+        .py(10.0)
+        .gap(12.0)
+        .center_y()
+        .fill(c.danger.bg)
+        .border_sides([0.0, 0.0, 1.0, 0.0], c.danger.border)
+        .child(
+            el()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(text(err).font(k.ty.ui_compact).color(c.danger.fg).wrap().w_full()),
+        )
+        .child(actions)
 }
 
 fn build_empty_state(s: &AppState, k: &Kit) -> El {
     let c = &k.c;
+    if s.store_load_error.is_some() {
+        return col()
+            .key("launcher-empty")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .center()
+            .gap(10.0)
+            .padding(32.0)
+            .child(icon(&icons::DATABASE, 36.0).color(c.icon_faint))
+            .child(
+                text("Unable to load saved connections")
+                    .font(k.ty.body_medium)
+                    .color(c.text_base),
+            )
+            .child(
+                text("Your connections file was preserved on disk. Fix or reload it, or back it up to start fresh.")
+                    .font(k.ty.ui)
+                    .color(c.text_muted),
+            );
+    }
     let is_filtered = !s.launcher_search.text.trim().is_empty() || s.env_filter.is_some();
     let title = if is_filtered {
         "No connections match this filter"

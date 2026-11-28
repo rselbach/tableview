@@ -465,7 +465,25 @@ pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut
     }
 
     let testing = matches!(form.test_status, TestStatus::Testing(_));
-    let can_test = !testing && s.worker.is_some();
+    let saving = form.saving_req_id.is_some();
+    if saving {
+        feedback = feedback.child(
+            row()
+                .w_full()
+                .padding(8.0)
+                .gap(8.0)
+                .center_y()
+                .radius(k.radius.sm)
+                .fill(c.layer_03)
+                .child(Spinner::new().size(13.0).color(c.icon_muted).build(k))
+                .child(
+                    text("Saving profile and updating keychain…")
+                        .font(k.ty.ui_compact)
+                        .color(c.text_muted),
+                ),
+        );
+    }
+    let can_test = !testing && !saving && s.worker.is_some();
 
     let footer = row()
         .key("form-footer")
@@ -486,13 +504,14 @@ pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut
             Button::new("Cancel")
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Regular)
-                .on_press(|s: &mut AppState| s.overlay = OverlayState::None)
+                .on_press(|s: &mut AppState| s.dismiss_connection_form())
                 .build(k),
         )
         .child(
-            Button::new("Save")
+            Button::new(if saving { "Saving…" } else { "Save" })
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Regular)
+                .disabled(saving)
                 .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.save_connection_form(false, tx))
                 .build(k),
         )
@@ -500,6 +519,7 @@ pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut
             Button::new("Connect")
                 .variant(ButtonVariant::Contrast)
                 .control_size(ControlSize::Regular)
+                .disabled(saving)
                 .on_press_tx(|s: &mut AppState, tx: &mut Tx| s.save_connection_form(true, tx))
                 .build(k),
         );
@@ -512,7 +532,7 @@ pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut
         .gap(12.0)
         .on_key_preview(|s: &mut AppState, ev, tx| {
             if ev.key == Key::Escape {
-                s.overlay = OverlayState::None;
+                s.dismiss_connection_form();
                 return true;
             }
             if ev.key == Key::Enter && ev.mods.cmd {
@@ -530,7 +550,7 @@ pub fn build_form(s: &AppState, form: &ConnectionFormState, k: &Kit, layer: &mut
         .open(true)
         .width(560.0)
         .fit()
-        .on_close(|s: &mut AppState| s.overlay = OverlayState::None)
+        .on_close(|s: &mut AppState| s.dismiss_connection_form())
         .child(body)
         .build(k, layer);
 }
@@ -672,14 +692,19 @@ pub fn build_password_prompt(prompt: &PasswordPromptState, k: &Kit, layer: &mut 
 
 /// Builds the confirmation dialog before deleting a connection profile.
 pub fn build_delete_confirm(s: &AppState, id: ConnectionId, k: &Kit, layer: &mut Vec<El>) {
+    let c = &k.c;
     let name = s
         .connections
         .iter()
         .find(|c| c.id == id)
         .map(|c| c.name.as_str())
         .unwrap_or("this connection");
+    let deleting = s
+        .pending_profile_delete
+        .as_ref()
+        .is_some_and(|p| p.connection_id == id);
 
-    let body = col()
+    let mut body = col()
         .w_full()
         .px(20.0)
         .pb(18.0)
@@ -689,36 +714,54 @@ pub fn build_delete_confirm(s: &AppState, id: ConnectionId, k: &Kit, layer: &mut
                 "Delete \"{name}\" and remove any stored password from your keychain?"
             ))
             .font(k.ty.ui)
-            .color(k.c.text_muted)
+            .color(c.text_muted)
             .wrap()
             .w_full(),
-        )
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .child(spacer())
-                .child(
-                    Button::new("Cancel")
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(ControlSize::Regular)
-                        .on_press(|s: &mut AppState| s.overlay = OverlayState::None)
-                        .build(k),
-                )
-                .child(
-                    Button::new("Delete")
-                        .variant(ButtonVariant::Danger)
-                        .control_size(ControlSize::Regular)
-                        .on_press(move |s: &mut AppState| s.delete_connection(id))
-                        .build(k),
-                ),
         );
+    if let Some(ref err) = s.delete_confirm_error {
+        body = body.child(
+            el()
+                .key("delete-confirm-error")
+                .w_full()
+                .padding(8.0)
+                .radius(k.radius.sm)
+                .fill(c.danger.bg)
+                .border(0.5, c.danger.border)
+                .child(text(err).font(k.ty.ui_compact).color(c.danger.fg).wrap().w_full()),
+        );
+    }
+    body = body.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .child(spacer())
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(ControlSize::Regular)
+                    .disabled(deleting)
+                    .on_press(|s: &mut AppState| s.close_delete_confirm())
+                    .build(k),
+            )
+            .child(
+                Button::new(if deleting { "Deleting…" } else { "Delete" })
+                    .variant(ButtonVariant::Danger)
+                    .control_size(ControlSize::Regular)
+                    .disabled(deleting)
+                    .on_press(move |s: &mut AppState| s.delete_connection(id))
+                    .build(k),
+            ),
+    );
 
     Dialog::new("delete-confirm", "Delete Connection")
         .open(true)
         .width(420.0)
         .fit()
-        .on_close(|s: &mut AppState| s.overlay = OverlayState::None)
+        .on_close(|s: &mut AppState| {
+            if s.pending_profile_delete.is_none() {
+                s.close_delete_confirm();
+            }
+        })
         .child(body)
         .build(k, layer);
 }

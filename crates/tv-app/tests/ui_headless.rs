@@ -15,11 +15,11 @@ use tv_app::state::{
     ConsoleLogEntry, OverlayState, PickerKind, RowKey, Screen, SessionState, SidebarTab, TableViewMode,
 };
 use tv_app::views;
-use tv_app::worker::{SessionConnector, WorkerBridge, WorkerCmd};
+use tv_app::worker::{CredentialBackend, SessionConnector, WorkerBridge, WorkerCmd};
 use tv_core::{
-    AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbEngine, DbError,
-    DbObject, DbObjectKind, DbSession, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef,
-    IndexInfo, MysqlQuoteMode, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult,
+    AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, ConnectionStore, DatabaseInfo,
+    DbEngine, DbError, DbObject, DbObjectKind, DbSession, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow,
+    ForeignKeyRef, IndexInfo, MysqlQuoteMode, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult,
     QueryStatementResult, SafetyPolicy, SchemaInfo, ServerInfo, SettingsStore, SqlSessionMode, StoreData, TablePage,
     TableStats, TableStructure, TransactionOutcome, connect_session,
 };
@@ -8165,4 +8165,693 @@ fn postgres_aux_errors_staged_commit_and_concurrent_tabs_keep_mode_in_sync() {
             "cancelled query must still be filtered from history under dispatch-time scs=off"
         );
     }
+}
+
+#[test]
+fn corrupt_connection_store_preserves_file_and_supports_recovery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("connections.json");
+
+    let mut initial = StoreData::default();
+    let greendale = ConnectionProfile::new_postgres("study_group_db", "127.0.0.1", "annie_edison");
+    initial.upsert(greendale.clone());
+    ConnectionStore::at(store_path.clone())
+        .save(&initial)
+        .expect("seed valid connections json");
+
+    // Overwrite with corrupt JSON and load into launcher.
+    let corrupt_payload = "{corrupt greendale connections json";
+    std::fs::write(&store_path, corrupt_payload).expect("write corrupt connections json");
+
+    let mut rt = empty_runtime(true);
+    rt.update(|s, _| {
+        s.persist_enabled = true;
+        s.load_connections_from(store_path.clone());
+    });
+    rt.frame(0.1);
+
+    assert!(rt.state.store_load_error.is_some());
+    assert!(rt.state.connections.is_empty());
+    assert!(rt.find("launcher-store-error").is_some());
+    assert!(rt.find("launcher-store-retry").is_some());
+    assert!(rt.find("launcher-store-reset").is_some());
+
+    // Attempting to save a new connection must fail rather than clobbering the corrupt file.
+    rt.update(|s, tx| {
+        s.open_new_connection_form(tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("should_not_overwrite");
+        }
+        s.save_connection_form(false, tx);
+    });
+    rt.frame(0.1);
+    assert!(matches!(rt.state.overlay, OverlayState::ConnectionForm(_)));
+    if let OverlayState::ConnectionForm(ref form) = rt.state.overlay {
+        assert!(
+            form.validation_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Failed to save connection profile")),
+            "expected save block validation error, got {:?}",
+            form.validation_error
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&store_path).expect("corrupt file unchanged"),
+        corrupt_payload
+    );
+    assert!(rt.state.persist_connections().is_err());
+
+    // Repair the file on disk and click Retry Load -> restores profiles and clears banner.
+    rt.update(|s, _| s.dismiss_connection_form());
+    ConnectionStore::at(store_path.clone())
+        .save(&initial)
+        .expect("restore repaired connections json");
+    rt.frame(0.1);
+    let (rx, ry) = rt.find("launcher-store-retry").expect("retry load button");
+    rt.pointer_down(rx, ry);
+    rt.pointer_up(rx, ry);
+    rt.frame(0.1);
+
+    assert!(rt.state.store_load_error.is_none());
+    assert!(rt.find("launcher-store-error").is_none());
+    assert_eq!(rt.state.connections.len(), 1);
+    assert_eq!(rt.state.connections[0].name, "study_group_db");
+
+    // Corrupt again and click Back Up & Start Fresh -> preserves backup file and re-enables saves.
+    let second_corrupt = "{second corrupt greendale store";
+    std::fs::write(&store_path, second_corrupt).expect("write second corrupt json");
+    rt.update(|s, _| s.load_connections_from(store_path.clone()));
+    rt.frame(0.1);
+    assert!(rt.find("launcher-store-reset").is_some());
+
+    let (bx, by) = rt.find("launcher-store-reset").expect("backup & reset button");
+    rt.pointer_down(bx, by);
+    rt.pointer_up(bx, by);
+    rt.frame(0.1);
+
+    assert!(rt.state.store_load_error.is_none());
+    assert!(rt.find("launcher-store-error").is_none());
+    assert!(rt.state.connections.is_empty());
+
+    let backups: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read tempdir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".backup-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "expected exactly one backup file");
+    assert_eq!(
+        std::fs::read_to_string(backups[0].path()).expect("read backup payload"),
+        second_corrupt
+    );
+
+    rt.update(|s, tx| {
+        s.open_new_connection_form(tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("dean_office_db");
+        }
+        s.save_connection_form(false, tx);
+    });
+    rt.frame(0.1);
+    let persisted = ConnectionStore::at(store_path).load().expect("reload fresh store");
+    assert_eq!(persisted.connections.len(), 1);
+    assert_eq!(persisted.connections[0].name, "dean_office_db");
+}
+
+struct MockCredentialBackend {
+    secrets: Mutex<std::collections::HashMap<String, (String, String)>>,
+    ops_log: Mutex<Vec<String>>,
+    fail_read: Mutex<Option<String>>,
+    fail_write: Mutex<Option<String>>,
+    fail_delete: Mutex<Option<String>>,
+    delete_chmod_readonly: Mutex<Option<std::path::PathBuf>>,
+    write_delay: Mutex<Duration>,
+    write_calls: AtomicUsize,
+}
+
+impl MockCredentialBackend {
+    fn new() -> Self {
+        Self {
+            secrets: Mutex::new(std::collections::HashMap::new()),
+            ops_log: Mutex::new(Vec::new()),
+            fail_read: Mutex::new(None),
+            fail_write: Mutex::new(None),
+            fail_delete: Mutex::new(None),
+            delete_chmod_readonly: Mutex::new(None),
+            write_delay: Mutex::new(Duration::ZERO),
+            write_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CredentialBackend for MockCredentialBackend {
+    fn read(&self, service: &str) -> Result<Option<String>, String> {
+        self.ops_log
+            .lock()
+            .expect("ops_log")
+            .push(format!("read:{service}"));
+        if let Some(err) = self.fail_read.lock().expect("fail_read").clone() {
+            return Err(err);
+        }
+        Ok(self
+            .secrets
+            .lock()
+            .expect("secrets")
+            .get(service)
+            .map(|(_, secret)| secret.clone()))
+    }
+
+    fn write(&self, service: &str, account: &str, secret: &str) -> Result<(), String> {
+        self.write_calls.fetch_add(1, Ordering::AcqRel);
+        self.ops_log
+            .lock()
+            .expect("ops_log")
+            .push(format!("start_write:{service}:{secret}"));
+        let delay = *self.write_delay.lock().expect("write_delay");
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        if let Some(err) = self.fail_write.lock().expect("fail_write").clone() {
+            self.ops_log
+                .lock()
+                .expect("ops_log")
+                .push(format!("write:{service}:{secret}"));
+            return Err(err);
+        }
+        self.secrets
+            .lock()
+            .expect("secrets")
+            .insert(service.to_owned(), (account.to_owned(), secret.to_owned()));
+        self.ops_log
+            .lock()
+            .expect("ops_log")
+            .push(format!("write:{service}:{secret}"));
+        Ok(())
+    }
+
+    fn delete(&self, service: &str) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        self.ops_log
+            .lock()
+            .expect("ops_log")
+            .push(format!("delete:{service}"));
+        if let Some(path) = self.delete_chmod_readonly.lock().expect("delete_chmod_readonly").as_ref() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+                .expect("chmod store readonly during delete");
+        }
+        if let Some(err) = self.fail_delete.lock().expect("fail_delete").clone() {
+            return Err(err);
+        }
+        self.secrets.lock().expect("secrets").remove(service);
+        Ok(())
+    }
+}
+
+#[test]
+fn profile_and_keychain_save_failures_report_recover_and_serialize() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreWritable(std::path::PathBuf);
+    impl Drop for RestoreWritable {
+        fn drop(&mut self) {
+            drop(std::fs::set_permissions(
+                &self.0,
+                std::fs::Permissions::from_mode(0o644),
+            ));
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("connections.json");
+    let store = ConnectionStore::at(store_path.clone());
+    store.save(&StoreData::default()).expect("seed empty store");
+
+    let cluster = MockCluster::new(Duration::ZERO);
+    cluster.set_expected_password(Some("human_beings"));
+    let cred_backend = Arc::new(MockCredentialBackend::new());
+    let cred_trait: Arc<dyn CredentialBackend> = cred_backend.clone();
+
+    let mut state = AppState::init_in_memory(StoreData::default());
+    state.persist_enabled = true;
+    state.store_path = store_path.clone();
+    state.appearance = ColorScheme::Dark;
+    state.worker = Some(
+        WorkerBridge::spawn_with_connector_and_credentials(cluster.connector(), cred_trait)
+            .expect("spawn worker"),
+    );
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(true, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+
+    // 1. Keychain write failure on Save & Connect rolls back JSON, keeps form open, and does NOT connect.
+    *cred_backend.fail_write.lock().expect("fail_write") =
+        Some("keychain access denied".to_owned());
+    rt.update(|s, tx| {
+        s.open_new_connection_form(tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("greendale_pg");
+            form.user = rune::TextEdit::new("troy_barnes");
+            form.password = rune::TextEdit::new("human_beings");
+            form.password_touched = true;
+        }
+        s.save_connection_form(true, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+    });
+    assert_eq!(rt.state.screen, Screen::Launcher);
+    assert_eq!(cluster.connect_count(), 0);
+    assert!(rt.state.connections.is_empty());
+    assert!(store.load().expect("reload after rollback").connections.is_empty());
+    assert!(matches!(rt.state.overlay, OverlayState::ConnectionForm(_)));
+    if let OverlayState::ConnectionForm(ref form) = rt.state.overlay {
+        assert!(form.saving_req_id.is_none());
+        assert!(
+            form.validation_error
+                .as_deref()
+                .is_some_and(|e| e.contains("keychain access denied") && e.contains("reverted")),
+            "unexpected validation error: {:?}",
+            form.validation_error
+        );
+    }
+
+    // 2. Retry Save & Connect after allowing keychain writes persists both stores and connects via keychain.
+    *cred_backend.fail_write.lock().expect("fail_write") = None;
+    rt.update(|s, tx| s.save_connection_form(true, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+            && rt
+                .state
+                .active_session()
+                .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    let saved_id = rt
+        .state
+        .connections
+        .first()
+        .expect("saved profile")
+        .id;
+    let service = rt.state.connections[0].credential_service();
+    assert_eq!(store.load().expect("reload saved").connections.len(), 1);
+    assert_eq!(
+        cred_backend
+            .secrets
+            .lock()
+            .expect("secrets")
+            .get(&service)
+            .map(|(a, s)| (a.as_str(), s.as_str())),
+        Some(("troy_barnes", "human_beings"))
+    );
+    let ops = cred_backend.ops_log.lock().expect("ops_log").clone();
+    let write_pos = ops
+        .iter()
+        .position(|op| op == &format!("write:{service}:human_beings"))
+        .expect("expected keychain write");
+    let read_pos = ops
+        .iter()
+        .rposition(|op| op == &format!("read:{service}"))
+        .expect("expected Save & Connect to read from keychain");
+    assert!(write_pos < read_pos, "keychain write must complete before connect read: {ops:?}");
+
+    // 2b. Save & Connect on a failed Keychain session does NOT cache the form password when keychain read fails.
+    *cred_backend.fail_read.lock().expect("fail_read") =
+        Some("initial read blocked".to_owned());
+    rt.update(|s, tx| s.reconnect_active(tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Failed(_)))
+    });
+    let connects_before_s1 = cluster.connect_count();
+    *cred_backend.fail_read.lock().expect("fail_read") =
+        Some("keychain read denied".to_owned());
+    rt.update(|s, tx| {
+        s.open_edit_connection_form(saved_id, tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.password = rune::TextEdit::new("human_beings");
+            form.password_touched = true;
+        }
+        s.save_connection_form(true, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+            && rt.state.active_session().is_some_and(|sess| {
+                matches!(&sess.status, ConnectionState::Failed(msg) if msg.contains("keychain read denied"))
+            })
+    });
+    assert_eq!(cluster.connect_count(), connects_before_s1);
+    let sess = rt.state.active_session().expect("active session");
+    assert!(sess.session_password.is_none());
+    *cred_backend.fail_read.lock().expect("fail_read") = None;
+    rt.update(|s, tx| s.reconnect_active(tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    assert_eq!(cluster.connect_count(), connects_before_s1 + 1);
+
+    // 2c. Save & Connect while already connected forces a fresh connection using the edited database and Keychain read.
+    cred_backend.ops_log.lock().expect("ops_log").clear();
+    let connects_before_db_edit = cluster.connect_count();
+    rt.update(|s, tx| {
+        s.open_edit_connection_form(saved_id, tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.database = rune::TextEdit::new("greendale_new");
+        }
+        s.save_connection_form(true, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+            && rt.state.active_session().is_some_and(|sess| {
+                sess.status
+                    .as_connected()
+                    .is_some_and(|c| c.active_database.as_deref() == Some("greendale_new"))
+            })
+    });
+    assert_eq!(cluster.connect_count(), connects_before_db_edit + 1);
+    assert!(
+        cred_backend
+            .ops_log
+            .lock()
+            .expect("ops_log")
+            .contains(&format!("read:{service}")),
+        "expected Save & Connect reconnect to read password from keychain"
+    );
+
+    // 3. Unwritable connections.json aborts Save BEFORE touching keychain.
+    std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o444))
+        .expect("chmod store 0444");
+    let _restore = RestoreWritable(store_path.clone());
+    let writes_before = cred_backend.write_calls.load(Ordering::Acquire);
+    rt.update(|s, tx| {
+        s.open_new_connection_form(tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("abed_pg");
+            form.password = rune::TextEdit::new("cool_cool_cool");
+            form.password_touched = true;
+        }
+        s.save_connection_form(false, tx);
+    });
+    rt.frame(0.1);
+    assert!(rt.state.pending_profile_save.is_none());
+    assert_eq!(cred_backend.write_calls.load(Ordering::Acquire), writes_before);
+    assert!(matches!(rt.state.overlay, OverlayState::ConnectionForm(_)));
+    if let OverlayState::ConnectionForm(ref form) = rt.state.overlay {
+        assert!(
+            form.validation_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Failed to save connection profile")),
+            "expected JSON save failure error, got {:?}",
+            form.validation_error
+        );
+    }
+    assert_eq!(store.load().expect("store unchanged").connections.len(), 1);
+
+    // 3b. Failing to persist last_connected_at after reconnect surfaces an error notice while staying connected.
+    rt.update(|s, tx| {
+        s.dismiss_connection_form();
+        s.status_notice = None;
+        s.reconnect_active(tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+            && rt.state.status_notice.is_some()
+    });
+    assert!(
+        rt.state.status_notice.as_ref().is_some_and(|n| {
+            n.is_error && n.message.contains("failed to update connection metadata on disk")
+        }),
+        "expected metadata persistence error notice, got {:?}",
+        rt.state.status_notice
+    );
+
+    // 3c. Switching away from Keychain when delete + JSON rollback both fail retains cleanup until Retry Save succeeds.
+    drop(_restore);
+    let _restore_s2 = RestoreWritable(store_path.clone());
+    *cred_backend.fail_delete.lock().expect("fail_delete") =
+        Some("keychain locked".to_owned());
+    *cred_backend
+        .delete_chmod_readonly
+        .lock()
+        .expect("delete_chmod_readonly") = Some(store_path.clone());
+    rt.update(|s, tx| {
+        s.open_edit_connection_form(saved_id, tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.password_mode = tv_core::PasswordMode::AskEveryTime;
+        }
+        s.save_connection_form(false, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+    });
+    assert_eq!(
+        rt.state.connections[0].password_mode,
+        tv_core::PasswordMode::AskEveryTime
+    );
+    assert!(rt.state.pending_credential_deletes.contains(&saved_id));
+    assert!(
+        cred_backend
+            .secrets
+            .lock()
+            .expect("secrets")
+            .contains_key(&service)
+    );
+    if let OverlayState::ConnectionForm(ref form) = rt.state.overlay {
+        assert!(
+            form.validation_error
+                .as_deref()
+                .is_some_and(|e| e.contains("failed to revert") && e.contains("Retry Save")),
+            "expected rollback failure guidance, got {:?}",
+            form.validation_error
+        );
+    } else {
+        panic!("expected ConnectionForm to remain open after rollback failure");
+    }
+
+    drop(_restore_s2);
+    *cred_backend.fail_delete.lock().expect("fail_delete") = None;
+    *cred_backend
+        .delete_chmod_readonly
+        .lock()
+        .expect("delete_chmod_readonly") = None;
+    rt.update(|s, tx| s.save_connection_form(false, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+            && !rt.state.pending_credential_deletes.contains(&saved_id)
+    });
+    assert!(
+        !cred_backend
+            .secrets
+            .lock()
+            .expect("secrets")
+            .contains_key(&service),
+        "Retry Save should remove the lingering keychain credential"
+    );
+    assert!(matches!(rt.state.overlay, OverlayState::None));
+
+    // Re-save Keychain password before Step 4 tests profile deletion cleanup.
+    rt.update(|s, tx| {
+        s.open_edit_connection_form(saved_id, tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.password_mode = tv_core::PasswordMode::Keychain;
+            form.password = rune::TextEdit::new("human_beings");
+            form.password_touched = true;
+        }
+        s.save_connection_form(false, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none() && matches!(rt.state.overlay, OverlayState::None)
+    });
+
+    // 4. Keychain delete failure rolls back connections.json and keeps DeleteConfirm open with error.
+    *cred_backend.fail_delete.lock().expect("fail_delete") =
+        Some("keychain delete blocked".to_owned());
+    rt.update(|s, _| {
+        s.open_delete_confirm(saved_id);
+        s.delete_connection(saved_id);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_delete.is_none()
+    });
+    assert_eq!(rt.state.connections.len(), 1);
+    assert_eq!(store.load().expect("rolled back delete").connections.len(), 1);
+    assert!(
+        rt.state
+            .delete_confirm_error
+            .as_deref()
+            .is_some_and(|e| e.contains("keychain delete blocked")),
+        "expected delete error, got {:?}",
+        rt.state.delete_confirm_error
+    );
+    assert!(rt.find("delete-confirm-error").is_some());
+
+    *cred_backend.fail_delete.lock().expect("fail_delete") = None;
+    rt.update(|s, _| s.delete_connection(saved_id));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_delete.is_none() && rt.state.connections.is_empty()
+    });
+    assert!(store.load().expect("deleted from disk").connections.is_empty());
+    assert!(
+        !cred_backend
+            .secrets
+            .lock()
+            .expect("secrets")
+            .contains_key(&service)
+    );
+    assert_eq!(rt.state.screen, Screen::Launcher);
+
+    // 5. Concurrent credential updates for the same profile run strictly in FIFO order.
+    let fifo_service = "tableview.connection.greendale-fifo".to_owned();
+    cred_backend.ops_log.lock().expect("ops_log").clear();
+    *cred_backend.write_delay.lock().expect("write_delay") = Duration::from_millis(80);
+    let worker = rt.state.worker.as_ref().expect("worker");
+    let r1 = tv_core::RequestId::new(9001);
+    let r2 = tv_core::RequestId::new(9002);
+    worker.send(WorkerCmd::SaveCredential {
+        req_id: r1,
+        connection_id: saved_id,
+        service: fifo_service.clone(),
+        account: "jeff_winger".to_owned(),
+        secret: "first-secret".to_owned(),
+    });
+    worker.send(WorkerCmd::SaveCredential {
+        req_id: r2,
+        connection_id: saved_id,
+        service: fifo_service.clone(),
+        account: "jeff_winger".to_owned(),
+        secret: "second-secret".to_owned(),
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if cred_backend.ops_log.lock().expect("ops_log").len() >= 4 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for serialized credential ops");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    *cred_backend.write_delay.lock().expect("write_delay") = Duration::ZERO;
+    assert_eq!(
+        *cred_backend.ops_log.lock().expect("ops_log"),
+        vec![
+            format!("start_write:{fifo_service}:first-secret"),
+            format!("write:{fifo_service}:first-secret"),
+            format!("start_write:{fifo_service}:second-secret"),
+            format!("write:{fifo_service}:second-secret"),
+        ]
+    );
+    assert_eq!(
+        cred_backend
+            .secrets
+            .lock()
+            .expect("secrets")
+            .get(&fifo_service)
+            .map(|(_, s)| s.as_str()),
+        Some("second-secret")
+    );
+}
+
+#[test]
+fn pending_save_preserves_concurrent_recent_timestamp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("connections.json");
+    let store = ConnectionStore::at(store_path.clone());
+    store.save(&StoreData::default()).expect("seed empty store");
+
+    let cluster = MockCluster::new(Duration::ZERO);
+    let cred_backend = Arc::new(MockCredentialBackend::new());
+    let cred_trait: Arc<dyn CredentialBackend> = cred_backend.clone();
+
+    let mut state = AppState::init_in_memory(StoreData::default());
+    state.persist_enabled = true;
+    state.store_path = store_path;
+    state.appearance = ColorScheme::Dark;
+    state.worker = Some(
+        WorkerBridge::spawn_with_connector_and_credentials(cluster.connector(), cred_trait)
+            .expect("spawn worker"),
+    );
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(true, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+
+    rt.update(|s, tx| {
+        s.open_new_connection_form(tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("greendale_pg");
+            form.user = rune::TextEdit::new("troy_barnes");
+            form.password = rune::TextEdit::new("human_beings");
+            form.password_touched = true;
+        }
+        s.save_connection_form(true, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+            && rt
+                .state
+                .active_session()
+                .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    let greendale_id = rt.state.connections[0].id;
+
+    rt.update(|s, _| {
+        s.connections[0].last_connected_at = None;
+    });
+    let mut reset_disk = store.load().expect("reload seeded store");
+    reset_disk.connections[0].last_connected_at = None;
+    store.save(&reset_disk).expect("save reset timestamp");
+
+    *cred_backend.write_delay.lock().expect("write_delay") = Duration::from_millis(300);
+    rt.update(|s, tx| {
+        s.open_new_connection_form(tx);
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("abed_pg");
+            form.user = rune::TextEdit::new("abed_nadir");
+            form.password = rune::TextEdit::new("cool_cool_cool");
+            form.password_touched = true;
+        }
+        s.save_connection_form(false, tx);
+    });
+    assert!(rt.state.pending_profile_save.is_some());
+
+    rt.update(|s, tx| s.reconnect_active(tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .connections
+            .iter()
+            .find(|c| c.id == greendale_id)
+            .and_then(|c| c.last_connected_at)
+            .is_some()
+    });
+    assert!(
+        rt.state.pending_profile_save.is_some(),
+        "reconnect should finish while profile save is still pending"
+    );
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none() && rt.state.connections.len() == 2
+    });
+    *cred_backend.write_delay.lock().expect("write_delay") = Duration::ZERO;
+
+    assert!(
+        rt.state
+            .connections
+            .iter()
+            .find(|c| c.id == greendale_id)
+            .and_then(|c| c.last_connected_at)
+            .is_some(),
+        "in-memory Recent timestamp should be preserved across pending save completion"
+    );
+    let reloaded = store.load().expect("reload after merged save");
+    assert_eq!(reloaded.connections.len(), 2);
+    assert!(
+        reloaded
+            .connections
+            .iter()
+            .find(|c| c.id == greendale_id)
+            .and_then(|c| c.last_connected_at)
+            .is_some(),
+        "disk Recent timestamp should be persisted after pending save completion"
+    );
 }

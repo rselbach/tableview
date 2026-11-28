@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -185,6 +185,7 @@ pub struct ConnectionFormState {
     pub validation_error: Option<String>,
     pub loading_credential: bool,
     pub password_touched: bool,
+    pub saving_req_id: Option<RequestId>,
 }
 
 impl ConnectionFormState {
@@ -213,6 +214,7 @@ impl ConnectionFormState {
             validation_error: None,
             loading_credential: false,
             password_touched: false,
+            saving_req_id: None,
         }
     }
 
@@ -292,6 +294,7 @@ impl ConnectionFormState {
             validation_error: None,
             loading_credential,
             password_touched: false,
+            saving_req_id: None,
         }
     }
 
@@ -1453,11 +1456,37 @@ impl SessionState {
     }
 }
 
+/// Tracks an in-flight connection profile save waiting on keychain confirmation.
+#[derive(Clone, Debug)]
+pub struct PendingProfileSave {
+    pub req_id: RequestId,
+    pub profile: ConnectionProfile,
+    pub previous_profile: Option<ConnectionProfile>,
+    pub previous_folders: Vec<String>,
+    pub next_store: StoreData,
+    pub connect_after: bool,
+    pub password_update: Option<Option<String>>,
+    pub deleting_credential: bool,
+    pub cancelled: bool,
+}
+
+/// Tracks an in-flight connection deletion waiting on keychain removal.
+#[derive(Clone, Debug)]
+pub struct PendingProfileDelete {
+    pub req_id: RequestId,
+    pub connection_id: ConnectionId,
+    pub connection_name: String,
+    pub previous_profile: ConnectionProfile,
+    pub previous_folders: Vec<String>,
+    pub next_store: StoreData,
+}
+
 /// Top-level application state owned by Rune.
 pub struct AppState {
     pub store_path: PathBuf,
     pub settings_path: PathBuf,
     pub persist_enabled: bool,
+    pub store_load_error: Option<String>,
     pub connections: Vec<ConnectionProfile>,
     pub folders: Vec<String>,
     pub sort_order: SortOrder,
@@ -1466,6 +1495,10 @@ pub struct AppState {
     pub launcher_search: TextEdit,
     pub launcher_selected: Option<ConnectionId>,
     pub launcher_context_menu: Option<(ConnectionId, PointerPress)>,
+    pub delete_confirm_error: Option<String>,
+    pub pending_profile_save: Option<PendingProfileSave>,
+    pub pending_profile_delete: Option<PendingProfileDelete>,
+    pub pending_credential_deletes: HashSet<ConnectionId>,
     pub sessions: HashMap<SessionId, SessionState>,
     pub screen: Screen,
     pub overlay: OverlayState,
@@ -1509,13 +1542,13 @@ pub const fn pref_from_appearance(scheme: ColorScheme) -> AppearancePreference {
 impl AppState {
     /// Creates application state loaded from the default platform store (or memory fallback).
     pub fn init_default() -> Self {
-        let (store_path, store_data) = match ConnectionStore::open_default() {
+        let (store_path, persist_enabled, store_result) = match ConnectionStore::open_default() {
             Ok(store) => {
                 let path = store.path().to_path_buf();
-                let data = store.load().unwrap_or_default();
-                (path, data)
+                let result = store.load();
+                (path, true, result)
             }
-            Err(_) => (PathBuf::from("connections.json"), StoreData::default()),
+            Err(err) => (PathBuf::from("connections.json"), false, Err(err)),
         };
         let (settings_path, settings_result) = match SettingsStore::open_default() {
             Ok(store) => {
@@ -1525,7 +1558,8 @@ impl AppState {
             }
             Err(err) => (PathBuf::from("settings.json"), Err(err)),
         };
-        let mut state = Self::from_store_data(store_path, store_data, true);
+        let mut state = Self::from_store_data(store_path, StoreData::default(), persist_enabled);
+        state.apply_connections_load(store_result);
         state.settings_path = settings_path;
         state.apply_settings_load(settings_result);
         let worker = WorkerBridge::spawn();
@@ -1553,6 +1587,7 @@ impl AppState {
             store_path,
             settings_path: PathBuf::from("in-memory-settings.json"),
             persist_enabled,
+            store_load_error: None,
             connections: data.connections,
             folders: data.folders,
             sort_order: SortOrder::Name,
@@ -1561,6 +1596,10 @@ impl AppState {
             launcher_search: TextEdit::new(""),
             launcher_selected,
             launcher_context_menu: None,
+            delete_confirm_error: None,
+            pending_profile_save: None,
+            pending_profile_delete: None,
+            pending_credential_deletes: HashSet::new(),
             sessions: HashMap::new(),
             screen: Screen::Launcher,
             overlay: OverlayState::None,
@@ -1912,17 +1951,121 @@ impl AppState {
             .collect()
     }
 
-    pub fn persist_connections(&self) {
-        if !self.persist_enabled {
-            return;
-        }
-        let store = ConnectionStore::at(self.store_path.clone());
-        let data = StoreData {
+    fn current_store_data(&self) -> StoreData {
+        StoreData {
             version: tv_core::storage::STORE_SCHEMA_VERSION,
             folders: self.folders.clone(),
             connections: self.connections.clone(),
+        }
+    }
+
+    fn save_store_data(&self, data: &StoreData) -> Result<(), StorageError> {
+        if !self.persist_enabled {
+            return Ok(());
+        }
+        if self.store_load_error.is_some() {
+            return Err(StorageError::Io(
+                "connection store could not be loaded; retry loading or back up the existing file first"
+                    .to_owned(),
+            ));
+        }
+        ConnectionStore::at(self.store_path.clone()).save(data)
+    }
+
+    pub fn persist_connections(&self) -> Result<(), StorageError> {
+        self.save_store_data(&self.current_store_data())
+    }
+
+    /// Loads connections from `path`, preserving unreadable or corrupt files on disk.
+    pub fn load_connections_from(&mut self, path: PathBuf) {
+        self.store_path = path.clone();
+        self.apply_connections_load(ConnectionStore::at(path).load());
+    }
+
+    pub fn retry_load_connections(&mut self) {
+        let result = if self.persist_enabled {
+            ConnectionStore::at(self.store_path.clone()).load()
+        } else {
+            match ConnectionStore::open_default() {
+                Ok(store) => {
+                    self.store_path = store.path().to_path_buf();
+                    self.persist_enabled = true;
+                    store.load()
+                }
+                Err(err) => Err(err),
+            }
         };
-        drop(store.save(&data));
+        let ok = result.is_ok();
+        self.apply_connections_load(result);
+        if ok {
+            self.set_notice("Loaded connections from disk", false);
+        }
+    }
+
+    pub fn backup_and_reset_connection_store(&mut self) {
+        if !self.persist_enabled {
+            return;
+        }
+        match ConnectionStore::at(self.store_path.clone()).backup_and_reset() {
+            Ok(backup_path) => {
+                self.connections.clear();
+                self.folders.clear();
+                self.launcher_selected = None;
+                self.store_load_error = None;
+                let msg = match backup_path {
+                    Some(path) => format!(
+                        "Backed up unreadable connections file to {} and created a fresh store",
+                        path.display()
+                    ),
+                    None => "Initialized a fresh connections store".to_owned(),
+                };
+                self.set_notice(msg, false);
+            }
+            Err(err) => {
+                let msg = format!(
+                    "Failed to reset connections store ({err}). Existing file was preserved on disk."
+                );
+                self.store_load_error = Some(msg.clone());
+                self.set_notice(msg, true);
+            }
+        }
+    }
+
+    fn apply_connections_load(&mut self, result: Result<StoreData, StorageError>) {
+        match result {
+            Ok(mut data) => {
+                data.sort(self.sort_order);
+                self.connections = data.connections;
+                self.folders = data.folders;
+                self.launcher_selected = self.connections.first().map(|c| c.id);
+                let had_error = self.store_load_error.take().is_some();
+                if had_error
+                    && self.status_notice.as_ref().is_some_and(|n| {
+                        n.is_error
+                            && (n.message.starts_with("Failed to load connections")
+                                || n.message.starts_with("Failed to locate connections")
+                                || n.message.starts_with("Failed to reset connections"))
+                    })
+                {
+                    self.status_notice = None;
+                }
+            }
+            Err(err) => {
+                self.connections.clear();
+                self.folders.clear();
+                self.launcher_selected = None;
+                let msg = if self.persist_enabled {
+                    format!(
+                        "Failed to load connections from {} ({err}). Existing file has been preserved on disk.",
+                        self.store_path.display()
+                    )
+                } else {
+                    format!("Failed to locate connections store ({err}). Persistence is disabled.")
+                };
+                self.store_load_error = Some(msg.clone());
+                self.set_notice(msg, true);
+            }
+        }
     }
 
     pub fn sort_connections(&mut self, order: SortOrder) {
@@ -2031,74 +2174,219 @@ impl AppState {
         tx.focus_when_shown("import-url-input", true);
     }
 
+    pub fn open_delete_confirm(&mut self, id: ConnectionId) {
+        self.launcher_context_menu = None;
+        self.delete_confirm_error = None;
+        self.overlay = OverlayState::DeleteConfirm(id);
+    }
+
+    pub fn close_delete_confirm(&mut self) {
+        self.delete_confirm_error = None;
+        self.overlay = OverlayState::None;
+    }
+
+    pub fn dismiss_connection_form(&mut self) {
+        if let Some(ref mut pending) = self.pending_profile_save
+            && let OverlayState::ConnectionForm(ref form) = self.overlay
+            && form.saving_req_id == Some(pending.req_id)
+        {
+            pending.cancelled = true;
+        }
+        self.overlay = OverlayState::None;
+    }
+
     pub fn save_connection_form(&mut self, connect_after: bool, tx: &mut Tx) {
-        let OverlayState::ConnectionForm(ref mut form) = self.overlay else {
+        if self.pending_profile_save.is_some() || self.pending_profile_delete.is_some() {
             return;
-        };
-        let existing = form
-            .editing_id
-            .and_then(|id| self.connections.iter().find(|c| c.id == id));
-        let profile = match form.to_profile(existing) {
-            Ok(p) => p,
-            Err(msg) => {
-                form.validation_error = Some(msg);
-                return;
-            }
-        };
-
-        let secret = form.password.text.clone();
-        let password_touched = form.password_touched;
-        let is_new = form.editing_id.is_none();
-
-        if let Some(worker) = &self.worker {
-            match profile.password_mode {
-                PasswordMode::Keychain if password_touched || is_new || !secret.is_empty() => {
-                    worker.send(WorkerCmd::SaveCredential {
-                        service: profile.credential_service(),
-                        account: profile.user.clone(),
-                        secret: secret.clone(),
-                    });
-                }
-                PasswordMode::None | PasswordMode::AskEveryTime => {
-                    worker.send(WorkerCmd::DeleteCredential {
-                        service: profile.credential_service(),
-                    });
-                }
-                PasswordMode::Keychain => {}
-            }
         }
 
-        let mut data = StoreData {
-            version: tv_core::storage::STORE_SCHEMA_VERSION,
-            folders: std::mem::take(&mut self.folders),
-            connections: std::mem::take(&mut self.connections),
+        let (profile, previous_profile, secret, password_touched, is_new) = {
+            let OverlayState::ConnectionForm(ref mut form) = self.overlay else {
+                return;
+            };
+            if form.saving_req_id.is_some() {
+                return;
+            }
+            let existing = form
+                .editing_id
+                .and_then(|id| self.connections.iter().find(|c| c.id == id));
+            let profile = match form.to_profile(existing) {
+                Ok(p) => p,
+                Err(msg) => {
+                    form.validation_error = Some(msg);
+                    return;
+                }
+            };
+            (
+                profile,
+                existing.cloned(),
+                form.password.text.clone(),
+                form.password_touched,
+                form.editing_id.is_none(),
+            )
         };
-        data.upsert(profile.clone());
-        data.sort(self.sort_order);
-        self.folders = data.folders;
-        self.connections = data.connections;
+
+        let previous_folders = self.folders.clone();
+        let mut next_store = self.current_store_data();
+        next_store.upsert(profile.clone());
+        next_store.sort(self.sort_order);
+
+        if let Err(err) = self.save_store_data(&next_store) {
+            let msg = format!("Failed to save connection profile: {err}");
+            if let OverlayState::ConnectionForm(ref mut form) = self.overlay {
+                form.validation_error = Some(msg.clone());
+            }
+            self.set_notice(msg, true);
+            return;
+        }
+
+        let switched_from_keychain = previous_profile
+            .as_ref()
+            .is_some_and(|p| p.password_mode == PasswordMode::Keychain);
+        let needs_cleanup = self.pending_credential_deletes.contains(&profile.id);
+        let password_update = match profile.password_mode {
+            PasswordMode::Keychain | PasswordMode::None => Some(None),
+            PasswordMode::AskEveryTime if switched_from_keychain => Some(None),
+            PasswordMode::AskEveryTime => None,
+        };
+
+        enum CredMutation {
+            SaveSecret(String),
+            DeleteSecret,
+        }
+
+        let cred_mutation = if self.worker.is_some() {
+            match profile.password_mode {
+                PasswordMode::Keychain if !secret.is_empty() => {
+                    Some(CredMutation::SaveSecret(secret.clone()))
+                }
+                PasswordMode::Keychain if (password_touched && !is_new) || needs_cleanup => {
+                    Some(CredMutation::DeleteSecret)
+                }
+                PasswordMode::None | PasswordMode::AskEveryTime
+                    if switched_from_keychain || needs_cleanup =>
+                {
+                    Some(CredMutation::DeleteSecret)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(mutation) = cred_mutation {
+            let deleting_credential = matches!(mutation, CredMutation::DeleteSecret);
+            let req_id = self.alloc_req_id();
+            if let OverlayState::ConnectionForm(ref mut form) = self.overlay {
+                form.saving_req_id = Some(req_id);
+                form.validation_error = None;
+            }
+            let service = profile.credential_service();
+            let account = profile.user.clone();
+            let connection_id = profile.id;
+            self.pending_profile_save = Some(PendingProfileSave {
+                req_id,
+                profile,
+                previous_profile,
+                previous_folders,
+                next_store,
+                connect_after,
+                password_update,
+                deleting_credential,
+                cancelled: false,
+            });
+            if let Some(worker) = &self.worker {
+                match mutation {
+                    CredMutation::SaveSecret(secret_val) => {
+                        worker.send(WorkerCmd::SaveCredential {
+                            req_id,
+                            connection_id,
+                            service,
+                            account,
+                            secret: secret_val,
+                        });
+                    }
+                    CredMutation::DeleteSecret => {
+                        worker.send(WorkerCmd::DeleteCredential {
+                            req_id,
+                            connection_id,
+                            service,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        let pending = PendingProfileSave {
+            req_id: RequestId::new(0),
+            profile: profile.clone(),
+            previous_profile,
+            previous_folders,
+            next_store,
+            connect_after,
+            password_update,
+            deleting_credential: false,
+            cancelled: false,
+        };
+        let explicit_pw = if matches!(
+            profile.password_mode,
+            PasswordMode::Keychain | PasswordMode::AskEveryTime | PasswordMode::None
+        ) {
+            None
+        } else {
+            (!secret.is_empty()).then_some(secret)
+        };
+        self.finish_profile_save(pending, explicit_pw, tx);
+    }
+
+    fn merge_recent_timestamps(&self, target: &mut StoreData) -> bool {
+        let mut merged = false;
+        for conn in &mut target.connections {
+            if let Some(existing) = self.connections.iter().find(|c| c.id == conn.id)
+                && existing.last_connected_at > conn.last_connected_at
+            {
+                conn.last_connected_at = existing.last_connected_at;
+                merged = true;
+            }
+        }
+        merged
+    }
+
+    fn persist_merged_recent_if_needed(&mut self, merged_recent: bool) {
+        if merged_recent
+            && self.store_load_error.is_none()
+            && let Err(err) = self.persist_connections()
+        {
+            self.set_notice(
+                format!("Updated profile, but failed to update connection metadata on disk: {err}"),
+                true,
+            );
+        }
+    }
+
+    fn apply_saved_profile_to_state(
+        &mut self,
+        profile: &ConnectionProfile,
+        mut next_store: StoreData,
+        password_update: &Option<Option<String>>,
+    ) -> bool {
+        let merged_recent = self.merge_recent_timestamps(&mut next_store);
+        self.folders = next_store.folders;
+        self.connections = next_store.connections;
         self.launcher_selected = Some(profile.id);
         if self.env_filter.is_some_and(|env| env != profile.env) {
             self.env_filter = None;
         }
         let search_q = self.launcher_search.text.trim().to_ascii_lowercase();
-        if !connection_matches_search(&profile, &search_q) {
+        if !connection_matches_search(profile, &search_q) {
             self.launcher_search = TextEdit::new("");
         }
-        self.persist_connections();
-
-        let password_update = if profile.password_mode == PasswordMode::None {
-            Some(None)
-        } else if password_touched || !secret.is_empty() {
-            Some((!secret.is_empty()).then(|| secret.clone()))
-        } else {
-            None
-        };
 
         for session in self.sessions.values_mut() {
             if session.profile.id == profile.id {
                 session.profile = profile.clone();
-                if let Some(ref updated_pw) = password_update {
+                if let Some(updated_pw) = password_update {
                     session.session_password = updated_pw.clone();
                 }
                 if let Some(worker) = &self.worker {
@@ -2110,14 +2398,32 @@ impl AppState {
                 }
             }
         }
+        merged_recent
+    }
 
+    fn finish_profile_save(
+        &mut self,
+        pending: PendingProfileSave,
+        explicit_pw: Option<String>,
+        tx: &mut Tx,
+    ) {
+        let merged_recent = self.apply_saved_profile_to_state(
+            &pending.profile,
+            pending.next_store,
+            &pending.password_update,
+        );
         self.overlay = OverlayState::None;
-        if connect_after {
-            let explicit_pw = (!secret.is_empty()).then_some(secret);
-            self.start_or_focus_connection(profile.id, explicit_pw, None, tx);
+        if pending.connect_after {
+            let pw = if pending.profile.password_mode == PasswordMode::Keychain {
+                None
+            } else {
+                explicit_pw
+            };
+            self.start_connection_inner(pending.profile.id, pw, None, true, tx);
         } else {
-            self.set_notice(format!("Saved connection \"{}\"", profile.name), false);
+            self.set_notice(format!("Saved connection \"{}\"", pending.profile.name), false);
         }
+        self.persist_merged_recent_if_needed(merged_recent);
     }
 
     pub fn test_connection_form(&mut self) {
@@ -2171,19 +2477,22 @@ impl AppState {
     }
 
     pub fn duplicate_connection(&mut self, id: ConnectionId) {
-        let mut data = StoreData {
-            version: tv_core::storage::STORE_SCHEMA_VERSION,
-            folders: std::mem::take(&mut self.folders),
-            connections: std::mem::take(&mut self.connections),
-        };
-        if let Some(copy) = data.duplicate(id) {
-            self.launcher_selected = Some(copy.id);
-            self.set_notice(format!("Duplicated as \"{}\"", copy.name), false);
-        }
-        self.folders = data.folders;
-        self.connections = data.connections;
         self.launcher_context_menu = None;
-        self.persist_connections();
+        if self.pending_profile_save.is_some() || self.pending_profile_delete.is_some() {
+            return;
+        }
+        let mut next_store = self.current_store_data();
+        let Some(copy) = next_store.duplicate(id) else {
+            return;
+        };
+        if let Err(err) = self.save_store_data(&next_store) {
+            self.set_notice(format!("Failed to save duplicated connection: {err}"), true);
+            return;
+        }
+        self.folders = next_store.folders;
+        self.connections = next_store.connections;
+        self.launcher_selected = Some(copy.id);
+        self.set_notice(format!("Duplicated as \"{}\"", copy.name), false);
     }
 
     pub fn copy_connection_url(&mut self, id: ConnectionId, tx: &mut Tx) {
@@ -2197,19 +2506,65 @@ impl AppState {
     }
 
     pub fn delete_connection(&mut self, id: ConnectionId) {
-        let service = self
-            .connections
-            .iter()
-            .find(|c| c.id == id)
-            .map(ConnectionProfile::credential_service);
-        let mut data = StoreData {
-            version: tv_core::storage::STORE_SCHEMA_VERSION,
-            folders: std::mem::take(&mut self.folders),
-            connections: std::mem::take(&mut self.connections),
+        self.launcher_context_menu = None;
+        if self.pending_profile_delete.is_some() || self.pending_profile_save.is_some() {
+            return;
+        }
+        let Some(previous_profile) = self.connections.iter().find(|c| c.id == id).cloned() else {
+            return;
         };
-        data.delete(id);
-        self.folders = data.folders;
-        self.connections = data.connections;
+        let previous_folders = self.folders.clone();
+        let mut next_store = self.current_store_data();
+        if !next_store.delete(id) {
+            return;
+        }
+
+        if let Err(err) = self.save_store_data(&next_store) {
+            let msg = format!("Failed to save connection removal: {err}");
+            self.delete_confirm_error = Some(msg.clone());
+            self.set_notice(msg, true);
+            return;
+        }
+
+        if (previous_profile.password_mode == PasswordMode::Keychain
+            || self.pending_credential_deletes.contains(&id))
+            && self.worker.is_some()
+        {
+            let req_id = self.alloc_req_id();
+            let service = previous_profile.credential_service();
+            self.delete_confirm_error = None;
+            self.pending_profile_delete = Some(PendingProfileDelete {
+                req_id,
+                connection_id: id,
+                connection_name: previous_profile.name.clone(),
+                previous_profile,
+                previous_folders,
+                next_store,
+            });
+            if let Some(worker) = &self.worker {
+                worker.send(WorkerCmd::DeleteCredential {
+                    req_id,
+                    connection_id: id,
+                    service,
+                });
+            }
+            return;
+        }
+
+        let name = previous_profile.name;
+        self.finish_profile_delete(id, &name, next_store, true);
+    }
+
+    fn finish_profile_delete(
+        &mut self,
+        id: ConnectionId,
+        name: &str,
+        mut next_store: StoreData,
+        persist_recent: bool,
+    ) {
+        let merged_recent = self.merge_recent_timestamps(&mut next_store);
+        self.folders = next_store.folders;
+        self.connections = next_store.connections;
         if self.launcher_selected == Some(id) {
             self.launcher_selected = self.connections.first().map(|c| c.id);
         }
@@ -2222,12 +2577,13 @@ impl AppState {
                 self.screen = Screen::Launcher;
             }
         }
-        if let (Some(worker), Some(service)) = (&self.worker, service) {
-            worker.send(WorkerCmd::DeleteCredential { service });
-        }
+        self.delete_confirm_error = None;
         self.overlay = OverlayState::None;
         self.launcher_context_menu = None;
-        self.persist_connections();
+        self.set_notice(format!("Deleted connection \"{name}\""), false);
+        if persist_recent {
+            self.persist_merged_recent_if_needed(merged_recent);
+        }
     }
 
     pub fn start_or_focus_connection(
@@ -2237,8 +2593,26 @@ impl AppState {
         database_override: Option<String>,
         tx: &mut Tx,
     ) {
+        self.start_connection_inner(
+            connection_id,
+            explicit_password,
+            database_override,
+            false,
+            tx,
+        );
+    }
+
+    fn start_connection_inner(
+        &mut self,
+        connection_id: ConnectionId,
+        explicit_password: Option<String>,
+        database_override: Option<String>,
+        force_connect: bool,
+        tx: &mut Tx,
+    ) {
         self.launcher_context_menu = None;
-        if let Some(existing_sid) = self.find_session_for_connection(connection_id)
+        if !force_connect
+            && let Some(existing_sid) = self.find_session_for_connection(connection_id)
             && database_override.is_none()
             && explicit_password.is_none()
         {
@@ -4631,8 +5005,16 @@ impl AppState {
                     profile.last_connected_at = Some(chrono::Utc::now());
                     persisted_conn_change = true;
                 }
-                if persisted_conn_change {
-                    self.persist_connections();
+                if persisted_conn_change
+                    && self.store_load_error.is_none()
+                    && self.pending_profile_save.is_none()
+                    && self.pending_profile_delete.is_none()
+                    && let Err(err) = self.persist_connections()
+                {
+                    self.set_notice(
+                        format!("Connected, but failed to update connection metadata on disk: {err}"),
+                        true,
+                    );
                 }
 
                 if active_database.is_some() && self.worker.is_some() {
@@ -5219,7 +5601,7 @@ impl AppState {
             WorkerEvent::CredentialLoaded {
                 req_id,
                 connection_id,
-                secret,
+                result,
             } => {
                 if self.active_cred_req_id != Some(req_id) {
                     return;
@@ -5228,12 +5610,27 @@ impl AppState {
                     && form.editing_id == Some(connection_id)
                 {
                     form.loading_credential = false;
-                    if !form.password_touched
-                        && let Some(pw) = secret
-                    {
-                        form.password = TextEdit::new(&pw);
+                    match result {
+                        Ok(Some(pw)) => {
+                            if !form.password_touched {
+                                form.password = TextEdit::new(&pw);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            if !form.password_touched {
+                                form.validation_error = Some(format!(
+                                    "Failed to read stored password from keychain: {err}"
+                                ));
+                            }
+                        }
                     }
                 }
+            }
+
+            WorkerEvent::CredentialSaved { req_id, result, .. }
+            | WorkerEvent::CredentialDeleted { req_id, result, .. } => {
+                self.handle_credential_mutation_event(req_id, result, tx);
             }
 
             WorkerEvent::StagedChangesCommitted {
@@ -5491,6 +5888,142 @@ impl AppState {
             hovered: was_hovered,
             timer,
         });
+    }
+
+    fn handle_credential_mutation_event(
+        &mut self,
+        req_id: RequestId,
+        result: Result<(), String>,
+        tx: &mut Tx,
+    ) {
+        if self
+            .pending_profile_save
+            .as_ref()
+            .is_some_and(|p| p.req_id == req_id)
+        {
+            let Some(pending) = self.pending_profile_save.take() else {
+                return;
+            };
+            let form_matches = matches!(
+                self.overlay,
+                OverlayState::ConnectionForm(ref form) if form.saving_req_id == Some(req_id)
+            );
+            if let OverlayState::ConnectionForm(ref mut form) = self.overlay
+                && form.saving_req_id == Some(req_id)
+            {
+                form.saving_req_id = None;
+            }
+            match result {
+                Ok(()) => {
+                    self.pending_credential_deletes.remove(&pending.profile.id);
+                    if pending.cancelled {
+                        let name = pending.profile.name.clone();
+                        let merged_recent = self.apply_saved_profile_to_state(
+                            &pending.profile,
+                            pending.next_store,
+                            &pending.password_update,
+                        );
+                        self.set_notice(format!("Saved connection \"{name}\""), false);
+                        self.persist_merged_recent_if_needed(merged_recent);
+                    } else {
+                        self.finish_profile_save(pending, None, tx);
+                    }
+                }
+                Err(cred_err) => {
+                    let mut rollback = self.current_store_data();
+                    rollback.folders = pending.previous_folders.clone();
+                    match self.save_store_data(&rollback) {
+                        Ok(()) => {
+                            let msg = format!(
+                                "Failed to update keychain ({cred_err}). Profile changes were reverted."
+                            );
+                            if form_matches
+                                && let OverlayState::ConnectionForm(ref mut form) = self.overlay
+                            {
+                                form.validation_error = Some(msg.clone());
+                            }
+                            self.set_notice(msg, true);
+                        }
+                        Err(rb_err) => {
+                            if pending.deleting_credential {
+                                self.pending_credential_deletes.insert(pending.profile.id);
+                            }
+                            let _ = self.apply_saved_profile_to_state(
+                                &pending.profile,
+                                pending.next_store,
+                                &pending.password_update,
+                            );
+                            if form_matches
+                                && let OverlayState::ConnectionForm(ref mut form) = self.overlay
+                            {
+                                form.editing_id = Some(pending.profile.id);
+                                form.validation_error = Some(format!(
+                                    "Failed to update keychain ({cred_err}) and failed to revert connections file ({rb_err}). Retry Save or switch password mode."
+                                ));
+                            }
+                            self.set_notice(
+                                format!(
+                                    "Failed to update keychain ({cred_err}) and failed to revert connections file ({rb_err})"
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if self
+            .pending_profile_delete
+            .as_ref()
+            .is_some_and(|p| p.req_id == req_id)
+        {
+            let Some(pending) = self.pending_profile_delete.take() else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    self.pending_credential_deletes
+                        .remove(&pending.connection_id);
+                    self.finish_profile_delete(
+                        pending.connection_id,
+                        &pending.connection_name,
+                        pending.next_store,
+                        true,
+                    );
+                }
+                Err(cred_err) => {
+                    let mut rollback = self.current_store_data();
+                    rollback.folders = pending.previous_folders;
+                    match self.save_store_data(&rollback) {
+                        Ok(()) => {
+                            let msg = format!(
+                                "Failed to remove password from keychain ({cred_err}). Connection \"{}\" was not deleted.",
+                                pending.connection_name
+                            );
+                            self.delete_confirm_error = Some(msg.clone());
+                            self.set_notice(msg, true);
+                        }
+                        Err(rb_err) => {
+                            self.finish_profile_delete(
+                                pending.connection_id,
+                                &pending.connection_name,
+                                pending.next_store,
+                                false,
+                            );
+                            self.set_notice(
+                                format!(
+                                    "Deleted \"{}\", but failed to remove its keychain password ({cred_err}) and failed to restore connections file ({rb_err}).",
+                                    pending.connection_name
+                                ),
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn dismiss_status_notice(&mut self) {

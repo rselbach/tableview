@@ -116,6 +116,86 @@ fn connection_store_roundtrip_duplicate_sort_delete_and_import() {
 }
 
 #[test]
+fn connection_store_preserves_unreadable_or_corrupt_files_and_backs_up_on_reset() {
+    let dir = tempdir().expect("create tempdir");
+    let store_path = dir.path().join("connections.json");
+    let store = ConnectionStore::at(store_path.clone());
+
+    assert!(store.load().expect("missing file returns empty").connections.is_empty());
+
+    std::fs::write(&store_path, "{greendale corrupt json").expect("write corrupt json");
+    let err = store.load().expect_err("corrupt json must fail to load");
+    assert!(matches!(err, tv_core::StorageError::Parse(_)));
+
+    let backup_1 = store
+        .backup_and_reset()
+        .expect("backup and reset succeeds")
+        .expect("backup file created");
+    assert_eq!(
+        std::fs::read_to_string(&backup_1).expect("read first backup"),
+        "{greendale corrupt json"
+    );
+    assert!(store.load().expect("reset store loads cleanly").connections.is_empty());
+
+    std::fs::write(&store_path, "{second corrupt").expect("write second corrupt json");
+    let backup_2 = store
+        .backup_and_reset()
+        .expect("second backup and reset succeeds")
+        .expect("second backup file created");
+    assert_ne!(backup_1, backup_2);
+    assert_eq!(
+        std::fs::read_to_string(&backup_1).expect("first backup preserved"),
+        "{greendale corrupt json"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&backup_2).expect("second backup content"),
+        "{second corrupt"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        // Test unreadable 0o000 file vs backup_and_reset only if not running as root (uid != 0).
+        std::fs::write(&store_path, "secret_unreadable_payload").expect("write file");
+        std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+        if std::fs::read_to_string(&store_path).is_err() {
+            let io_err = store.load().expect_err("0o000 file must fail load");
+            assert!(matches!(io_err, tv_core::StorageError::Io(_)));
+            let unreadable_backup = store
+                .backup_and_reset()
+                .expect("backup unreadable file")
+                .expect("backup path");
+            std::fs::set_permissions(&unreadable_backup, std::fs::Permissions::from_mode(0o644))
+                .expect("restore backup perms");
+            assert_eq!(
+                std::fs::read_to_string(&unreadable_backup).expect("read unreadable backup"),
+                "secret_unreadable_payload"
+            );
+            assert!(store.load().expect("fresh store loads").connections.is_empty());
+        } else {
+            std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o644)).expect("restore perms");
+        }
+
+        std::fs::remove_file(&store_path).expect("remove regular store");
+        symlink(dir.path().join("missing_target.json"), &store_path).expect("create dangling symlink");
+        let link_err = store.load().expect_err("dangling symlink must fail load");
+        assert!(matches!(link_err, tv_core::StorageError::Io(_)));
+        let link_backup = store
+            .backup_and_reset()
+            .expect("backup dangling symlink")
+            .expect("link backup path");
+        assert!(
+            std::fs::symlink_metadata(&link_backup)
+                .expect("backup link meta")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(store.load().expect("fresh store after symlink reset").connections.is_empty());
+    }
+}
+
+#[test]
 fn settings_store_roundtrip_and_missing_file_defaults() {
     let dir = tempdir().expect("create tempdir");
     let store = SettingsStore::at(dir.path().join("settings.json"));

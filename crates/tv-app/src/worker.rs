@@ -137,11 +137,15 @@ pub enum WorkerCmd {
         password_override: Option<String>,
     },
     SaveCredential {
+        req_id: RequestId,
+        connection_id: ConnectionId,
         service: String,
         account: String,
         secret: String,
     },
     DeleteCredential {
+        req_id: RequestId,
+        connection_id: ConnectionId,
         service: String,
     },
     LoadCredentialForEdit {
@@ -290,10 +294,20 @@ pub enum WorkerEvent {
         req_id: RequestId,
         result: Result<ServerInfo, DbError>,
     },
+    CredentialSaved {
+        req_id: RequestId,
+        connection_id: ConnectionId,
+        result: Result<(), String>,
+    },
+    CredentialDeleted {
+        req_id: RequestId,
+        connection_id: ConnectionId,
+        result: Result<(), String>,
+    },
     CredentialLoaded {
         req_id: RequestId,
         connection_id: ConnectionId,
-        secret: Option<String>,
+        result: Result<Option<String>, String>,
     },
     StagedChangesCommitted {
         session_id: SessionId,
@@ -318,6 +332,220 @@ pub enum WorkerEvent {
     },
 }
 
+/// Abstraction over OS credential storage used by [`WorkerBridge`] so tests can inject mock backends.
+pub trait CredentialBackend: Send + Sync {
+    fn read(&self, service: &str) -> Result<Option<String>, String>;
+    fn write(&self, service: &str, account: &str, secret: &str) -> Result<(), String>;
+    fn delete(&self, service: &str) -> Result<(), String>;
+}
+
+fn read_credentials_utf8(store: &Credentials, service: &str) -> Result<Option<String>, String> {
+    let cred = store.read(service).map_err(|err| err.to_string())?;
+    let Some(cred) = cred else {
+        return Ok(None);
+    };
+    String::from_utf8(cred.secret().to_vec())
+        .map(Some)
+        .map_err(|_| "stored credential is not valid UTF-8".to_owned())
+}
+
+struct SystemCredentialBackend;
+
+impl CredentialBackend for SystemCredentialBackend {
+    fn read(&self, service: &str) -> Result<Option<String>, String> {
+        read_credentials_utf8(&Credentials::system(), service)
+    }
+
+    fn write(&self, service: &str, account: &str, secret: &str) -> Result<(), String> {
+        Credentials::system()
+            .write(service, account, secret.as_bytes())
+            .map_err(|err| err.to_string())
+    }
+
+    fn delete(&self, service: &str) -> Result<(), String> {
+        Credentials::system()
+            .delete(service)
+            .map_err(|err| err.to_string())
+    }
+}
+
+struct MemoryCredentialBackend(Credentials);
+
+impl MemoryCredentialBackend {
+    fn new() -> Self {
+        Self(Credentials::memory())
+    }
+}
+
+impl CredentialBackend for MemoryCredentialBackend {
+    fn read(&self, service: &str) -> Result<Option<String>, String> {
+        read_credentials_utf8(&self.0, service)
+    }
+
+    fn write(&self, service: &str, account: &str, secret: &str) -> Result<(), String> {
+        self.0
+            .write(service, account, secret.as_bytes())
+            .map_err(|err| err.to_string())
+    }
+
+    fn delete(&self, service: &str) -> Result<(), String> {
+        self.0.delete(service).map_err(|err| err.to_string())
+    }
+}
+
+enum CredentialTask {
+    Read {
+        service: String,
+        reply: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
+    },
+    Write {
+        service: String,
+        account: String,
+        secret: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    Delete {
+        service: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
+enum PendingCredentialRx {
+    Read(tokio::sync::oneshot::Receiver<Result<Option<String>, String>>),
+    Mutate(tokio::sync::oneshot::Receiver<Result<(), String>>),
+}
+
+#[derive(Clone)]
+struct CredentialRunner {
+    backend: Arc<dyn CredentialBackend>,
+    queues: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<CredentialTask>>>>,
+}
+
+impl CredentialRunner {
+    fn new(backend: Arc<dyn CredentialBackend>) -> Self {
+        Self {
+            backend,
+            queues: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn enqueue_task(&self, service: &str, mut task: CredentialTask) {
+        let Ok(mut map) = self.queues.lock() else {
+            return;
+        };
+        if let Some(tx) = map.get(service) {
+            match tx.send(task) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::SendError(unsent)) => {
+                    task = unsent;
+                }
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CredentialTask>();
+        drop(tx.send(task));
+        map.insert(service.to_owned(), tx);
+        let backend = Arc::clone(&self.backend);
+        let queues = Arc::clone(&self.queues);
+        let service_key = service.to_owned();
+        tokio::spawn(async move {
+            loop {
+                let next_task = {
+                    let Ok(mut guard) = queues.lock() else {
+                        break;
+                    };
+                    if let Ok(t) = rx.try_recv() {
+                        t
+                    } else {
+                        guard.remove(&service_key);
+                        drop(rx);
+                        break;
+                    }
+                };
+                let backend_ref = Arc::clone(&backend);
+                match next_task {
+                    CredentialTask::Read { service, reply } => {
+                        let res =
+                            tokio::task::spawn_blocking(move || backend_ref.read(&service))
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Err(format!("credential read task panicked: {e}"))
+                                });
+                        drop(reply.send(res));
+                    }
+                    CredentialTask::Write {
+                        service,
+                        account,
+                        secret,
+                        reply,
+                    } => {
+                        let res = tokio::task::spawn_blocking(move || {
+                            backend_ref.write(&service, &account, &secret)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("credential write task panicked: {e}")));
+                        drop(reply.send(res));
+                    }
+                    CredentialTask::Delete { service, reply } => {
+                        let res =
+                            tokio::task::spawn_blocking(move || backend_ref.delete(&service))
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Err(format!("credential delete task panicked: {e}"))
+                                });
+                        drop(reply.send(res));
+                    }
+                }
+            }
+        });
+    }
+
+    fn enqueue_read(
+        &self,
+        service: &str,
+    ) -> tokio::sync::oneshot::Receiver<Result<Option<String>, String>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.enqueue_task(
+            service,
+            CredentialTask::Read {
+                service: service.to_owned(),
+                reply,
+            },
+        );
+        rx
+    }
+
+    fn enqueue_write(
+        &self,
+        service: &str,
+        account: &str,
+        secret: &str,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.enqueue_task(
+            service,
+            CredentialTask::Write {
+                service: service.to_owned(),
+                account: account.to_owned(),
+                secret: secret.to_owned(),
+                reply,
+            },
+        );
+        rx
+    }
+
+    fn enqueue_delete(&self, service: &str) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.enqueue_task(
+            service,
+            CredentialTask::Delete {
+                service: service.to_owned(),
+                reply,
+            },
+        );
+        rx
+    }
+}
+
 /// Owns the background Tokio runtime thread and wakes Rune whenever worker events arrive.
 pub struct WorkerBridge {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCmd>,
@@ -330,15 +558,35 @@ pub struct WorkerBridge {
 impl WorkerBridge {
     /// Spawns the background Tokio worker thread. Returns `None` if runtime initialization fails.
     pub fn spawn() -> Option<Self> {
-        Self::spawn_inner(default_session_connector(), false)
+        Self::spawn_inner(
+            default_session_connector(),
+            false,
+            Arc::new(SystemCredentialBackend),
+        )
     }
 
-    /// Spawns the background worker with a custom session connector and isolated in-memory query store.
+    /// Spawns the background worker with a custom session connector and isolated in-memory stores.
     pub fn spawn_with_connector(connector: SessionConnector) -> Option<Self> {
-        Self::spawn_inner(connector, true)
+        Self::spawn_inner(
+            connector,
+            true,
+            Arc::new(MemoryCredentialBackend::new()),
+        )
     }
 
-    fn spawn_inner(connector: SessionConnector, in_memory_history: bool) -> Option<Self> {
+    /// Spawns the background worker with custom session connector and credential backend for tests.
+    pub fn spawn_with_connector_and_credentials(
+        connector: SessionConnector,
+        credentials: Arc<dyn CredentialBackend>,
+    ) -> Option<Self> {
+        Self::spawn_inner(connector, true, credentials)
+    }
+
+    fn spawn_inner(
+        connector: SessionConnector,
+        in_memory_history: bool,
+        credential_backend: Arc<dyn CredentialBackend>,
+    ) -> Option<Self> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::channel();
         let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
@@ -363,6 +611,7 @@ impl WorkerBridge {
                     event_tx,
                     worker_waker,
                     connector,
+                    CredentialRunner::new(credential_backend),
                     in_memory_history,
                 ));
             })
@@ -411,28 +660,24 @@ fn emit(tx: &mpsc::Sender<WorkerEvent>, waker: &Arc<std::sync::Mutex<Option<Wake
     }
 }
 
-async fn resolve_password(
+async fn resolve_password_with_rx(
     profile: &ConnectionProfile,
     explicit: Option<String>,
-) -> Option<String> {
+    cred_rx: Option<PendingCredentialRx>,
+) -> Result<Option<String>, String> {
     if let Some(pw) = explicit.filter(|s| !s.is_empty()) {
-        return Some(pw);
+        return Ok(Some(pw));
     }
     if profile.password_mode != PasswordMode::Keychain {
-        return None;
+        return Ok(None);
     }
-    let service = profile.credential_service();
-    tokio::task::spawn_blocking(move || {
-        Credentials::system()
-            .read(&service)
-            .ok()
-            .flatten()
-            .and_then(|cred| String::from_utf8(cred.secret().to_vec()).ok())
-            .filter(|s| !s.is_empty())
-    })
-    .await
-    .ok()
-    .flatten()
+    let Some(PendingCredentialRx::Read(rx)) = cred_rx else {
+        return Ok(None);
+    };
+    let secret = rx
+        .await
+        .map_err(|_| "credential worker channel closed".to_owned())??;
+    Ok(secret.filter(|s| !s.is_empty()))
 }
 
 fn pick_default_schema(schemas: &[SchemaInfo], preferred: Option<&str>) -> Option<String> {
@@ -604,6 +849,7 @@ async fn emit_session_mode(
 async fn reconnect_session(
     sessions: &SessionMap,
     connector: &SessionConnector,
+    credentials: &CredentialRunner,
     session_id: SessionId,
     stale_session: &Arc<dyn DbSession>,
     stale_connect_req_id: RequestId,
@@ -652,8 +898,20 @@ async fn reconnect_session(
 
     let pw = if cached_pw.is_some() {
         cached_pw
+    } else if profile.password_mode == PasswordMode::Keychain {
+        let rx = credentials.enqueue_read(&profile.credential_service());
+        match resolve_password_with_rx(&profile, None, Some(PendingCredentialRx::Read(rx))).await {
+            Ok(pw) => pw,
+            Err(msg) => {
+                let err = DbError::ConnectionFailed(format!("keychain read failed: {msg}"));
+                gate_guard.last_failure = Some((Instant::now(), err.clone()));
+                let still_current =
+                    current_connect_req_id(sessions, session_id, stale_connect_req_id).await;
+                return Err((still_current, err));
+            }
+        }
     } else {
-        resolve_password(&profile, None).await
+        None
     };
 
     match (connector)(profile, pw.clone(), database).await {
@@ -683,6 +941,7 @@ async fn reconnect_session(
 async fn prepare_session(
     sessions: &SessionMap,
     connector: &SessionConnector,
+    credentials: &CredentialRunner,
     session_id: SessionId,
     liveness: LivenessCheck,
     expected_connect_req_id: Option<RequestId>,
@@ -709,24 +968,38 @@ async fn prepare_session(
     }
 
     if session.is_disconnected() {
-        return reconnect_session(sessions, connector, session_id, &session, connect_req_id)
-            .await
-            .map_err(|(cid, cause)| SessionCallError::Disconnected {
-                connect_req_id: cid,
-                cause,
-            });
+        return reconnect_session(
+            sessions,
+            connector,
+            credentials,
+            session_id,
+            &session,
+            connect_req_id,
+        )
+        .await
+        .map_err(|(cid, cause)| SessionCallError::Disconnected {
+            connect_req_id: cid,
+            cause,
+        });
     }
 
     if liveness == LivenessCheck::AlwaysPing
         && let Err(err) = session.ping().await
     {
         if is_session_disconnect_err(session.as_ref(), &err) {
-            return reconnect_session(sessions, connector, session_id, &session, connect_req_id)
-                .await
-                .map_err(|(cid, cause)| SessionCallError::Disconnected {
-                    connect_req_id: cid,
-                    cause,
-                });
+            return reconnect_session(
+                sessions,
+                connector,
+                credentials,
+                session_id,
+                &session,
+                connect_req_id,
+            )
+            .await
+            .map_err(|(cid, cause)| SessionCallError::Disconnected {
+                connect_req_id: cid,
+                cause,
+            });
         }
         return Err(SessionCallError::Operation {
             engine: session.engine(),
@@ -741,6 +1014,7 @@ async fn prepare_session(
 struct WorkerCtx<'a> {
     sessions: &'a SessionMap,
     connector: &'a SessionConnector,
+    credentials: &'a CredentialRunner,
     event_tx: &'a mpsc::Sender<WorkerEvent>,
     waker: &'a Arc<std::sync::Mutex<Option<Waker>>>,
 }
@@ -760,12 +1034,14 @@ where
     let WorkerCtx {
         sessions,
         connector,
+        credentials,
         event_tx,
         waker,
     } = ctx;
     let (session, connect_req_id) = match prepare_session(
         sessions,
         connector,
+        credentials,
         session_id,
         liveness,
         expected_connect_req_id,
@@ -795,9 +1071,15 @@ where
                     cause: unwrap_disconnect_cause(error),
                 });
             }
-            let (fresh_session, fresh_cid) =
-                reconnect_session(sessions, connector, session_id, &session, connect_req_id)
-                    .await
+            let (fresh_session, fresh_cid) = reconnect_session(
+                sessions,
+                connector,
+                credentials,
+                session_id,
+                &session,
+                connect_req_id,
+            )
+            .await
                     .map_err(|(cid, cause)| SessionCallError::Disconnected {
                         connect_req_id: cid,
                         cause,
@@ -836,6 +1118,7 @@ async fn worker_loop(
     event_tx: mpsc::Sender<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
     connector: SessionConnector,
+    credentials: CredentialRunner,
     in_memory_history: bool,
 ) {
     let sessions: SessionMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -856,6 +1139,62 @@ async fn worker_loop(
         let event_tx = event_tx.clone();
         let waker = Arc::clone(&waker);
         let connector = Arc::clone(&connector);
+        let credentials_clone = credentials.clone();
+
+        let cred_rx = match &cmd {
+            WorkerCmd::SaveCredential {
+                service,
+                account,
+                secret,
+                ..
+            } => Some(PendingCredentialRx::Mutate(if secret.is_empty() {
+                credentials.enqueue_delete(service)
+            } else {
+                credentials.enqueue_write(service, account, secret)
+            })),
+            WorkerCmd::DeleteCredential { service, .. } => {
+                Some(PendingCredentialRx::Mutate(credentials.enqueue_delete(service)))
+            }
+            WorkerCmd::LoadCredentialForEdit { service, .. } => {
+                Some(PendingCredentialRx::Read(credentials.enqueue_read(service)))
+            }
+            WorkerCmd::Connect {
+                profile,
+                prompt_password,
+                ..
+            }
+            | WorkerCmd::SelectDatabase {
+                profile,
+                prompt_password,
+                ..
+            } => {
+                if prompt_password.as_deref().is_some_and(|s| !s.is_empty())
+                    || profile.password_mode != PasswordMode::Keychain
+                {
+                    None
+                } else {
+                    Some(PendingCredentialRx::Read(
+                        credentials.enqueue_read(&profile.credential_service()),
+                    ))
+                }
+            }
+            WorkerCmd::TestConnection {
+                profile,
+                password_override,
+                ..
+            } => {
+                if password_override.as_deref().is_some_and(|s| !s.is_empty())
+                    || profile.password_mode != PasswordMode::Keychain
+                {
+                    None
+                } else {
+                    Some(PendingCredentialRx::Read(
+                        credentials.enqueue_read(&profile.credential_service()),
+                    ))
+                }
+            }
+            _ => None,
+        };
 
         let lifecycle_epoch = match &cmd {
             WorkerCmd::Connect { session_id, .. } | WorkerCmd::SelectDatabase { session_id, .. } => {
@@ -919,6 +1258,8 @@ async fn worker_loop(
                 event_tx,
                 waker,
                 connector,
+                credentials_clone,
+                cred_rx,
             )
             .await;
         });
@@ -938,7 +1279,16 @@ async fn handle_cmd(
     event_tx: mpsc::Sender<WorkerEvent>,
     waker: Arc<std::sync::Mutex<Option<Waker>>>,
     connector: SessionConnector,
+    credentials: CredentialRunner,
+    cred_rx: Option<PendingCredentialRx>,
 ) {
+    let worker_ctx = WorkerCtx {
+        sessions: &sessions,
+        connector: &connector,
+        credentials: &credentials,
+        event_tx: &event_tx,
+        waker: &waker,
+    };
     match cmd {
         WorkerCmd::Connect {
             session_id,
@@ -955,7 +1305,23 @@ async fn handle_cmd(
                 .or_else(|| profile.database.as_deref().map(str::trim).filter(|s| !s.is_empty()))
                 .map(str::to_owned);
 
-            let pw = resolve_password(&profile, prompt_password).await;
+            let pw = match resolve_password_with_rx(&profile, prompt_password, cred_rx).await {
+                Ok(pw) => pw,
+                Err(msg) => {
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(
+                            &event_tx,
+                            &waker,
+                            WorkerEvent::ConnectFailed {
+                                session_id,
+                                req_id,
+                                error: DbError::ConnectionFailed(format!("keychain read failed: {msg}")),
+                            },
+                        );
+                    }
+                    return;
+                }
+            };
             let connected = (connector)(profile.clone(), pw.clone(), explicit_db.clone()).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
@@ -1086,7 +1452,23 @@ async fn handle_cmd(
             prompt_password,
             database,
         } => {
-            let pw = resolve_password(&profile, prompt_password).await;
+            let pw = match resolve_password_with_rx(&profile, prompt_password, cred_rx).await {
+                Ok(pw) => pw,
+                Err(msg) => {
+                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                        emit(
+                            &event_tx,
+                            &waker,
+                            WorkerEvent::OperationFailed {
+                                session_id,
+                                req_id,
+                                error: DbError::ConnectionFailed(format!("keychain read failed: {msg}")),
+                            },
+                        );
+                    }
+                    return;
+                }
+            };
             let connected = (connector)(profile.clone(), pw.clone(), Some(database.clone())).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
@@ -1186,12 +1568,7 @@ async fn handle_cmd(
             schema,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1242,12 +1619,7 @@ async fn handle_cmd(
             object,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1310,12 +1682,7 @@ async fn handle_cmd(
             active_schema,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1403,12 +1770,7 @@ async fn handle_cmd(
             request,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1476,12 +1838,7 @@ async fn handle_cmd(
             table,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1584,6 +1941,7 @@ async fn handle_cmd(
                 let prep_fut = prepare_session(
                     &sessions,
                     &connector,
+                    &credentials,
                     session_id,
                     LivenessCheck::AlwaysPing,
                     Some(connect_req_id),
@@ -1702,6 +2060,7 @@ async fn handle_cmd(
                                         let rec_fut = reconnect_session(
                                             &sessions,
                                             &connector,
+                                            &credentials,
                                             session_id,
                                             &session,
                                             session_cid,
@@ -2022,59 +2381,78 @@ async fn handle_cmd(
             profile,
             password_override,
         } => {
-            let pw = resolve_password(&profile, password_override).await;
-            let result = test_connection(&profile, pw.as_deref()).await;
+            let result = match resolve_password_with_rx(&profile, password_override, cred_rx).await {
+                Ok(pw) => test_connection(&profile, pw.as_deref()).await,
+                Err(msg) => Err(DbError::ConnectionFailed(format!("keychain read failed: {msg}"))),
+            };
             emit(&event_tx, &waker, WorkerEvent::TestResult { req_id, result });
         }
 
         WorkerCmd::SaveCredential {
-            service,
-            account,
-            secret,
+            req_id,
+            connection_id,
+            ..
         } => {
-            drop(
-                tokio::task::spawn_blocking(move || {
-                    if secret.is_empty() {
-                        drop(Credentials::system().delete(&service));
-                    } else {
-                        drop(Credentials::system().write(&service, &account, secret.as_bytes()));
-                    }
-                })
-                .await,
+            let result = match cred_rx {
+                Some(PendingCredentialRx::Mutate(rx)) => rx
+                    .await
+                    .map_err(|_| "credential worker channel closed".to_owned())
+                    .and_then(|res| res),
+                _ => Ok(()),
+            };
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::CredentialSaved {
+                    req_id,
+                    connection_id,
+                    result,
+                },
             );
         }
 
-        WorkerCmd::DeleteCredential { service } => {
-            drop(
-                tokio::task::spawn_blocking(move || {
-                    drop(Credentials::system().delete(&service));
-                })
-                .await,
+        WorkerCmd::DeleteCredential {
+            req_id,
+            connection_id,
+            ..
+        } => {
+            let result = match cred_rx {
+                Some(PendingCredentialRx::Mutate(rx)) => rx
+                    .await
+                    .map_err(|_| "credential worker channel closed".to_owned())
+                    .and_then(|res| res),
+                _ => Ok(()),
+            };
+            emit(
+                &event_tx,
+                &waker,
+                WorkerEvent::CredentialDeleted {
+                    req_id,
+                    connection_id,
+                    result,
+                },
             );
         }
 
         WorkerCmd::LoadCredentialForEdit {
             req_id,
             connection_id,
-            service,
+            ..
         } => {
-            let secret = tokio::task::spawn_blocking(move || {
-                Credentials::system()
-                    .read(&service)
-                    .ok()
-                    .flatten()
-                    .and_then(|c| String::from_utf8(c.secret().to_vec()).ok())
-            })
-            .await
-            .ok()
-            .flatten();
+            let result = match cred_rx {
+                Some(PendingCredentialRx::Read(rx)) => rx
+                    .await
+                    .map_err(|_| "credential worker channel closed".to_owned())
+                    .and_then(|res| res),
+                _ => Ok(None),
+            };
             emit(
                 &event_tx,
                 &waker,
                 WorkerEvent::CredentialLoaded {
                     req_id,
                     connection_id,
-                    secret,
+                    result,
                 },
             );
         }
@@ -2087,12 +2465,7 @@ async fn handle_cmd(
             statements,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::AlwaysPing,
                 false,
@@ -2166,12 +2539,7 @@ async fn handle_cmd(
                 LivenessCheck::Fast
             };
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 liveness,
                 !analyze,
@@ -2233,12 +2601,7 @@ async fn handle_cmd(
             source_col,
         } => {
             let outcome = run_with_reconnect(
-                WorkerCtx {
-                    sessions: &sessions,
-                    connector: &connector,
-                    event_tx: &event_tx,
-                    waker: &waker,
-                },
+                worker_ctx,
                 session_id,
                 LivenessCheck::Fast,
                 true,
