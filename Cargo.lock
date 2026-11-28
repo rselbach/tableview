@@ -5092,6 +5092,7 @@ dependencies = [
  "chrono",
  "directories",
  "exacl",
+ "futures-core",
  "mysql_async",
  "rusqlite",
  "rustix 1.1.6",

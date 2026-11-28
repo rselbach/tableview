@@ -17,7 +17,7 @@ use tv_core::{
     StatementInspection, StorageError, StoreData, TabId, TablePage, TableStructure, TableTransactionSupport,
     atomic_write_bytes, build_explain_sql_for_engine, build_fk_where_clause_for_engine, default_export_filename,
     evaluate_sql_safety_for_engine_with_session_mode, evaluate_staged_commit_safety, export_rows_for_engine,
-    validate_row_editable,
+    validate_row_editable, validate_table_filter_where,
 };
 use tv_core::sql::{
     MysqlQuoteMode, PostgresSessionMode, SqlSessionMode, batch_sets_credentials_with_session_mode, cursor_line_col,
@@ -104,6 +104,7 @@ pub struct ConnectedData {
     pub server_version: String,
     pub mode_seq: u64,
     pub mysql_quote_mode: Option<MysqlQuoteMode>,
+    pub mysql_grid_quote_mode: Option<MysqlQuoteMode>,
     pub postgres_session_mode: Option<PostgresSessionMode>,
     pub databases: Vec<DatabaseInfo>,
     pub active_database: Option<String>,
@@ -1421,6 +1422,11 @@ impl SessionState {
         self.status.as_connected().and_then(|c| c.mysql_quote_mode)
     }
 
+    /// Returns live MySQL quoting flags for pooled grid connections (`@@GLOBAL.sql_mode`).
+    pub fn mysql_grid_quote_mode(&self) -> Option<MysqlQuoteMode> {
+        self.status.as_connected().and_then(|c| c.mysql_grid_quote_mode)
+    }
+
     /// Returns live PostgreSQL session string-escaping and transaction state reported by the worker.
     pub fn postgres_session_mode(&self) -> Option<PostgresSessionMode> {
         self.status
@@ -1438,6 +1444,14 @@ impl SessionState {
     pub fn sql_mode(&self) -> SqlSessionMode {
         SqlSessionMode {
             mysql: self.mysql_quote_mode(),
+            postgres: self.postgres_session_mode(),
+        }
+    }
+
+    /// Returns SQL dialect flags matching the connection pool used by table grid filters.
+    pub fn grid_sql_mode(&self) -> SqlSessionMode {
+        SqlSessionMode {
+            mysql: self.mysql_grid_quote_mode(),
             postgres: self.postgres_session_mode(),
         }
     }
@@ -3320,31 +3334,54 @@ impl AppState {
     }
 
     pub fn apply_active_tab_filter(&mut self) {
-        let blocked = {
-            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+        enum FilterAction {
+            StagedBlocked,
+            Invalid(String),
+            Ready,
+        }
+        let action = {
+            let Some(session) = self.active_session_mut() else {
+                return;
+            };
+            let engine = session.profile.engine;
+            let sql_mode = session.grid_sql_mode();
+            let Some(tab) = session.active_table_tab_mut() else {
                 return;
             };
             if tab.staged.has_changes() || tab.committing {
                 tab.diff_drawer_open = true;
-                true
+                FilterAction::StagedBlocked
             } else {
-                let trimmed = tab.filter_input.text.trim();
-                tab.applied_filter = (!trimmed.is_empty()).then(|| trimmed.to_owned());
-                tab.filter_error = None;
-                tab.offset = 0;
-                tab.selected_row = None;
-                tab.selected_row_key = None;
-                tab.selected_cell = None;
-                tab.editing_cell = None;
-                tab.data_table.clear_selection();
-                false
+                let trimmed = tab.filter_input.text.trim().to_owned();
+                if !(engine == DbEngine::Mysql && sql_mode.mysql.is_none())
+                    && let Err(err) = validate_table_filter_where(engine, &trimmed, sql_mode)
+                {
+                    tab.filter_error = Some(err.clone());
+                    FilterAction::Invalid(err)
+                } else {
+                    tab.applied_filter = (!trimmed.is_empty()).then_some(trimmed);
+                    tab.filter_error = None;
+                    tab.offset = 0;
+                    tab.selected_row = None;
+                    tab.selected_row_key = None;
+                    tab.selected_cell = None;
+                    tab.editing_cell = None;
+                    tab.data_table.clear_selection();
+                    FilterAction::Ready
+                }
             }
         };
-        if blocked {
-            self.set_notice("Commit or discard staged changes before filtering rows", true);
-            return;
+        match action {
+            FilterAction::StagedBlocked => {
+                self.set_notice("Commit or discard staged changes before filtering rows", true);
+            }
+            FilterAction::Invalid(msg) => {
+                self.set_notice(msg, true);
+            }
+            FilterAction::Ready => {
+                self.dispatch_active_tab_page();
+            }
         }
-        self.dispatch_active_tab_page();
     }
 
     pub fn clear_active_tab_filter(&mut self) {
@@ -5448,6 +5485,7 @@ impl AppState {
                 req_id,
                 server_info,
                 mysql_quote_mode,
+                mysql_grid_quote_mode,
                 postgres_session_mode,
                 databases,
                 active_database,
@@ -5479,6 +5517,7 @@ impl AppState {
                         server_version: server_info.version,
                         mode_seq: 0,
                         mysql_quote_mode,
+                        mysql_grid_quote_mode,
                         postgres_session_mode,
                         databases,
                         active_database: active_database.clone(),
@@ -5668,6 +5707,7 @@ impl AppState {
                 is_db_switch,
                 server_version,
                 mysql_quote_mode,
+                mysql_grid_quote_mode,
                 postgres_session_mode,
                 databases,
                 active_database,
@@ -5712,6 +5752,7 @@ impl AppState {
                             data.mode_seq = 0;
                             if session.profile.engine == DbEngine::Mysql {
                                 data.mysql_quote_mode = mysql_quote_mode;
+                                data.mysql_grid_quote_mode = mysql_grid_quote_mode;
                             } else if session.profile.engine == DbEngine::Postgres {
                                 data.postgres_session_mode = postgres_session_mode;
                             }
@@ -5730,6 +5771,7 @@ impl AppState {
                             server_version: server_version.unwrap_or_default(),
                             mode_seq: 0,
                             mysql_quote_mode,
+                            mysql_grid_quote_mode,
                             postgres_session_mode,
                             databases,
                             active_database: Some(active_database),
@@ -5918,6 +5960,7 @@ impl AppState {
                 connect_req_id,
                 mode_seq,
                 mysql_quote_mode,
+                mysql_grid_quote_mode,
                 postgres_session_mode,
             } => {
                 let Some(session) = self.sessions.get_mut(&session_id) else {
@@ -5930,6 +5973,7 @@ impl AppState {
                     data.mode_seq = mode_seq;
                     if session.profile.engine == DbEngine::Mysql {
                         data.mysql_quote_mode = mysql_quote_mode;
+                        data.mysql_grid_quote_mode = mysql_grid_quote_mode;
                     } else if session.profile.engine == DbEngine::Postgres {
                         data.postgres_session_mode = postgres_session_mode;
                     }
@@ -6842,6 +6886,7 @@ mod tests {
             server_version: "PostgreSQL 18.6".to_owned(),
             mode_seq: 0,
             mysql_quote_mode: None,
+            mysql_grid_quote_mode: None,
             postgres_session_mode: Some(PostgresSessionMode::new(true)),
             databases: Vec::new(),
             active_database: Some("greendale".to_owned()),
@@ -6869,6 +6914,7 @@ mod tests {
                 connect_req_id,
                 mode_seq: 2,
                 mysql_quote_mode: None,
+                mysql_grid_quote_mode: None,
                 postgres_session_mode: Some(newer_mode.clone()),
             },
             &mut tx,
@@ -6880,6 +6926,7 @@ mod tests {
                 connect_req_id,
                 mode_seq: 1,
                 mysql_quote_mode: None,
+                mysql_grid_quote_mode: None,
                 postgres_session_mode: Some(older_mode),
             },
             &mut tx,

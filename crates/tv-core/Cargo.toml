@@ -11,6 +11,7 @@ workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 directories.workspace = true
+futures-core.workspace = true
 mysql_async.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true

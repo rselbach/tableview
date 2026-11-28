@@ -33,6 +33,7 @@ pub use safety::{
     evaluate_sql_safety_for_engine_with_mysql_mode, evaluate_sql_safety_for_engine_with_session_mode,
     evaluate_staged_commit_safety, inspect_statement, inspect_statement_for_engine,
     inspect_statement_for_engine_with_mysql_mode, inspect_statement_for_engine_with_session_mode,
+    validate_table_filter_where,
 };
 pub use sql::{
     MysqlFlavor, MysqlQuoteMode, MysqlServerVersion, PostgresSavepointMode, PostgresServerEncoding,

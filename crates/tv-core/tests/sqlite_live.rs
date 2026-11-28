@@ -577,7 +577,7 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
         let ro_tx = ro_session
             .execute_transaction(&["DELETE FROM students WHERE student_id = 5".to_owned()])
             .await;
-        assert!(matches!(ro_tx, Err(DbError::QueryFailed { .. })));
+        assert!(matches!(ro_tx, Err(DbError::InvalidInput(_))));
 
         // Live query cancellation via InterruptHandle
         let shared = Arc::clone(&session);
@@ -1261,5 +1261,151 @@ fn live_sqlite_staged_mutations_enforce_typed_identity_null_pk_rejection_and_opt
             .await
             .expect("verify nul_notes update");
         assert_eq!(nul_hex.results[0].rows[0][0], CellValue::Text("6D006E".to_owned()));
+    });
+}
+
+#[test]
+fn live_sqlite_read_only_memory_enforces_query_only_and_filter_guardrails() {
+    let rt = Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let mut ro_mem = ConnectionProfile::new_sqlite("Greendale RO Memory", ":memory:");
+        ro_mem.safety = SafetyPolicy::ReadOnly;
+        let (mem_session, _) = connect_session(&ro_mem, None, None)
+            .await
+            .expect("connect :memory: ReadOnly");
+
+        for pragma_attempt in ["PRAGMA query_only(0)", "PRAGMA query_only = 0"] {
+            let (pragma_batch, _) = mem_session
+                .execute_sql(&[pragma_attempt.to_owned()], None)
+                .await
+                .expect("authorizer denial returns batch error");
+            assert!(
+                pragma_batch.results[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.to_ascii_lowercase().contains("not authorized")),
+                "expected authorizer denial for {pragma_attempt}, got {:?}",
+                pragma_batch.results[0].error
+            );
+        }
+
+        let (sql_batch, _) = mem_session
+            .execute_sql(&["CREATE TABLE blocked (id INTEGER PRIMARY KEY)".to_owned()], None)
+            .await
+            .expect("PRAGMA query_only :memory: write returns batch error");
+        assert!(
+            sql_batch.results[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| {
+                    let lower = e.to_ascii_lowercase();
+                    lower.contains("readonly") || lower.contains("not authorized")
+                }),
+            "expected readonly/authorizer error, got {:?}",
+            sql_batch.results[0].error
+        );
+
+        let tx_err = mem_session
+            .execute_transaction(&["CREATE TABLE blocked (id INTEGER PRIMARY KEY)".to_owned()])
+            .await
+            .expect_err("ReadOnly session must reject execute_transaction");
+        assert!(matches!(tx_err, DbError::InvalidInput(_)), "got {tx_err:?}");
+
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("greendale_ro.sqlite3");
+        {
+            let conn = Connection::open(&db_path).expect("seed sqlite db");
+            conn.execute_batch(
+                "CREATE TABLE students (student_id INTEGER PRIMARY KEY, full_name TEXT NOT NULL, [update] INTEGER NOT NULL DEFAULT 1);
+                 INSERT INTO students (student_id, full_name, [update]) VALUES (1, 'Troy Barnes', 1), (2, 'Abed Nadir', 0);",
+            )
+            .expect("seed students");
+        }
+
+        let mut ro_file = ConnectionProfile::new_sqlite("Greendale RO File", &db_path);
+        ro_file.safety = SafetyPolicy::ReadOnly;
+        let (ro_session, _) = connect_session(&ro_file, None, None)
+            .await
+            .expect("connect file ReadOnly");
+
+        let (objs, _) = ro_session.list_objects("main").await.expect("list_objects RO");
+        assert!(objs.iter().any(|o| o.name == "students"));
+        let (described, _) = ro_session
+            .describe_table("main", "students")
+            .await
+            .expect("describe_table RO");
+        assert_eq!(described.columns.len(), 3);
+        let _ = ro_session
+            .explain_sql("SELECT * FROM students WHERE student_id = 1", false)
+            .await
+            .expect("explain_sql RO");
+
+        let (valid_page, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("replace(full_name, 'Troy', 'T-Bone') = 'T-Bone Barnes' AND [update] = 1".to_owned()),
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("valid replace() + [update] filter");
+        assert_eq!(valid_page.rows.len(), 1);
+        assert_eq!(valid_page.rows[0][1], CellValue::Text("Troy Barnes".to_owned()));
+
+        for unsafe_filter in [
+            "1=1; DROP TABLE students",
+            "1=1) UNION SELECT 1, 'Dean Pelton'",
+        ] {
+            let err = ro_session
+                .fetch_table_page(&PageRequest {
+                    schema: "main".to_owned(),
+                    table: "students".to_owned(),
+                    filter_where: Some(unsafe_filter.to_owned()),
+                    sort: None,
+                    limit: 10,
+                    offset: 0,
+                })
+                .await
+                .expect_err("unsafe filter must be rejected");
+            assert!(
+                matches!(err, DbError::InvalidInput(_)),
+                "filter {unsafe_filter:?} -> {err:?}"
+            );
+        }
+
+        let malformed_err = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("student_id = (".to_owned()),
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect_err("malformed SQL should still surface QueryFailed from SQLite");
+        assert!(
+            matches!(malformed_err, DbError::QueryFailed { .. }),
+            "expected QueryFailed for syntax error, got {malformed_err:?}"
+        );
+
+        let mut staged = StagedChanges::new();
+        staged.stage_cell_edit_with_raw(
+            0,
+            &valid_page.rows[0],
+            valid_page.raw_row(0),
+            1,
+            StagedCellValue::Literal("T-Bone".to_owned()),
+        );
+        let batch = staged
+            .build_commit_batch(DbEngine::Sqlite, "main", "students", &valid_page.columns)
+            .expect("build staged batch");
+        let staged_err = ro_session
+            .execute_staged_mutations(&batch)
+            .await
+            .expect_err("ReadOnly session must reject staged commit");
+        assert!(matches!(staged_err, DbError::InvalidInput(_)), "got {staged_err:?}");
     });
 }

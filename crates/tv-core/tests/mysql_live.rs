@@ -586,5 +586,80 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
             .await
             .expect("refetch after rollback");
         assert_eq!(after_rollback.rows[0][2], CellValue::Text("Troy 'T-Bone' Barnes".to_owned()));
+
+        // Persistent editor connection (#12) preserves transactions, temporary tables, and @vars.
+        shared
+            .execute_sql(
+                &[
+                    "START TRANSACTION".to_owned(),
+                    format!(
+                        "INSERT INTO {fq_students} (`student_id`, `id`, `full_name`, `major`) VALUES (88, '88888888-8888-8888-8888-888888888888', 'Magnitude', 'Pop Pop')"
+                    ),
+                ],
+                None,
+            )
+            .await
+            .expect("editor tx start");
+        shared
+            .execute_sql(&["ROLLBACK".to_owned()], None)
+            .await
+            .expect("editor tx rollback across executions");
+        let (after_ed_rb, _) = shared
+            .execute_sql(
+                &[format!("SELECT COUNT(*) FROM {fq_students} WHERE `student_id` = 88")],
+                None,
+            )
+            .await
+            .expect("check rolled back row");
+        assert_eq!(after_ed_rb.results[0].rows[0][0], CellValue::Int(0));
+
+        shared
+            .execute_sql(
+                &[
+                    "CREATE TEMPORARY TABLE tmp_study (label VARCHAR(64))".to_owned(),
+                    "INSERT INTO tmp_study VALUES ('Study Room F')".to_owned(),
+                    "SET @campus_note = 'Greendale'".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("create temp table and session var");
+        let (sess_state_res, _) = shared
+            .execute_sql(&["SELECT label, @campus_note FROM tmp_study".to_owned()], None)
+            .await
+            .expect("temp table and session var persist");
+        assert_eq!(
+            sess_state_res.results[0].rows[0],
+            vec![
+                CellValue::Text("Study Room F".to_owned()),
+                CellValue::Text("Greendale".to_owned()),
+            ]
+        );
+
+        // Cancelling a running editor query retains the persistent connection and its temp table / @var state.
+        let shared = Arc::new(shared);
+        let cancel_target = Arc::clone(&shared);
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            cancel_target.cancel_running_query().await
+        });
+        let (cancelled_batch, _) = shared
+            .execute_sql(&["SELECT SLEEP(5)".to_owned()], None)
+            .await
+            .expect("cancelled SLEEP returns batch");
+        cancel_task.await.expect("join cancel").expect("cancel ok");
+        assert!(cancelled_batch.cancelled);
+
+        let (after_cancel_state, _) = shared
+            .execute_sql(&["SELECT label, @campus_note FROM tmp_study".to_owned()], None)
+            .await
+            .expect("temp table and @var survive confirmed cancel");
+        assert_eq!(
+            after_cancel_state.results[0].rows[0],
+            vec![
+                CellValue::Text("Study Room F".to_owned()),
+                CellValue::Text("Greendale".to_owned()),
+            ]
+        );
     });
 }

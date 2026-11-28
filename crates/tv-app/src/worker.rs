@@ -7,11 +7,12 @@ use rune::credentials::Credentials;
 use tv_core::engine::{connect_session, test_connection};
 use tv_core::{
     AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine,
-    DbError, DbObject, DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode,
+    DbError, DbObject, DbSession, EnvTag, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode,
     NewHistoryEntry, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult, QueryHistoryEntry,
-    QueryStore, RequestId, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo, SessionId, SqlSessionMode, TabId,
-    TablePage, TableStructure, TransactionOutcome, StagedCommitBatch, batch_sets_credentials_with_session_mode,
-    trim_sql_whitespace_for_engine,
+    QueryStore, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo,
+    SessionId, SqlSessionMode, TabId, TablePage, TableStructure, TransactionOutcome, StagedCommitBatch,
+    batch_sets_credentials_with_session_mode, build_explain_sql_for_engine,
+    evaluate_sql_safety_for_engine_with_session_mode, trim_sql_whitespace_for_engine,
 };
 
 const QUERY_HISTORY_LIMIT: usize = 200;
@@ -193,6 +194,7 @@ pub enum WorkerEvent {
         req_id: RequestId,
         server_info: ServerInfo,
         mysql_quote_mode: Option<MysqlQuoteMode>,
+        mysql_grid_quote_mode: Option<MysqlQuoteMode>,
         postgres_session_mode: Option<PostgresSessionMode>,
         databases: Vec<DatabaseInfo>,
         active_database: Option<String>,
@@ -217,6 +219,7 @@ pub enum WorkerEvent {
         is_db_switch: bool,
         server_version: Option<String>,
         mysql_quote_mode: Option<MysqlQuoteMode>,
+        mysql_grid_quote_mode: Option<MysqlQuoteMode>,
         postgres_session_mode: Option<PostgresSessionMode>,
         databases: Vec<DatabaseInfo>,
         active_database: String,
@@ -273,6 +276,7 @@ pub enum WorkerEvent {
         connect_req_id: RequestId,
         mode_seq: u64,
         mysql_quote_mode: Option<MysqlQuoteMode>,
+        mysql_grid_quote_mode: Option<MysqlQuoteMode>,
         postgres_session_mode: Option<PostgresSessionMode>,
     },
     QueryLibraryLoaded {
@@ -838,6 +842,7 @@ async fn emit_session_mode(
     }
     entry.mode_seq = entry.mode_seq.saturating_add(1);
     let mysql_quote_mode = entry.session.mysql_quote_mode();
+    let mysql_grid_quote_mode = entry.session.mysql_grid_quote_mode();
     let postgres_session_mode = entry.session.postgres_session_mode();
     emit(
         event_tx,
@@ -847,6 +852,7 @@ async fn emit_session_mode(
             connect_req_id: entry.connect_req_id,
             mode_seq: entry.mode_seq,
             mysql_quote_mode,
+            mysql_grid_quote_mode,
             postgres_session_mode,
         },
     );
@@ -999,6 +1005,17 @@ struct WorkerCtx<'a> {
     connector: &'a SessionConnector,
     event_tx: &'a mpsc::Sender<WorkerEvent>,
     waker: &'a Arc<std::sync::Mutex<Option<Waker>>>,
+}
+
+async fn session_safety_context(
+    sessions: &SessionMap,
+    session_id: SessionId,
+    expected_connect_req_id: RequestId,
+) -> Option<(SafetyPolicy, EnvTag, DbEngine)> {
+    let map = sessions.lock().await;
+    let entry = map.get(&session_id)?;
+    (entry.connect_req_id == expected_connect_req_id)
+        .then_some((entry.profile.safety, entry.profile.env, entry.profile.engine))
 }
 
 async fn run_with_reconnect<T, F, Fut>(
@@ -1366,6 +1383,7 @@ async fn handle_cmd(
             };
 
             let mysql_quote_mode = session.mysql_quote_mode();
+            let mysql_grid_quote_mode = session.mysql_grid_quote_mode();
             let postgres_session_mode = session.postgres_session_mode();
             {
                 let mut map = sessions.lock().await;
@@ -1392,6 +1410,7 @@ async fn handle_cmd(
                         req_id,
                         server_info,
                         mysql_quote_mode,
+                        mysql_grid_quote_mode,
                         postgres_session_mode,
                         databases,
                         active_database,
@@ -1518,6 +1537,7 @@ async fn handle_cmd(
 
             let server_version = session.server_info().version.clone();
             let mysql_quote_mode = session.mysql_quote_mode();
+            let mysql_grid_quote_mode = session.mysql_grid_quote_mode();
             let postgres_session_mode = session.postgres_session_mode();
             {
                 let mut map = sessions.lock().await;
@@ -1545,6 +1565,7 @@ async fn handle_cmd(
                         is_db_switch: true,
                         server_version: Some(server_version),
                         mysql_quote_mode,
+                        mysql_grid_quote_mode,
                         postgres_session_mode,
                         databases,
                         active_database: database,
@@ -1731,6 +1752,7 @@ async fn handle_cmd(
                         is_db_switch: false,
                         server_version: None,
                         mysql_quote_mode: None,
+                        mysql_grid_quote_mode: None,
                         postgres_session_mode: None,
                         databases,
                         active_database,
@@ -1767,11 +1789,20 @@ async fn handle_cmd(
             connect_req_id,
             request,
         } => {
+            let has_custom_filter = request
+                .filter_where
+                .as_deref()
+                .is_some_and(|w| !w.trim().is_empty());
+            let liveness = if has_custom_filter {
+                LivenessCheck::AlwaysPing
+            } else {
+                LivenessCheck::Fast
+            };
             let outcome = run_with_reconnect(
                 worker_ctx,
                 session_id,
-                LivenessCheck::Fast,
-                true,
+                liveness,
+                !has_custom_filter,
                 Some(connect_req_id),
                 |session| {
                     let req = request.clone();
@@ -1931,7 +1962,28 @@ async fn handle_cmd(
                 },
             };
             let mut skipped_for_mode_mismatch = false;
-            let outcome = if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow() {
+            let safety_block = if let Some((SafetyPolicy::ReadOnly, env, session_engine)) =
+                session_safety_context(&sessions, session_id, connect_req_id).await
+            {
+                match evaluate_sql_safety_for_engine_with_session_mode(
+                    session_engine,
+                    SafetyPolicy::ReadOnly,
+                    env,
+                    &statements,
+                    initial_sql_mode.clone(),
+                ) {
+                    SafetyDecision::Block { reason, .. } => Some((session_engine, reason)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let outcome = if let Some((blocked_engine, reason)) = safety_block {
+                Err(SessionCallError::Operation {
+                    engine: blocked_engine,
+                    error: DbError::InvalidInput(reason),
+                })
+            } else if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow() {
                 Err(SessionCallError::Operation {
                     engine: DbEngine::Postgres,
                     error: DbError::Cancelled,
@@ -2461,18 +2513,30 @@ async fn handle_cmd(
             connect_req_id,
             batch,
         } => {
-            let outcome = run_with_reconnect(
-                worker_ctx,
-                session_id,
-                LivenessCheck::AlwaysPing,
-                false,
-                Some(connect_req_id),
-                |session| {
-                    let batch = batch.clone();
-                    async move { session.execute_staged_mutations(&batch).await }
-                },
-            )
-            .await;
+            let ro_block = session_safety_context(&sessions, session_id, connect_req_id)
+                .await
+                .and_then(|(policy, _, engine)| {
+                    (policy == SafetyPolicy::ReadOnly).then_some(engine)
+                });
+            let outcome = if let Some(blocked_engine) = ro_block {
+                Err(SessionCallError::Operation {
+                    engine: blocked_engine,
+                    error: DbError::InvalidInput("Read-Only connection blocks committing staged changes".to_owned()),
+                })
+            } else {
+                run_with_reconnect(
+                    worker_ctx,
+                    session_id,
+                    LivenessCheck::AlwaysPing,
+                    false,
+                    Some(connect_req_id),
+                    |session| {
+                        let batch = batch.clone();
+                        async move { session.execute_staged_mutations(&batch).await }
+                    },
+                )
+                .await
+            };
 
             match outcome {
                 Ok((outcome, logs)) => emit(
@@ -2534,24 +2598,49 @@ async fn handle_cmd(
             analyze,
             expected_sql_mode,
         } => {
+            let ro_block = if analyze
+                && let Some((SafetyPolicy::ReadOnly, env, session_engine)) =
+                    session_safety_context(&sessions, session_id, connect_req_id).await
+            {
+                let wrapped = vec![build_explain_sql_for_engine(session_engine, &statement, true)];
+                match evaluate_sql_safety_for_engine_with_session_mode(
+                    session_engine,
+                    SafetyPolicy::ReadOnly,
+                    env,
+                    &wrapped,
+                    expected_sql_mode.clone(),
+                ) {
+                    SafetyDecision::Block { reason, .. } => Some((session_engine, reason)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let liveness = if analyze {
                 LivenessCheck::AlwaysPing
             } else {
                 LivenessCheck::Fast
             };
-            let outcome = run_with_reconnect(
-                worker_ctx,
-                session_id,
-                liveness,
-                !analyze,
-                Some(connect_req_id),
-                |session| {
-                    let stmt = statement.clone();
-                    let expected_mode = expected_sql_mode.clone();
-                    async move { session.explain_sql_checked(&stmt, analyze, expected_mode).await }
-                },
-            )
-            .await;
+            let outcome = if let Some((blocked_engine, reason)) = ro_block {
+                Err(SessionCallError::Operation {
+                    engine: blocked_engine,
+                    error: DbError::InvalidInput(reason),
+                })
+            } else {
+                run_with_reconnect(
+                    worker_ctx,
+                    session_id,
+                    liveness,
+                    !analyze,
+                    Some(connect_req_id),
+                    |session| {
+                        let stmt = statement.clone();
+                        let expected_mode = expected_sql_mode.clone();
+                        async move { session.explain_sql_checked(&stmt, analyze, expected_mode).await }
+                    },
+                )
+                .await
+            };
 
             match outcome {
                 Ok((plan, log)) => emit(

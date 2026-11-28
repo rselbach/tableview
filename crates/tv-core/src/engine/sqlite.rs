@@ -63,6 +63,28 @@ fn flag_cancelled(cancel_flag: Option<&AtomicBool>) -> bool {
     cancel_flag.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
+fn is_readonly_sqlite_pragma(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "table_info"
+            | "table_xinfo"
+            | "index_list"
+            | "index_info"
+            | "index_xinfo"
+            | "foreign_key_list"
+            | "foreign_key_check"
+            | "integrity_check"
+            | "quick_check"
+            | "collation_list"
+            | "database_list"
+            | "function_list"
+            | "module_list"
+            | "pragma_list"
+            | "table_list"
+            | "compile_options"
+    )
+}
+
 /// Active SQLite database session backed by `rusqlite` on Tokio's blocking pool.
 pub struct SqliteSession {
     conn: Arc<Mutex<Connection>>,
@@ -70,6 +92,7 @@ pub struct SqliteSession {
     cancel_state: Arc<Mutex<SqliteCancelState>>,
     interrupt_handle: InterruptHandle,
     server_info: ServerInfo,
+    read_only: bool,
     file_path: Option<PathBuf>,
 }
 
@@ -111,7 +134,7 @@ impl SqliteSession {
 
         let path_for_open = raw_path.clone();
         let (conn, interrupt_handle, version, version_log) = tokio::task::spawn_blocking(move || {
-            let conn = if is_memory {
+            let mut conn = if is_memory {
                 Connection::open_in_memory().map_err(|e| DbError::ConnectionFailed(e.to_string()))?
             } else {
                 let flags = if read_only {
@@ -125,6 +148,27 @@ impl SqliteSession {
 
             conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;")
                 .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+            if read_only {
+                conn.execute_batch("PRAGMA query_only = ON;")
+                    .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+                conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                    use rusqlite::hooks::{AuthAction, Authorization};
+                    match ctx.action {
+                        AuthAction::Select
+                        | AuthAction::Read { .. }
+                        | AuthAction::Function { .. }
+                        | AuthAction::Recursive => Authorization::Allow,
+                        AuthAction::Pragma {
+                            pragma_name,
+                            pragma_value,
+                        } if pragma_value.is_none() || is_readonly_sqlite_pragma(pragma_name) => {
+                            Authorization::Allow
+                        }
+                        _ => Authorization::Deny,
+                    }
+                }))
+                .map_err(|e| DbError::ConnectionFailed(e.to_string()))?;
+            }
 
             let sql = "SELECT sqlite_version()";
             let start = Instant::now();
@@ -152,6 +196,7 @@ impl SqliteSession {
                 current_database,
                 current_user: String::new(),
             },
+            read_only,
             file_path: (!is_memory).then_some(raw_path),
         };
         Ok((session, vec![version_log]))
@@ -476,6 +521,14 @@ impl DbSession for SqliteSession {
     }
 
     async fn fetch_table_page(&self, req: &PageRequest) -> Result<(TablePage, Vec<ExecutedSql>), DbError> {
+        if let Some(where_clause) = req.filter_where.as_deref() {
+            crate::safety::validate_table_filter_where(
+                DbEngine::Sqlite,
+                where_clause,
+                crate::sql::SqlSessionMode::default(),
+            )
+            .map_err(DbError::InvalidInput)?;
+        }
         let req = req.clone();
         self.with_conn(move |conn| {
             let schema = normalize_schema(&req.schema);
@@ -689,6 +742,11 @@ impl DbSession for SqliteSession {
         &self,
         statements: &[String],
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if self.read_only {
+            return Err(DbError::InvalidInput(
+                "Read-Only connection blocks write transactions".to_owned(),
+            ));
+        }
         if statements.is_empty() {
             return Err(DbError::InvalidInput(
                 "no SQL statements to execute in transaction".to_owned(),
@@ -782,6 +840,11 @@ impl DbSession for SqliteSession {
         &self,
         batch: &StagedCommitBatch,
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if self.read_only {
+            return Err(DbError::InvalidInput(
+                "Read-Only connection blocks write transactions".to_owned(),
+            ));
+        }
         if batch.mutations.is_empty() {
             return Err(DbError::InvalidInput("no staged changes to execute".to_owned()));
         }

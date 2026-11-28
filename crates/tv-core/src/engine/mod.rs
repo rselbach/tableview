@@ -622,6 +622,11 @@ pub trait DbSession: Send + Sync {
     fn mysql_quote_mode(&self) -> Option<crate::sql::MysqlQuoteMode> {
         None
     }
+    /// Returns live MySQL quoting flags for pooled grid connections (`@@GLOBAL.sql_mode`),
+    /// defaulting to `mysql_quote_mode()` for non-MySQL or mock sessions.
+    fn mysql_grid_quote_mode(&self) -> Option<crate::sql::MysqlQuoteMode> {
+        self.mysql_quote_mode()
+    }
     /// Returns live PostgreSQL session string-escaping and transaction state when backed by PostgreSQL.
     fn postgres_session_mode(&self) -> Option<crate::sql::PostgresSessionMode> {
         None

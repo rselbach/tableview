@@ -2601,6 +2601,7 @@ struct MockSession {
     engine: DbEngine,
     server_info: ServerInfo,
     mysql_quote_mode: Mutex<Option<MysqlQuoteMode>>,
+    mysql_grid_quote_mode: Mutex<Option<MysqlQuoteMode>>,
     next_lease_mysql_mode: Mutex<Option<Option<MysqlQuoteMode>>>,
     postgres_session_mode: Mutex<Option<PostgresSessionMode>>,
     next_lease_pg_mode: Mutex<Option<Option<PostgresSessionMode>>>,
@@ -2608,6 +2609,7 @@ struct MockSession {
     half_open: AtomicBool,
     fail_next_sql: AtomicBool,
     fail_next_page: AtomicBool,
+    disconnect_next_page: AtomicBool,
     fail_next_pre_dispatch: AtomicBool,
     fail_with_auth_on_disconnect: AtomicBool,
     ping_delay: Mutex<Duration>,
@@ -2648,6 +2650,7 @@ impl MockSession {
                 current_user: "troy_barnes".to_owned(),
             },
             mysql_quote_mode: Mutex::new(mysql_quote_mode),
+            mysql_grid_quote_mode: Mutex::new(None),
             next_lease_mysql_mode: Mutex::new(None),
             postgres_session_mode: Mutex::new(
                 (engine == DbEngine::Postgres).then(|| PostgresSessionMode::new(true)),
@@ -2657,6 +2660,7 @@ impl MockSession {
             half_open: AtomicBool::new(false),
             fail_next_sql: AtomicBool::new(false),
             fail_next_page: AtomicBool::new(false),
+            disconnect_next_page: AtomicBool::new(false),
             fail_next_pre_dispatch: AtomicBool::new(false),
             fail_with_auth_on_disconnect: AtomicBool::new(false),
             ping_delay: Mutex::new(Duration::ZERO),
@@ -2698,6 +2702,17 @@ impl MockSession {
 
     fn set_fail_next_page(&self, value: bool) {
         self.fail_next_page.store(value, Ordering::Release);
+    }
+
+    fn set_disconnect_next_page(&self, value: bool) {
+        self.disconnect_next_page.store(value, Ordering::Release);
+    }
+
+    fn set_mysql_grid_quote_mode(&self, mode: Option<MysqlQuoteMode>) {
+        *self
+            .mysql_grid_quote_mode
+            .lock()
+            .expect("mysql_grid_quote_mode lock") = mode;
     }
 
     fn set_fail_next_pre_dispatch(&self, value: bool) {
@@ -2992,6 +3007,13 @@ impl DbSession for MockSession {
         *self.mysql_quote_mode.lock().expect("mysql_quote_mode lock")
     }
 
+    fn mysql_grid_quote_mode(&self) -> Option<MysqlQuoteMode> {
+        self.mysql_grid_quote_mode
+            .lock()
+            .expect("mysql_grid_quote_mode lock")
+            .or_else(|| self.mysql_quote_mode())
+    }
+
     fn postgres_session_mode(&self) -> Option<PostgresSessionMode> {
         self.postgres_session_mode
             .lock()
@@ -3179,6 +3201,9 @@ impl DbSession for MockSession {
         Box::pin(async move {
             self.page_calls.fetch_add(1, Ordering::AcqRel);
             self.check_transport()?;
+            if self.disconnect_next_page.swap(false, Ordering::AcqRel) {
+                return Err(DbError::Disconnected);
+            }
             if self.fail_next_page.swap(false, Ordering::AcqRel) {
                 if self.engine == DbEngine::Postgres
                     && let Some(ref mut mode) = *self
@@ -3790,21 +3815,8 @@ impl DbSession for MockSession {
             let stmts = batch
                 .render_sql(self.engine)
                 .map_err(|e| DbError::InvalidInput(e.to_string()))?;
-            if self.engine == DbEngine::Postgres
-                && let Some(ref mut mode) = *self
-                    .postgres_session_mode
-                    .lock()
-                    .expect("postgres_session_mode lock")
-            {
-                mode.tx_state = Some(tv_core::PostgresTxState::Idle);
-                if let Some(sess) = mode.session_standard_conforming_strings {
-                    mode.standard_conforming_strings = sess;
-                }
-                mode.pre_tx_standard_conforming_strings =
-                    mode.session_standard_conforming_strings;
-                mode.savepoints.clear();
-                mode.has_untracked_savepoints = false;
-            }
+            // PostgreSQL staged commits execute on an isolated backend connection, leaving any
+            // open SQL editor transaction and LOCAL GUC settings untouched.
             let logs = stmts
                 .iter()
                 .map(|sql| ExecutedSql {
@@ -8068,7 +8080,8 @@ fn postgres_aux_errors_staged_commit_and_concurrent_tabs_keep_mode_in_sync() {
         assert!(mode.standard_conforming_strings);
     }
 
-    // 2. Staged table edit commit ends transaction and restores pre-tx SCS in UI session mode.
+    // 2. Staged table edit commit runs on an isolated PostgreSQL connection and keeps the
+    // editor's open transaction and LOCAL standard_conforming_strings setting intact.
     rt.update(|s, _| {
         let tab = s
             .active_session_mut()
@@ -8109,8 +8122,11 @@ fn postgres_aux_errors_staged_commit_and_concurrent_tabs_keep_mode_in_sync() {
         .expect("session")
         .postgres_session_mode()
         .expect("pg mode");
-    assert_eq!(after_staged_commit.tx_state, Some(tv_core::PostgresTxState::Idle));
-    assert!(after_staged_commit.standard_conforming_strings);
+    assert_eq!(
+        after_staged_commit.tx_state,
+        Some(tv_core::PostgresTxState::InTransaction)
+    );
+    assert!(!after_staged_commit.standard_conforming_strings);
 
     rt.update(|s, tx| s.activate_tab(query_tab_a, tx));
     rt.frame(0.05);
@@ -8120,7 +8136,7 @@ fn postgres_aux_errors_staged_commit_and_concurrent_tabs_keep_mode_in_sync() {
             .expect("session")
             .active_query_tab_mut()
             .expect("query tab a");
-        tab.editor = rune::TextEdit::new("SELECT 'Troy\\';");
+        tab.editor = rune::TextEdit::new("ROLLBACK; SELECT 'Troy\\';");
         assert!(s.run_active_query(true));
     });
     poll_until(&mut rt, Duration::from_secs(3), |rt| {
@@ -10097,4 +10113,264 @@ fn nontransactional_tables_null_pk_and_stale_conflicts_guard_staged_edits() {
             .is_some_and(|e| e.contains("matched 0 rows"))
     );
     assert_eq!(sqlite_mock.tx_calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn table_filters_enforce_safety_no_filter_retry_and_destructive_ddl_confirm() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+
+    // 1. Unsafe table filter is blocked client-side before hitting the worker/session.
+    let before_pages = cluster.latest_session().page_calls.load(Ordering::Acquire);
+    rt.update(|s, _| {
+        let tab = s
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .expect("students table tab");
+        tab.filter_input = rune::TextEdit::new("1=1; DROP TABLE study_room.students");
+        s.apply_active_tab_filter();
+    });
+    rt.frame(0.05);
+    {
+        let tab = rt
+            .state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .expect("students tab");
+        assert!(tab.filter_error.is_some());
+        assert!(tab.applied_filter.is_none());
+    }
+    assert_eq!(
+        cluster.latest_session().page_calls.load(Ordering::Acquire),
+        before_pages
+    );
+
+    // 2. Valid custom filter does not silently auto-reconnect/replay after half-open disconnect.
+    rt.update(|s, _| {
+        let tab = s
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .expect("students table tab");
+        tab.filter_input = rune::TextEdit::new("student_id = 1");
+        s.apply_active_tab_filter();
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| {
+                !t.page_loading && t.applied_filter.as_deref() == Some("student_id = 1")
+            })
+    });
+
+    let connects = cluster.connect_count();
+    let filtered_sess = cluster.latest_session();
+    filtered_sess.set_disconnect_next_page(true);
+    let before_mid_flight = filtered_sess.page_calls.load(Ordering::Acquire);
+    rt.update(|s, _| {
+        let tab = s
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .expect("students table tab");
+        tab.filter_input = rune::TextEdit::new("student_id = 2");
+        s.apply_active_tab_filter();
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.reload_on_reconnect)
+    });
+    assert_eq!(cluster.connect_count(), connects);
+    assert_eq!(
+        filtered_sess.page_calls.load(Ordering::Acquire),
+        before_mid_flight + 1
+    );
+    assert!(
+        rt.state
+            .active_session()
+            .is_some_and(|s| s.status.as_connected().is_none())
+    );
+
+    // 3. Reconnect manually (reloading pending filtered table) and verify Production + Unrestricted still prompts destructive confirmation for ALTER TABLE ... DROP COLUMN.
+    rt.update(|s, tx| {
+        assert!(dispatch_action(s, Action::Reconnect, tx));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+            && rt
+                .state
+                .active_session()
+                .and_then(SessionState::active_table_tab)
+                .is_some_and(|t| !t.page_loading && !t.reload_on_reconnect)
+    });
+    rt.update(|s, tx| {
+        s.open_new_query_tab(tx);
+        let sess = s.active_session_mut().expect("session");
+        sess.profile.env = EnvTag::Production;
+        sess.profile.safety = SafetyPolicy::Unrestricted;
+        let q = sess.active_query_tab_mut().expect("query tab");
+        q.editor = rune::TextEdit::new("ALTER TABLE study_room.students DROP COLUMN full_name;");
+        s.run_active_query(true);
+    });
+    rt.frame(0.2);
+    assert!(matches!(
+        rt.state.overlay,
+        OverlayState::SafetyConfirm(ref m) if m.is_destructive && !m.destructive_ack
+    ));
+    assert!(rt.find("safety-confirm-modal-dialog").is_some());
+}
+
+#[test]
+fn mysql_table_filter_uses_grid_quote_mode_independent_of_editor_mode() {
+    let mut mysql_profile = ConnectionProfile::new_mysql("greendale_mysql", "127.0.0.1", "troy");
+    mysql_profile.database = Some("greendale".to_owned());
+    mysql_profile.safety = SafetyPolicy::Unrestricted;
+    let conn_id = mysql_profile.id;
+
+    let store = StoreData {
+        connections: vec![mysql_profile],
+        ..StoreData::default()
+    };
+    let mut state = AppState::init_in_memory(store);
+    let cluster = MockCluster::new(Duration::ZERO);
+    *cluster.mysql_quote_mode.lock().expect("mysql_quote_mode lock") = Some(MysqlQuoteMode::DEFAULT);
+    state.worker = Some(WorkerBridge::spawn_with_connector(cluster.connector()).expect("spawn worker"));
+
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(true, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+    rt.frame(0.0);
+
+    rt.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some()
+    });
+    rt.update(|s, _| s.select_schema("study_room".to_owned()));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|s| s.status.as_connected())
+            .is_some_and(|c| {
+                c.active_schema.as_deref() == Some("study_room")
+                    && c.objects.iter().any(|o| o.name == "students")
+            })
+    });
+
+    let (sx, sy) = rt
+        .find("sidebar/obj/study_room.students")
+        .expect("students sidebar item");
+    rt.pointer_down(sx, sy);
+    rt.pointer_up(sx, sy);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+
+    // Diverge editor session mode (NO_BACKSLASH_ESCAPES) from pooled grid mode (DEFAULT).
+    let sess_mock = cluster.latest_session();
+    sess_mock.set_mysql_grid_quote_mode(Some(MysqlQuoteMode::DEFAULT));
+    *sess_mock
+        .mysql_quote_mode
+        .lock()
+        .expect("mysql_quote_mode lock") = Some(MysqlQuoteMode::NO_BACKSLASH_ESCAPES);
+
+    let students_tab_id = rt
+        .state
+        .active_session()
+        .expect("session")
+        .active_tab
+        .expect("students tab id");
+    rt.update(|s, tx| {
+        s.open_new_query_tab(tx);
+        let q = s
+            .active_session_mut()
+            .and_then(SessionState::active_query_tab_mut)
+            .expect("query tab");
+        q.editor = rune::TextEdit::new("SELECT 1;");
+        assert!(s.run_active_query(true));
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        !rt.state
+            .active_session()
+            .and_then(SessionState::active_query_tab)
+            .is_some_and(|q| q.running)
+    });
+
+    rt.update(|s, tx| {
+        s.activate_tab(students_tab_id, tx);
+    });
+    rt.frame(0.05);
+    {
+        let sess = rt.state.active_session().expect("session");
+        assert_eq!(sess.mysql_quote_mode(), Some(MysqlQuoteMode::NO_BACKSLASH_ESCAPES));
+        assert_eq!(sess.mysql_grid_quote_mode(), Some(MysqlQuoteMode::DEFAULT));
+    }
+
+    // Backslash escape valid under grid DEFAULT mode must be accepted despite editor NO_BACKSLASH_ESCAPES.
+    rt.update(|s, _| {
+        let tab = s
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .expect("students table tab");
+        tab.filter_input = rune::TextEdit::new("full_name = 'Troy\\'s'");
+        s.apply_active_tab_filter();
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| {
+                !t.page_loading && t.applied_filter.as_deref() == Some("full_name = 'Troy\\'s'")
+            })
+    });
+    let tab = rt
+        .state
+        .active_session()
+        .and_then(SessionState::active_table_tab)
+        .expect("students tab");
+    assert!(tab.filter_error.is_none());
+
+    // When grid mode becomes unknown (None), UI defers mode-dependent checks to the grid connection
+    // instead of rejecting using editor's NO_BACKSLASH_ESCAPES or assuming DEFAULT.
+    sess_mock.set_mysql_grid_quote_mode(None);
+    rt.update(|s, _| {
+        if let Some(sess) = s.active_session_mut()
+            && let tv_app::state::ConnectionState::Connected(ref mut data) = sess.status
+        {
+            data.mysql_grid_quote_mode = None;
+        }
+        let tab = s
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .expect("students table tab");
+        tab.filter_input = rune::TextEdit::new("full_name = 'Troy\\'s' AND student_id = 1");
+        s.apply_active_tab_filter();
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| {
+                !t.page_loading
+                    && t.applied_filter.as_deref() == Some("full_name = 'Troy\\'s' AND student_id = 1")
+            })
+    });
+    let tab = rt
+        .state
+        .active_session()
+        .and_then(SessionState::active_table_tab)
+        .expect("students tab");
+    assert!(tab.filter_error.is_none());
 }

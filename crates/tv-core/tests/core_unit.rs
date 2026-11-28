@@ -24,7 +24,7 @@ use tv_core::{
     split_statements_for_engine_with_mysql_mode, split_statements_for_engine_with_session_mode, sql_sets_credentials,
     sql_sets_credentials_with_session_mode, statement_at_cursor, statement_at_cursor_for_engine,
     statement_at_cursor_for_engine_with_mysql_mode, statement_at_cursor_for_engine_with_session_mode,
-    validate_row_editable,
+    validate_row_editable, validate_table_filter_where,
 };
 
 #[test]
@@ -1492,6 +1492,22 @@ fn safety_guardrails_handle_mysql_and_sqlite_specific_statements() {
     assert_eq!(
         inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA table_info(students)").risk,
         StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA query_only").risk,
+        StatementRisk::ReadOnly
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA query_only(0)").risk,
+        StatementRisk::WriteDdl
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA main.query_only(OFF)").risk,
+        StatementRisk::WriteDdl
+    );
+    assert_eq!(
+        inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA journal_mode(wal)").risk,
+        StatementRisk::WriteDdl
     );
     assert_eq!(
         inspect_statement_for_engine(DbEngine::Sqlite, "PRAGMA foreign_keys = OFF").risk,
@@ -4013,6 +4029,15 @@ fn mysql_round15_mixed_gates_single_stmt_enforcement_and_mariadb_mssql_mode() {
         inspect_statement_for_engine_with_mysql_mode(
             DbEngine::Mysql,
             "SHOW CREATE USER 'troy' /*! ; RENAME TABLE a TO b */",
+            None,
+        )
+        .risk,
+        StatementRisk::Destructive
+    );
+    assert_eq!(
+        inspect_statement_for_engine_with_mysql_mode(
+            DbEngine::Mysql,
+            "SHOW CREATE USER 'troy' /*! ; CREATE TABLE a (id INT) */",
             None,
         )
         .risk,
@@ -7080,5 +7105,118 @@ fn postgres_splitter_preserves_tx_and_savepoints_across_uncertain_set_config() {
         assert_eq!(s19_tail_stmts[2].sql, "SELECT 'Troy\\'; Greendale'");
         assert_eq!(s19_tail_stmts[3].sql, "SELECT 2");
         assert_eq!(s19_tail_stmts[4].sql, partial_utf8_tail);
+    }
+}
+
+#[test]
+fn safety_classifies_destructive_schema_and_nested_cte_mutations() {
+    let prod_unrestricted = |engine: DbEngine, sql: &str| {
+        tv_core::evaluate_sql_safety_for_engine(
+            engine,
+            SafetyPolicy::Unrestricted,
+            EnvTag::Production,
+            &[sql.to_owned()],
+        )
+    };
+
+    for (engine, destructive_sql) in [
+        (DbEngine::Postgres, "ALTER TABLE public.students DROP COLUMN email"),
+        (DbEngine::Postgres, "ALTER TABLE public.students DROP CONSTRAINT fk_group"),
+        (DbEngine::Postgres, "ALTER TABLE public.students ALTER COLUMN full_name TYPE varchar(20)"),
+        (DbEngine::Postgres, "ALTER TABLE public.students RENAME COLUMN email TO contact"),
+        (DbEngine::Postgres, "ALTER TABLE public.students DETACH PARTITION students_2025"),
+        (DbEngine::Postgres, "ALTER VIEW public.active_students RENAME TO old_students"),
+        (DbEngine::Postgres, "CREATE OR REPLACE VIEW public.active_students AS SELECT 1"),
+        (DbEngine::Postgres, "CREATE OR REPLACE FUNCTION public.greet() RETURNS text LANGUAGE sql AS 'SELECT ''Troy'''"),
+        (DbEngine::Postgres, "ALTER INDEX public.idx_students_email RENAME TO idx_students_contact"),
+        (DbEngine::Postgres, "CREATE OR REPLACE RULE protect_students AS ON DELETE TO public.students DO INSTEAD NOTHING"),
+        (DbEngine::Mysql, "RENAME TABLE students TO alumni"),
+        (DbEngine::Mysql, "ALTER TABLE students MODIFY COLUMN full_name VARCHAR(20)"),
+        (DbEngine::Postgres, "DROP OWNED BY troy_barnes CASCADE"),
+    ] {
+        assert!(
+            matches!(
+                prod_unrestricted(engine, destructive_sql),
+                SafetyDecision::RequireConfirmation {
+                    is_destructive: true,
+                    ..
+                }
+            ),
+            "expected destructive confirmation for {engine:?}: {destructive_sql}"
+        );
+    }
+
+    assert_eq!(
+        prod_unrestricted(DbEngine::Postgres, "ALTER TABLE public.students ADD COLUMN nickname text"),
+        SafetyDecision::Allow
+    );
+
+    for ro_blocked in [
+        "SELECT * FROM public.students WHERE EXISTS (WITH d AS (DELETE FROM public.students RETURNING 1) SELECT 1 FROM d)",
+        "SELECT * FROM (WITH d AS (UPDATE public.students SET gpa = 0 RETURNING 1) SELECT * FROM d) t",
+        "SELECT * FROM public.students FOR UPDATE",
+        "SELECT student_id FROM public.students ORDER BY (SELECT 1 FROM public.students FOR UPDATE)",
+        "SELECT s.student_id FROM public.students s JOIN public.courses c ON c.course_id = (SELECT 1 FROM public.students FOR SHARE)",
+        "SELECT student_id FROM public.students GROUP BY (SELECT 1 FROM public.students FOR UPDATE)",
+        "SELECT student_id FROM public.students HAVING (SELECT 1 FROM public.students FOR SHARE) = 1",
+        "SELECT student_id FROM public.students LIMIT (SELECT 1 FROM public.students FOR UPDATE)",
+        "VALUES ((SELECT 1 FROM public.students FOR UPDATE))",
+    ] {
+        assert!(
+            matches!(
+                tv_core::evaluate_sql_safety_for_engine(
+                    DbEngine::Postgres,
+                    SafetyPolicy::ReadOnly,
+                    EnvTag::Local,
+                    &[ro_blocked.to_owned()],
+                ),
+                SafetyDecision::Block { .. }
+            ),
+            "expected ReadOnly block for nested/locking query: {ro_blocked}"
+        );
+    }
+}
+
+#[test]
+fn validate_table_filter_where_blocks_escape_and_mutations() {
+    for (engine, valid) in [
+        (DbEngine::Postgres, "gpa >= 3.5 AND full_name = 'Troy Barnes'"),
+        (DbEngine::Postgres, "student_id IN (SELECT student_id FROM enrollments)"),
+        (DbEngine::Postgres, "profile ->> 'campus' = 'Greendale'"),
+        (DbEngine::Postgres, "\"delete\" = 1"),
+        (DbEngine::Postgres, "replace(full_name, 'Troy', 'T-Bone') = 'T-Bone Barnes'"),
+        (DbEngine::Mysql, "`update` = 'ok'"),
+        (DbEngine::Mysql, "replace(full_name, 'Troy', 'T-Bone') = 'T-Bone Barnes'"),
+        (DbEngine::Sqlite, "replace(full_name, 'Troy', 'T-Bone') = 'T-Bone Barnes'"),
+        (DbEngine::Sqlite, "[update] = 1"),
+        (DbEngine::Sqlite, "student_id = ("),
+        (DbEngine::Postgres, "   "),
+    ] {
+        assert!(
+            validate_table_filter_where(engine, valid, SqlSessionMode::default()).is_ok(),
+            "expected valid filter for {engine:?}: {valid}"
+        );
+    }
+
+    for (engine, unsafe_filter) in [
+        (DbEngine::Postgres, "1=1; DROP TABLE students"),
+        (DbEngine::Sqlite, "1=1) UNION SELECT 1, 'x' --"),
+        (DbEngine::Postgres, "1=1) OR (1=1"),
+        (DbEngine::Mysql, "1=1 -- trailing comment"),
+        (DbEngine::Mysql, "1=1 # hash comment"),
+        (DbEngine::Mysql, "1=1 /*!50000 DROP TABLE students */"),
+        (DbEngine::Mysql, "1=1 INTO OUTFILE '/tmp/out.txt'"),
+        (DbEngine::Mysql, "1=1 LOCK IN SHARE MODE"),
+        (DbEngine::Mysql, "(SELECT 1 FROM students LOCK IN SHARE MODE) = 1"),
+        (DbEngine::Postgres, "EXISTS (WITH d AS (DELETE FROM students RETURNING 1) SELECT 1 FROM d)"),
+        (DbEngine::Postgres, "1=1 FOR UPDATE"),
+        (DbEngine::Postgres, "full_name = 'unterminated"),
+        (DbEngine::Sqlite, "[update = 1"),
+        (DbEngine::Postgres, "$$unterminated dollar quote"),
+    ] {
+        assert!(
+            validate_table_filter_where(engine, unsafe_filter, SqlSessionMode::default()).is_err(),
+            "expected rejection for unsafe filter on {engine:?}: {unsafe_filter}"
+        );
     }
 }

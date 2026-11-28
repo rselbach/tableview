@@ -13,7 +13,7 @@ use mysql_async::{
 };
 use uuid::Uuid;
 
-use crate::connection::{ConnectionProfile, DbEngine, PasswordMode, SslConfig, SslMode};
+use crate::connection::{ConnectionProfile, DbEngine, EnvTag, PasswordMode, SafetyPolicy, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
     FkPeekRow, ForeignKeyRef, IndexInfo, MysqlRawValue, PageRequest, QueryBatchResult, QueryStatementResult,
@@ -269,17 +269,33 @@ fn classify_mode_refresh_probe(
 pub struct MysqlSession {
     opts: Opts,
     server_info: ServerInfo,
+    read_only: bool,
     mysql_quote_mode: AtomicU64,
+    mysql_grid_quote_mode: AtomicU64,
     active_conn_ids: Arc<std::sync::Mutex<HashMap<u64, ActiveMysqlQuery>>>,
     idle_conns: Arc<std::sync::Mutex<IdlePool<mysql_async::Conn>>>,
     pool_slots: Arc<tokio::sync::Semaphore>,
+    editor_conn: tokio::sync::Mutex<Option<mysql_async::Conn>>,
     disconnected: AtomicBool,
     tx_lock: tokio::sync::Mutex<()>,
+}
+
+fn spawn_disconnect_mysql_conn(conn: mysql_async::Conn) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            drop(tokio::time::timeout(Duration::from_millis(500), conn.disconnect()).await);
+        });
+    }
 }
 
 impl Drop for MysqlSession {
     fn drop(&mut self) {
         self.evict_idle_conns();
+        if let Ok(mut guard) = self.editor_conn.try_lock()
+            && let Some(conn) = guard.take()
+        {
+            spawn_disconnect_mysql_conn(conn);
+        }
     }
 }
 
@@ -357,10 +373,13 @@ impl MysqlSession {
             Self {
                 opts,
                 server_info,
+                read_only: profile.safety == SafetyPolicy::ReadOnly,
                 mysql_quote_mode: AtomicU64::new(pack_mysql_quote_mode(Some(quote_mode))),
+                mysql_grid_quote_mode: AtomicU64::new(pack_mysql_quote_mode(Some(quote_mode))),
                 active_conn_ids: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 idle_conns: Arc::new(std::sync::Mutex::new(IdlePool::new(VecDeque::from([conn])))),
                 pool_slots: Arc::new(tokio::sync::Semaphore::new(MYSQL_POOL_MAX)),
+                editor_conn: tokio::sync::Mutex::new(None),
                 disconnected: AtomicBool::new(false),
                 tx_lock: tokio::sync::Mutex::new(()),
             },
@@ -403,65 +422,6 @@ impl MysqlSession {
         }
     }
 
-    async fn refresh_global_sql_mode(&self) {
-        if let Ok(lease) = self.get_checked_conn(false, false, None).await {
-            lease.return_clean();
-        }
-    }
-
-    async fn verify_lease_mysql_mode(
-        &self,
-        mut lease: PooledMysqlConn,
-        expected_mode: Option<crate::sql::MysqlQuoteMode>,
-        cancel_flag: Option<&AtomicBool>,
-    ) -> Result<(PooledMysqlConn, crate::sql::MysqlQuoteMode), DbError> {
-        let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
-        if is_cancelled() {
-            lease.return_clean();
-            return Err(DbError::Cancelled);
-        }
-        let mode_res = {
-            let conn = lease.conn_mut()?;
-            tokio::time::timeout(
-                PING_TIMEOUT,
-                conn.query_first::<Row, _>(MYSQL_LIVE_SESSION_MODE_SQL),
-            )
-            .await
-        };
-        match mode_res {
-            Ok(Ok(Some(row))) => {
-                let live_mode = parse_mysql_live_mode_row(&row);
-                self.mysql_quote_mode
-                    .store(pack_mysql_quote_mode(Some(live_mode)), Ordering::Release);
-                if is_cancelled() {
-                    lease.return_clean();
-                    return Err(DbError::Cancelled);
-                }
-                if evaluate_live_mysql_mode(live_mode, expected_mode).is_err() {
-                    lease.return_clean();
-                    return Err(DbError::MysqlModeMismatch);
-                }
-                Ok((lease, live_mode))
-            }
-            Ok(Ok(None)) | Err(_) => {
-                lease.discard();
-                self.disconnected.store(true, Ordering::Release);
-                Err(DbError::DisconnectedBeforeDispatch(Box::new(
-                    DbError::Disconnected,
-                )))
-            }
-            Ok(Err(err)) => {
-                lease.discard();
-                let mapped = self.map_session_err(err);
-                if matches!(mapped, DbError::Disconnected) {
-                    Err(DbError::DisconnectedBeforeDispatch(Box::new(mapped)))
-                } else {
-                    Err(mapped)
-                }
-            }
-        }
-    }
-
     fn ensure_alive(&self) -> Result<(), DbError> {
         if self.is_disconnected() {
             return Err(DbError::Disconnected);
@@ -486,6 +446,145 @@ impl MysqlSession {
             self.disconnected.store(true, Ordering::Release);
         }
         mapped
+    }
+
+    async fn acquire_editor_conn(
+        &self,
+        guard: &mut Option<mysql_async::Conn>,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<mysql_async::Conn, DbError> {
+        let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
+        if is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        if let Err(err) = self.ensure_alive() {
+            if let Some(stale) = guard.take() {
+                spawn_disconnect_mysql_conn(stale);
+            }
+            return Err(DbError::DisconnectedBeforeDispatch(Box::new(err)));
+        }
+        if let Some(mut conn) = guard.take() {
+            match tokio::time::timeout(PING_TIMEOUT, conn.ping()).await {
+                Ok(Ok(())) => {
+                    if is_cancelled() {
+                        *guard = Some(conn);
+                        return Err(DbError::Cancelled);
+                    }
+                    return Ok(conn);
+                }
+                Ok(Err(err)) => {
+                    spawn_disconnect_mysql_conn(conn);
+                    self.disconnected.store(true, Ordering::Release);
+                    self.mysql_quote_mode.store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                    let mapped = map_mysql_session_err(err);
+                    let cause = if matches!(mapped, DbError::Disconnected) {
+                        mapped
+                    } else {
+                        DbError::Disconnected
+                    };
+                    return Err(DbError::DisconnectedBeforeDispatch(Box::new(cause)));
+                }
+                Err(_) => {
+                    spawn_disconnect_mysql_conn(conn);
+                    self.disconnected.store(true, Ordering::Release);
+                    self.mysql_quote_mode.store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                    return Err(DbError::DisconnectedBeforeDispatch(Box::new(DbError::Disconnected)));
+                }
+            }
+        }
+
+        let mut conn = match tokio::time::timeout(CONNECT_TIMEOUT, mysql_async::Conn::new(self.opts.clone())).await {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(err)) => {
+                let mapped = self.map_checkout_err(err);
+                if mapped.is_auth_failure() {
+                    return Err(mapped);
+                }
+                return Err(DbError::DisconnectedBeforeDispatch(Box::new(mapped)));
+            }
+            Err(_) => {
+                self.disconnected.store(true, Ordering::Release);
+                return Err(DbError::DisconnectedBeforeDispatch(Box::new(
+                    DbError::ConnectionFailed("connection timed out".to_owned()),
+                )));
+            }
+        };
+
+        match tokio::time::timeout(
+            PING_TIMEOUT,
+            conn.query_first::<Row, _>(MYSQL_LIVE_SESSION_MODE_SQL),
+        )
+        .await
+        {
+            Ok(Ok(Some(row))) => {
+                let mode = parse_mysql_live_mode_row(&row);
+                self.mysql_quote_mode
+                    .store(pack_mysql_quote_mode(Some(mode)), Ordering::Release);
+            }
+            Ok(Ok(None)) | Err(_) => {
+                spawn_disconnect_mysql_conn(conn);
+                self.disconnected.store(true, Ordering::Release);
+                self.mysql_quote_mode.store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                return Err(DbError::DisconnectedBeforeDispatch(Box::new(DbError::Disconnected)));
+            }
+            Ok(Err(err)) => {
+                spawn_disconnect_mysql_conn(conn);
+                let mapped = self.map_checkout_err(err);
+                if mapped.is_auth_failure() {
+                    return Err(mapped);
+                }
+                return Err(DbError::DisconnectedBeforeDispatch(Box::new(mapped)));
+            }
+        }
+
+        if is_cancelled() {
+            *guard = Some(conn);
+            return Err(DbError::Cancelled);
+        }
+        Ok(conn)
+    }
+
+    async fn verify_editor_mysql_mode(
+        &self,
+        conn: &mut mysql_async::Conn,
+        expected_mode: Option<crate::sql::MysqlQuoteMode>,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<crate::sql::MysqlQuoteMode, DbError> {
+        let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
+        if is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+        match tokio::time::timeout(
+            PING_TIMEOUT,
+            conn.query_first::<Row, _>(MYSQL_LIVE_SESSION_MODE_SQL),
+        )
+        .await
+        {
+            Ok(Ok(Some(row))) => {
+                let live_mode = parse_mysql_live_mode_row(&row);
+                self.mysql_quote_mode
+                    .store(pack_mysql_quote_mode(Some(live_mode)), Ordering::Release);
+                if is_cancelled() {
+                    return Err(DbError::Cancelled);
+                }
+                if evaluate_live_mysql_mode(live_mode, expected_mode).is_err() {
+                    return Err(DbError::MysqlModeMismatch);
+                }
+                Ok(live_mode)
+            }
+            Ok(Ok(None)) | Err(_) => {
+                self.disconnected.store(true, Ordering::Release);
+                Err(DbError::DisconnectedBeforeDispatch(Box::new(DbError::Disconnected)))
+            }
+            Ok(Err(err)) => {
+                let mapped = self.map_session_err(err);
+                if matches!(mapped, DbError::Disconnected) {
+                    Err(DbError::DisconnectedBeforeDispatch(Box::new(mapped)))
+                } else {
+                    Err(mapped)
+                }
+            }
+        }
     }
 
     async fn get_conn(&self) -> Result<PooledMysqlConn, DbError> {
@@ -564,7 +663,7 @@ impl MysqlSession {
                         lease.return_clean();
                         return Err(DbError::Cancelled);
                     }
-                    if self.mysql_quote_mode.load(Ordering::Acquire) == MYSQL_QUOTE_MODE_UNKNOWN {
+                    if self.mysql_grid_quote_mode.load(Ordering::Acquire) == MYSQL_QUOTE_MODE_UNKNOWN {
                         let mode_res = {
                             let conn = lease.conn_mut()?;
                             tokio::time::timeout(
@@ -591,7 +690,7 @@ impl MysqlSession {
                             CheckedConnProbeAction::Ready => {
                                 if let Some(mode_row) = fetched_row {
                                     let refreshed = parse_mysql_live_mode_row(&mode_row);
-                                    self.mysql_quote_mode.store(
+                                    self.mysql_grid_quote_mode.store(
                                         pack_mysql_quote_mode(Some(refreshed)),
                                         Ordering::Release,
                                     );
@@ -773,6 +872,10 @@ impl DbSession for MysqlSession {
         unpack_mysql_quote_mode(self.mysql_quote_mode.load(Ordering::Acquire))
     }
 
+    fn mysql_grid_quote_mode(&self) -> Option<crate::sql::MysqlQuoteMode> {
+        unpack_mysql_quote_mode(self.mysql_grid_quote_mode.load(Ordering::Acquire))
+    }
+
     fn is_disconnected(&self) -> bool {
         self.disconnected.load(Ordering::Acquire)
     }
@@ -946,7 +1049,63 @@ impl DbSession for MysqlSession {
         let offset = req.offset.max(0);
         let (columns, _) = self.fetch_column_metas(&req.schema, &req.table).await?;
 
+        let mut lease = self.get_conn().await?;
+        let conn = lease.conn_mut()?;
+        if let Some(where_clause) = req.filter_where.as_deref()
+            && !where_clause.trim().is_empty()
+        {
+            let mode_row: Row = match tokio::time::timeout(
+                PING_TIMEOUT,
+                conn.query_first::<Row, _>(MYSQL_LIVE_SESSION_MODE_SQL),
+            )
+            .await
+            {
+                Ok(Ok(Some(row))) => row,
+                Ok(Ok(None)) | Err(_) => {
+                    lease.discard();
+                    self.mysql_grid_quote_mode
+                        .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                    return Err(DbError::QueryFailed {
+                        message: "timed out checking MySQL grid sql_mode before running filtered query"
+                            .to_owned(),
+                        code: None,
+                        detail: None,
+                        hint: None,
+                    });
+                }
+                Ok(Err(err)) => {
+                    let mapped = map_mysql_session_err(err);
+                    lease.discard();
+                    self.mysql_grid_quote_mode
+                        .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                    return Err(match mapped {
+                        DbError::Disconnected | DbError::ConnectionFailed(_) => DbError::QueryFailed {
+                            message: format!(
+                                "pooled MySQL grid connection failed while checking sql_mode: {mapped}"
+                            ),
+                            code: None,
+                            detail: None,
+                            hint: None,
+                        },
+                        other => other,
+                    });
+                }
+            };
+            let live_grid_mode = parse_mysql_live_mode_row(&mode_row);
+            self.mysql_grid_quote_mode.store(
+                pack_mysql_quote_mode(Some(live_grid_mode)),
+                Ordering::Release,
+            );
+            crate::safety::validate_table_filter_where(
+                DbEngine::Mysql,
+                where_clause,
+                crate::sql::SqlSessionMode::mysql(Some(live_grid_mode)),
+            )
+            .map_err(DbError::InvalidInput)?;
+        }
+
         if columns.is_empty() {
+            lease.return_clean();
             return Ok((
                 TablePage {
                     columns,
@@ -974,8 +1133,6 @@ impl DbSession for MysqlSession {
         }
 
         let sql = build_mysql_page_sql(&req.schema, &req.table, &columns, req, limit + 1, offset);
-        let mut lease = self.get_conn().await?;
-        let conn = lease.conn_mut()?;
         let start = Instant::now();
         let mysql_rows: Vec<Row> = conn.query(&sql).await.map_err(|e| self.map_session_err(e))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1280,6 +1437,11 @@ impl DbSession for MysqlSession {
         &self,
         statements: &[String],
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if self.read_only {
+            return Err(DbError::InvalidInput(
+                "Read-Only connection blocks write transactions".to_owned(),
+            ));
+        }
         if statements.is_empty() {
             return Err(DbError::InvalidInput(
                 "no SQL statements to execute in transaction".to_owned(),
@@ -1363,6 +1525,11 @@ impl DbSession for MysqlSession {
         &self,
         batch: &StagedCommitBatch,
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if self.read_only {
+            return Err(DbError::InvalidInput(
+                "Read-Only connection blocks write transactions".to_owned(),
+            ));
+        }
         if batch.mutations.is_empty() {
             return Err(DbError::InvalidInput("no staged changes to execute".to_owned()));
         }
@@ -1703,25 +1870,107 @@ impl MysqlSession {
         }
 
         let explain_query = build_explain_sql_for_engine(DbEngine::Mysql, trimmed, analyze);
-        let mut lease = if analyze || expected_mysql_mode.is_some() {
-            self.get_checked_conn(true, true, None).await?
-        } else {
-            self.get_conn().await?
-        };
+        let mut editor_guard = self.editor_conn.lock().await;
+        let mut conn = self.acquire_editor_conn(&mut editor_guard, None).await?;
+        let mut live_mode_for_safety = self.mysql_quote_mode();
         if let Some(expected) = expected_mysql_mode {
-            let (verified_lease, live_mode) = self.verify_lease_mysql_mode(lease, expected, None).await?;
-            lease = verified_lease;
-            if crate::sql::mysql_slice_has_multiple_statements(trimmed, Some(live_mode)) {
-                lease.return_clean();
-                return Err(DbError::InvalidInput(
-                    "cannot EXPLAIN a MySQL slice containing multiple statements; select or split a single statement"
-                        .to_owned(),
-                ));
+            let precheck_res: Result<crate::sql::MysqlQuoteMode, DbError> = async {
+                let live_mode = self.verify_editor_mysql_mode(&mut conn, expected, None).await?;
+                if crate::sql::mysql_slice_has_multiple_statements(trimmed, Some(live_mode)) {
+                    return Err(DbError::InvalidInput(
+                        "cannot EXPLAIN a MySQL slice containing multiple statements; select or split a single statement"
+                            .to_owned(),
+                    ));
+                }
+                Ok(live_mode)
+            }
+            .await;
+            match precheck_res {
+                Ok(mode) => live_mode_for_safety = Some(mode),
+                Err(err) => {
+                    if self.is_disconnected()
+                        || matches!(err, DbError::DisconnectedBeforeDispatch(_) | DbError::Disconnected)
+                    {
+                        spawn_disconnect_mysql_conn(conn);
+                        self.disconnected.store(true, Ordering::Release);
+                        self.mysql_quote_mode
+                            .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                    } else {
+                        *editor_guard = Some(conn);
+                    }
+                    return Err(err);
+                }
+            }
+        } else if self.read_only
+            && crate::sql::mysql_slice_has_multiple_statements(trimmed, live_mode_for_safety)
+        {
+            *editor_guard = Some(conn);
+            return Err(DbError::InvalidInput(
+                "cannot EXPLAIN a MySQL slice containing multiple statements; select or split a single statement"
+                    .to_owned(),
+            ));
+        }
+        if self.read_only && analyze {
+            let decision = crate::safety::evaluate_sql_safety_for_engine_with_session_mode(
+                DbEngine::Mysql,
+                SafetyPolicy::ReadOnly,
+                EnvTag::Local,
+                std::slice::from_ref(&explain_query),
+                crate::sql::SqlSessionMode::mysql(live_mode_for_safety),
+            );
+            if let crate::safety::SafetyDecision::Block { reason, .. } = decision {
+                *editor_guard = Some(conn);
+                return Err(DbError::InvalidInput(reason));
             }
         }
-        let conn = lease.conn_mut()?;
+        if self.read_only
+            && let Err(err) = conn.query_drop("START TRANSACTION READ ONLY").await
+        {
+            let mapped = self.map_session_err(err);
+            if self.is_disconnected() || matches!(mapped, DbError::Disconnected) {
+                spawn_disconnect_mysql_conn(conn);
+                self.disconnected.store(true, Ordering::Release);
+                self.mysql_quote_mode
+                    .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+            } else {
+                *editor_guard = Some(conn);
+            }
+            return Err(mapped);
+        }
         let start = Instant::now();
-        let rows: Vec<Row> = conn.query(&explain_query).await.map_err(|e| self.map_session_err(e))?;
+        let query_res = conn.query::<Row, _>(&explain_query).await;
+        if self.read_only
+            && let Err(rb_err) = conn.query_drop("ROLLBACK").await
+        {
+            let mapped = self.map_session_err(rb_err);
+            spawn_disconnect_mysql_conn(conn);
+            self.disconnected.store(true, Ordering::Release);
+            self.mysql_quote_mode
+                .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+            return Err(if matches!(mapped, DbError::Disconnected) {
+                mapped
+            } else {
+                DbError::Disconnected
+            });
+        }
+        let rows = match query_res {
+            Ok(rows) => {
+                *editor_guard = Some(conn);
+                rows
+            }
+            Err(err) => {
+                let mapped = self.map_session_err(err);
+                if self.is_disconnected() || matches!(mapped, DbError::Disconnected) {
+                    spawn_disconnect_mysql_conn(conn);
+                    self.disconnected.store(true, Ordering::Release);
+                    self.mysql_quote_mode
+                        .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                } else {
+                    *editor_guard = Some(conn);
+                }
+                return Err(mapped);
+            }
+        };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         let mut chunks = Vec::with_capacity(rows.len());
@@ -1760,27 +2009,61 @@ impl MysqlSession {
         expected_mysql_mode: Option<Option<crate::sql::MysqlQuoteMode>>,
     ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
         let is_cancelled = || cancel_flag.is_some_and(|f| f.load(Ordering::Acquire));
-        let mut lease = self.get_checked_conn(true, true, cancel_flag).await?;
-        if is_cancelled() {
-            lease.return_clean();
-            return Err(DbError::Cancelled);
-        }
+        let mut editor_guard = self.editor_conn.lock().await;
+        let mut conn = self.acquire_editor_conn(&mut editor_guard, cancel_flag).await?;
         let verified_live_mode = if let Some(expected) = expected_mysql_mode {
-            let (verified_lease, live_mode) = self
-                .verify_lease_mysql_mode(lease, expected, cancel_flag)
-                .await?;
-            lease = verified_lease;
-            if let Err(msg) =
-                crate::sql::validate_mysql_single_statement_batch(statements, Some(live_mode))
-            {
-                lease.return_clean();
-                return Err(DbError::InvalidInput(msg));
+            let verify_res: Result<crate::sql::MysqlQuoteMode, DbError> = async {
+                let live_mode = self
+                    .verify_editor_mysql_mode(&mut conn, expected, cancel_flag)
+                    .await?;
+                if let Err(msg) =
+                    crate::sql::validate_mysql_single_statement_batch(statements, Some(live_mode))
+                {
+                    return Err(DbError::InvalidInput(msg));
+                }
+                Ok(live_mode)
             }
-            Some(live_mode)
+            .await;
+            match verify_res {
+                Ok(live_mode) => Some(live_mode),
+                Err(err) => {
+                    if self.is_disconnected()
+                        || matches!(err, DbError::DisconnectedBeforeDispatch(_) | DbError::Disconnected)
+                    {
+                        spawn_disconnect_mysql_conn(conn);
+                        self.disconnected.store(true, Ordering::Release);
+                        self.mysql_quote_mode
+                            .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                    } else {
+                        *editor_guard = Some(conn);
+                    }
+                    return Err(err);
+                }
+            }
         } else {
             None
         };
-        let conn_id = u64::from(lease.conn_mut()?.id());
+        if self.read_only {
+            let live_mode = verified_live_mode.or_else(|| self.mysql_quote_mode());
+            if expected_mysql_mode.is_none()
+                && let Err(msg) = crate::sql::validate_mysql_single_statement_batch(statements, live_mode)
+            {
+                *editor_guard = Some(conn);
+                return Err(DbError::InvalidInput(msg));
+            }
+            let decision = crate::safety::evaluate_sql_safety_for_engine_with_session_mode(
+                DbEngine::Mysql,
+                SafetyPolicy::ReadOnly,
+                EnvTag::Local,
+                statements,
+                crate::sql::SqlSessionMode::mysql(live_mode),
+            );
+            if let crate::safety::SafetyDecision::Block { reason, .. } = decision {
+                *editor_guard = Some(conn);
+                return Err(DbError::InvalidInput(reason));
+            }
+        }
+        let conn_id = u64::from(conn.id());
         let cancel_requested = Arc::new(AtomicBool::new(false));
         if let Ok(mut guard) = self.active_conn_ids.lock() {
             guard.insert(
@@ -1799,9 +2082,12 @@ impl MysqlSession {
         let mut checked_mode: Option<Option<crate::sql::MysqlQuoteMode>> =
             verified_live_mode.map(Some);
         let mut need_mid_batch_mode_recheck = false;
-        let mut batch_may_change_sql_mode = statements
+        let mut batch_may_change_editor_sql_mode = statements
             .iter()
             .any(|s| crate::sql::mysql_stmt_may_touch_sql_mode_text(s));
+        let batch_may_change_global_sql_mode = statements
+            .iter()
+            .any(|s| mysql_stmt_may_touch_global_sql_mode_text(s));
         let mut refreshed_mode = false;
         let is_cancel_pending = || {
             should_abort_mysql_stmt_dispatch(
@@ -1810,8 +2096,9 @@ impl MysqlSession {
             )
         };
         let mut discard_lease = false;
-        let outcome: Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> = async {
-            let conn = lease.conn_mut()?;
+        let mut server_confirmed_cancel = false;
+        let mut protocol_dirty = false;
+        let mut outcome: Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> = async {
             if is_cancel_pending() {
                 return Err(DbError::Cancelled);
             }
@@ -1856,10 +2143,16 @@ impl MysqlSession {
                             Some(MidBatchProbeFailure::TimedOutOrEmpty),
                         ),
                         Ok(Err(err)) => {
+                            if !matches!(err, MysqlError::Server(_)) {
+                                protocol_dirty = true;
+                            }
                             let mapped = self.map_session_err(err);
                             let failure = match mapped {
                                 DbError::Disconnected => MidBatchProbeFailure::Disconnected,
-                                DbError::Cancelled => MidBatchProbeFailure::Cancelled,
+                                DbError::Cancelled => {
+                                    server_confirmed_cancel = true;
+                                    MidBatchProbeFailure::Cancelled
+                                }
                                 _ => MidBatchProbeFailure::QueryError,
                             };
                             (ProbeOutcome::MappedErr(mapped), Some(failure))
@@ -1903,7 +2196,7 @@ impl MysqlSession {
                                     elapsed_ms: 0,
                                     error: Some(err_msg),
                                 });
-                                batch_may_change_sql_mode = true;
+                                batch_may_change_editor_sql_mode = true;
                                 break;
                             }
                             need_mid_batch_mode_recheck = false;
@@ -1962,6 +2255,43 @@ impl MysqlSession {
                     break;
                 }
                 let start = Instant::now();
+                let mut ro_tx_started = false;
+                if self.read_only {
+                    match conn.query_drop("START TRANSACTION READ ONLY").await {
+                        Ok(()) => ro_tx_started = true,
+                        Err(mysql_err) => {
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            if !matches!(mysql_err, MysqlError::Server(_)) {
+                                protocol_dirty = true;
+                            }
+                            let mapped = self.map_session_err(mysql_err);
+                            if matches!(mapped, DbError::Cancelled) {
+                                cancelled = true;
+                                server_confirmed_cancel = true;
+                            }
+                            if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                                return Err(DbError::Disconnected);
+                            }
+                            let err_msg = mapped.to_string();
+                            logs.push(ExecutedSql {
+                                sql: stmt.to_owned(),
+                                duration_ms: elapsed_ms,
+                                error: Some(err_msg.clone()),
+                            });
+                            results.push(QueryStatementResult {
+                                sql: stmt.to_owned(),
+                                columns: Vec::new(),
+                                rows: Vec::new(),
+                                rows_affected: None,
+                                truncated: false,
+                                total_rows_seen: 0,
+                                elapsed_ms,
+                                error: Some(err_msg),
+                            });
+                            break;
+                        }
+                    }
+                }
 
                 match conn.query_iter(stmt).await {
                     Ok(mut result) => {
@@ -1999,18 +2329,32 @@ impl MysqlSession {
                             if let Err(err) = result.drop_result().await {
                                 stream_err = Some(err);
                             }
+                        } else if matches!(stream_err, Some(MysqlError::Server(_))) {
+                            if let Err(err) = result.drop_result().await
+                                && !matches!(err, MysqlError::Server(_))
+                            {
+                                protocol_dirty = true;
+                            }
                         } else {
+                            protocol_dirty = true;
                             drop(result);
                         }
 
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         if let Some(err) = stream_err {
-                            let mapped = self.map_session_err(err);
-                            if matches!(mapped, DbError::Disconnected) && results.is_empty() {
-                                return Err(DbError::Disconnected);
+                            if !matches!(err, MysqlError::Server(_)) {
+                                protocol_dirty = true;
                             }
+                            let mapped = self.map_session_err(err);
                             if matches!(mapped, DbError::Cancelled) {
                                 cancelled = true;
+                                server_confirmed_cancel = true;
+                            }
+                            if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                                if ro_tx_started {
+                                    drop(conn.query_drop("ROLLBACK").await);
+                                }
+                                return Err(DbError::Disconnected);
                             }
                             let err_msg = mapped.to_string();
                             logs.push(ExecutedSql {
@@ -2028,7 +2372,22 @@ impl MysqlSession {
                                 elapsed_ms,
                                 error: Some(err_msg),
                             });
+                            if ro_tx_started
+                                && let Err(rb_err) = conn.query_drop("ROLLBACK").await
+                                && !matches!(rb_err, MysqlError::Server(_))
+                            {
+                                protocol_dirty = true;
+                            }
                             break;
+                        }
+
+                        if ro_tx_started
+                            && let Err(rb_err) = conn.query_drop("ROLLBACK").await
+                        {
+                            if !matches!(rb_err, MysqlError::Server(_)) {
+                                protocol_dirty = true;
+                            }
+                            drop(self.map_session_err(rb_err));
                         }
 
                         let rows_affected = if columns.is_empty() {
@@ -2075,12 +2434,22 @@ impl MysqlSession {
                     }
                     Err(mysql_err) => {
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        let mapped = self.map_session_err(mysql_err);
-                        if matches!(mapped, DbError::Disconnected) && results.is_empty() {
-                            return Err(DbError::Disconnected);
+                        if !matches!(mysql_err, MysqlError::Server(_)) {
+                            protocol_dirty = true;
                         }
+                        if ro_tx_started
+                            && let Err(rb_err) = conn.query_drop("ROLLBACK").await
+                            && !matches!(rb_err, MysqlError::Server(_))
+                        {
+                            protocol_dirty = true;
+                        }
+                        let mapped = self.map_session_err(mysql_err);
                         if matches!(mapped, DbError::Cancelled) {
                             cancelled = true;
+                            server_confirmed_cancel = true;
+                        }
+                        if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                            return Err(DbError::Disconnected);
                         }
                         let err_msg = mapped.to_string();
                         logs.push(ExecutedSql {
@@ -2103,19 +2472,17 @@ impl MysqlSession {
                 }
             }
 
-            if batch_may_change_sql_mode {
+            if batch_may_change_editor_sql_mode {
                 if should_refresh_post_batch_global_mode(
                     true,
                     cancelled,
                     is_cancel_pending(),
                     self.is_disconnected() || discard_lease,
                 ) {
-                    // PooledMysqlConn resets session variables via COM_RESET_CONNECTION on drop,
-                    // so subsequent pooled operations inherit @@GLOBAL.sql_mode. Bound with
-                    // PING_TIMEOUT so a dead/hung probe never blocks batch completion (R18-6).
+                    // Persist @@SESSION.sql_mode across Run Current calls on the dedicated editor connection.
                     match tokio::time::timeout(
                         PING_TIMEOUT,
-                        conn.query_first::<Row, _>(MYSQL_LIVE_GLOBAL_MODE_SQL),
+                        conn.query_first::<Row, _>(MYSQL_LIVE_SESSION_MODE_SQL),
                     )
                     .await
                     {
@@ -2142,7 +2509,11 @@ impl MysqlSession {
                     self.mysql_quote_mode
                         .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
                 }
-                // Evict previously pooled idle connections so no stale session sql_mode survives.
+            }
+            if batch_may_change_global_sql_mode {
+                // Evict previously pooled idle connections only when global/procedure mode may have changed.
+                self.mysql_grid_quote_mode
+                    .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
                 self.evict_idle_conns();
             }
 
@@ -2159,25 +2530,77 @@ impl MysqlSession {
 
         drop(active_guard);
         let disconnected = self.is_disconnected() || discard_lease;
+        let cancel_requested_flag = cancel_requested.load(Ordering::Acquire);
         let batch_cancelled = is_cancelled()
-            || cancel_requested.load(Ordering::Acquire)
+            || cancel_requested_flag
             || matches!(outcome, Ok((ref batch, _)) if batch.cancelled)
             || matches!(outcome, Err(DbError::Cancelled));
         let needs_mode_refresh = matches!(outcome, Err(DbError::Cancelled)) || !refreshed_mode;
-        if should_discard_mysql_lease(
-            is_cancelled(),
-            cancel_requested.load(Ordering::Acquire),
+        let mut retire_conn = should_retire_mysql_editor_conn(
+            cancel_requested_flag,
+            server_confirmed_cancel,
             disconnected,
-            &outcome,
-        ) {
-            lease.discard();
+            protocol_dirty,
+        );
+        if !retire_conn
+            && (server_confirmed_cancel || batch_cancelled)
+            && !matches!(tokio::time::timeout(PING_TIMEOUT, conn.ping()).await, Ok(Ok(())))
+        {
+            retire_conn = true;
         }
-        if batch_may_change_sql_mode && needs_mode_refresh {
+        if retire_conn {
+            spawn_disconnect_mysql_conn(conn);
+            self.disconnected.store(true, Ordering::Release);
             self.mysql_quote_mode
                 .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
-            self.evict_idle_conns();
-            if should_run_cleanup_global_mode_refresh(disconnected, batch_cancelled) {
-                self.refresh_global_sql_mode().await;
+            if batch_may_change_global_sql_mode {
+                self.mysql_grid_quote_mode
+                    .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                self.evict_idle_conns();
+            }
+            if !matches!(outcome, Err(DbError::Disconnected)) {
+                outcome = Err(DbError::Disconnected);
+            }
+        } else {
+            let mut mode_probe_failed = false;
+            if batch_may_change_global_sql_mode {
+                self.mysql_grid_quote_mode
+                    .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                self.evict_idle_conns();
+            }
+            if batch_may_change_editor_sql_mode && needs_mode_refresh {
+                self.mysql_quote_mode
+                    .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                match tokio::time::timeout(
+                    PING_TIMEOUT,
+                    conn.query_first::<Row, _>(MYSQL_LIVE_SESSION_MODE_SQL),
+                )
+                .await
+                {
+                    Ok(Ok(Some(mode_row))) => {
+                        let refreshed = parse_mysql_live_mode_row(&mode_row);
+                        self.mysql_quote_mode
+                            .store(pack_mysql_quote_mode(Some(refreshed)), Ordering::Release);
+                    }
+                    Ok(Ok(None)) | Err(_) => {
+                        mode_probe_failed = true;
+                    }
+                    Ok(Err(err)) => {
+                        drop(self.map_session_err(err));
+                        mode_probe_failed = true;
+                    }
+                }
+            }
+            if mode_probe_failed {
+                spawn_disconnect_mysql_conn(conn);
+                self.disconnected.store(true, Ordering::Release);
+                self.mysql_quote_mode
+                    .store(MYSQL_QUOTE_MODE_UNKNOWN, Ordering::Release);
+                if !matches!(outcome, Err(DbError::Disconnected)) {
+                    outcome = Err(DbError::Disconnected);
+                }
+            } else {
+                *editor_guard = Some(conn);
             }
         }
         outcome
@@ -2199,6 +2622,17 @@ struct MidBatchProbeDecision {
     abort_cancelled: bool,
 }
 
+fn mysql_stmt_may_touch_global_sql_mode_text(stmt_sql: &str) -> bool {
+    if !crate::sql::mysql_stmt_may_touch_sql_mode_text(stmt_sql) {
+        return false;
+    }
+    let lower = stmt_sql.to_ascii_lowercase();
+    lower.contains("global")
+        || lower.contains("persist")
+        || lower.contains("call")
+        || lower.contains("execute")
+}
+
 fn decide_mid_batch_probe_after_wait(
     failure: Option<MidBatchProbeFailure>,
     cancel_pending: bool,
@@ -2207,9 +2641,7 @@ fn decide_mid_batch_probe_after_wait(
         failure,
         Some(MidBatchProbeFailure::TimedOutOrEmpty | MidBatchProbeFailure::Disconnected)
     );
-    let discard_lease = mark_disconnected
-        || cancel_pending
-        || matches!(failure, Some(MidBatchProbeFailure::Cancelled));
+    let discard_lease = mark_disconnected;
     let abort_cancelled =
         cancel_pending || matches!(failure, Some(MidBatchProbeFailure::Cancelled));
     MidBatchProbeDecision {
@@ -2217,10 +2649,6 @@ fn decide_mid_batch_probe_after_wait(
         discard_lease,
         abort_cancelled,
     }
-}
-
-fn should_run_cleanup_global_mode_refresh(disconnected: bool, cancelled: bool) -> bool {
-    !disconnected && !cancelled
 }
 
 fn should_abort_mysql_stmt_dispatch(local_cancelled: bool, cancel_requested: bool) -> bool {
@@ -2236,17 +2664,13 @@ fn should_refresh_post_batch_global_mode(
     batch_may_change_sql_mode && !cancelled && !cancel_pending && !disconnected
 }
 
-fn should_discard_mysql_lease(
-    local_cancelled: bool,
+fn should_retire_mysql_editor_conn(
     cancel_requested: bool,
+    server_confirmed_cancel: bool,
     disconnected: bool,
-    outcome: &Result<(QueryBatchResult, Vec<ExecutedSql>), DbError>,
+    protocol_dirty: bool,
 ) -> bool {
-    local_cancelled
-        || cancel_requested
-        || disconnected
-        || matches!(outcome, Ok((batch, _)) if batch.cancelled)
-        || matches!(outcome, Err(DbError::Disconnected | DbError::Cancelled))
+    disconnected || protocol_dirty || (cancel_requested && !server_confirmed_cancel)
 }
 
 impl MysqlSession {
@@ -2412,6 +2836,9 @@ pub fn build_mysql_opts(
         builder = builder.pass(password);
     }
     builder = builder.db_name(target_db);
+    if profile.safety == SafetyPolicy::ReadOnly {
+        builder = builder.setup(vec!["SET SESSION TRANSACTION READ ONLY".to_owned()]);
+    }
     if let Some(ssl) = ssl_opts {
         builder = builder.ssl_opts(ssl);
     }
@@ -4035,42 +4462,13 @@ mod tests {
     }
 
     #[test]
-    fn should_discard_mysql_lease_covers_server_cancelled_batches() {
-        let normal_ok = Ok((
-            QueryBatchResult {
-                results: Vec::new(),
-                total_elapsed_ms: 1,
-                cancelled: false,
-            },
-            Vec::new(),
-        ));
-        assert!(!should_discard_mysql_lease(false, false, false, &normal_ok));
-        assert!(should_discard_mysql_lease(false, false, true, &normal_ok));
-
-        // Server-reported cancellation (`batch.cancelled == true`) must discard even when local flags are false.
-        let server_cancelled = Ok((
-            QueryBatchResult {
-                results: Vec::new(),
-                total_elapsed_ms: 1,
-                cancelled: true,
-            },
-            Vec::new(),
-        ));
-        assert!(should_discard_mysql_lease(false, false, false, &server_cancelled));
-        assert!(should_discard_mysql_lease(true, false, false, &normal_ok));
-        assert!(should_discard_mysql_lease(false, true, false, &normal_ok));
-        assert!(should_discard_mysql_lease(
-            false,
-            false,
-            false,
-            &Err(DbError::Cancelled)
-        ));
-        assert!(should_discard_mysql_lease(
-            false,
-            false,
-            false,
-            &Err(DbError::Disconnected)
-        ));
+    fn should_retire_mysql_editor_conn_preserves_confirmed_cancel() {
+        assert!(!should_retire_mysql_editor_conn(false, false, false, false));
+        assert!(!should_retire_mysql_editor_conn(true, true, false, false));
+        assert!(should_retire_mysql_editor_conn(true, false, false, false));
+        assert!(should_retire_mysql_editor_conn(false, false, true, false));
+        assert!(should_retire_mysql_editor_conn(true, true, true, false));
+        assert!(should_retire_mysql_editor_conn(true, true, false, true));
 
         assert!(!should_abort_mysql_stmt_dispatch(false, false));
         assert!(should_abort_mysql_stmt_dispatch(true, false));
@@ -4113,14 +4511,30 @@ mod tests {
             decide_mid_batch_probe_after_wait(None, true),
             MidBatchProbeDecision {
                 mark_disconnected: false,
-                discard_lease: true,
+                discard_lease: false,
                 abort_cancelled: true,
             }
         );
-        assert!(should_run_cleanup_global_mode_refresh(false, false));
-        assert!(!should_run_cleanup_global_mode_refresh(true, false));
-        assert!(!should_run_cleanup_global_mode_refresh(false, true));
-        assert!(!should_run_cleanup_global_mode_refresh(true, true));
+        assert_eq!(
+            decide_mid_batch_probe_after_wait(Some(MidBatchProbeFailure::Cancelled), true),
+            MidBatchProbeDecision {
+                mark_disconnected: false,
+                discard_lease: false,
+                abort_cancelled: true,
+            }
+        );
+        assert!(!super::mysql_stmt_may_touch_global_sql_mode_text(
+            "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'"
+        ));
+        assert!(!super::mysql_stmt_may_touch_global_sql_mode_text(
+            "SET @@session.sql_mode = ''"
+        ));
+        assert!(super::mysql_stmt_may_touch_global_sql_mode_text(
+            "SET GLOBAL sql_mode = 'ANSI_QUOTES'"
+        ));
+        assert!(super::mysql_stmt_may_touch_global_sql_mode_text(
+            "SET PERSIST sql_mode = ''"
+        ));
     }
 
     #[test]
@@ -4218,5 +4632,21 @@ mod tests {
             }
             other => panic!("expected Update plan, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_mysql_opts_sets_read_only_setup_command_when_read_only() {
+        let mut ro_profile = ConnectionProfile::new_mysql("Greendale MySQL RO", "127.0.0.1", "troy");
+        ro_profile.safety = SafetyPolicy::ReadOnly;
+        let ro_opts = build_mysql_opts(&ro_profile, None, Some("greendale"), None);
+        assert_eq!(
+            ro_opts.setup(),
+            ["SET SESSION TRANSACTION READ ONLY"]
+        );
+
+        let mut rw_profile = ro_profile.clone();
+        rw_profile.safety = SafetyPolicy::Unrestricted;
+        let rw_opts = build_mysql_opts(&rw_profile, None, Some("greendale"), None);
+        assert!(rw_opts.setup().is_empty());
     }
 }

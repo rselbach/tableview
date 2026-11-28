@@ -1,5 +1,10 @@
 use sqlparser::ast::{
-    Query, Set, SetExpr, Statement, TransactionAccessMode, TransactionMode, UtilityOption, Value,
+    AccessExpr, AlterColumnOperation, AlterFunctionOperation, AlterIndexOperation, AlterSchemaOperation,
+    AlterTable, AlterTableOperation, AlterTypeOperation, AlterViewOperation, Distinct, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, InTarget, JoinConstraint, JoinOperator, LimitClause,
+    ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, PivotValueSource, Query, Select, SelectItem, Set,
+    SetExpr, Statement, Subscript, TableFactor, TransactionAccessMode, TransactionMode, UtilityOption, Value,
+    WindowType,
 };
 use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -908,7 +913,7 @@ fn classify_unparsed_statement(
         }
         DbEngine::Sqlite => {
             if starts_with_keyword(engine, &upper, "PRAGMA") {
-                if pragma_has_assignment(stripped) {
+                if unparsed_pragma_is_setter(stripped) {
                     return StatementInspection {
                         sql: trimmed.to_owned(),
                         risk: StatementRisk::WriteDdl,
@@ -952,6 +957,20 @@ fn classify_unparsed_statement(
         DbEngine::Postgres => {}
     }
 
+    if starts_with_keyword(engine, &upper, "DROP")
+        || starts_with_keyword(engine, &upper, "TRUNCATE")
+        || starts_with_keyword(engine, &upper, "RENAME")
+        || is_create_or_replace_command(engine, &upper)
+        || (starts_with_keyword(engine, &upper, "ALTER") && contains_destructive_alter_keyword(&upper))
+    {
+        return StatementInspection {
+            sql: trimmed.to_owned(),
+            risk: StatementRisk::Destructive,
+            summary: "Destructive DDL command".to_owned(),
+            parsed: false,
+        };
+    }
+
     // Fail-closed on unparseable engine-specific statements so guardrails cannot be bypassed.
     StatementInspection {
         sql: trimmed.to_owned(),
@@ -959,6 +978,30 @@ fn classify_unparsed_statement(
         summary: "Unparsed SQL statement (treated as write for safety)".to_owned(),
         parsed: false,
     }
+}
+
+fn is_create_or_replace_command(engine: DbEngine, upper: &str) -> bool {
+    if !starts_with_keyword(engine, upper, "CREATE") {
+        return false;
+    }
+    let mut toks = upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty());
+    matches!(
+        (toks.next(), toks.next(), toks.next()),
+        (Some("CREATE"), Some("OR"), Some("REPLACE" | "ALTER"))
+    )
+}
+
+fn contains_destructive_alter_keyword(upper: &str) -> bool {
+    upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| {
+            matches!(
+                tok,
+                "DROP" | "TRUNCATE" | "DETACH" | "MODIFY" | "CHANGE" | "RENAME" | "TYPE" | "SWAP" | "DISABLE"
+            )
+        })
 }
 
 fn starts_with_keyword(engine: DbEngine, upper: &str, kw: &str) -> bool {
@@ -969,22 +1012,75 @@ fn starts_with_keyword(engine: DbEngine, upper: &str, kw: &str) -> bool {
             .is_none_or(|c| crate::sql::is_sql_whitespace(engine, c) || c == ';')
 }
 
-fn pragma_has_assignment(sql: &str) -> bool {
-    // `PRAGMA name = val` sets a pragma; `PRAGMA name` or `PRAGMA name(arg)` reads.
+fn is_readonly_sqlite_pragma_ident(raw: &str) -> bool {
+    matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "table_info"
+            | "table_xinfo"
+            | "index_list"
+            | "index_info"
+            | "index_xinfo"
+            | "foreign_key_list"
+            | "foreign_key_check"
+            | "integrity_check"
+            | "quick_check"
+            | "collation_list"
+            | "database_list"
+            | "function_list"
+            | "module_list"
+            | "pragma_list"
+            | "table_list"
+            | "compile_options"
+    )
+}
+
+fn is_sqlite_readonly_pragma_name(name: &ObjectName) -> bool {
+    let Some(last) = name.0.last() else {
+        return false;
+    };
+    let raw = match last {
+        ObjectNamePart::Identifier(ident) => ident.value.as_str(),
+        ObjectNamePart::Function(_) => return false,
+    };
+    is_readonly_sqlite_pragma_ident(raw)
+}
+
+fn unparsed_pragma_is_setter(sql: &str) -> bool {
+    let after_pragma = sql
+        .trim_start()
+        .get(6..)
+        .map_or("", str::trim_start);
     let mut in_single = false;
     let mut in_double = false;
-    let mut paren_depth = 0usize;
-    for ch in sql.chars() {
+    let mut in_bracket = false;
+    let mut first_paren: Option<usize> = None;
+    for (idx, ch) in after_pragma.char_indices() {
         match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '(' if !in_single && !in_double => paren_depth += 1,
-            ')' if !in_single && !in_double => paren_depth = paren_depth.saturating_sub(1),
-            '=' if !in_single && !in_double && paren_depth == 0 => return true,
+            '\'' if !in_double && !in_bracket => in_single = !in_single,
+            '"' if !in_single && !in_bracket => in_double = !in_double,
+            '[' if !in_single && !in_double => in_bracket = true,
+            ']' if in_bracket => in_bracket = false,
+            '=' if !in_single && !in_double && !in_bracket => return true,
+            '(' if !in_single && !in_double && !in_bracket => {
+                first_paren = Some(idx);
+                break;
+            }
             _ => {}
         }
     }
-    false
+    let Some(paren_idx) = first_paren else {
+        return false;
+    };
+    let head = after_pragma[..paren_idx].trim();
+    let target = head.rsplit('.').next().unwrap_or(head).trim();
+    let unquoted = target
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .or_else(|| target.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .or_else(|| target.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .or_else(|| target.strip_prefix('`').and_then(|s| s.strip_suffix('`')))
+        .unwrap_or(target);
+    !is_readonly_sqlite_pragma_ident(unquoted)
 }
 
 /// Evaluates all SQL statements against the connection's [`SafetyPolicy`] and [`EnvTag`].
@@ -1157,8 +1253,8 @@ fn classify_ast_statement(engine: DbEngine, stmt: &Statement, raw_sql: &str) -> 
         }
         Statement::ExplainTable { .. } => (StatementRisk::ReadOnly, "DESCRIBE".to_owned()),
         Statement::Use(_) => (StatementRisk::ReadOnly, "USE".to_owned()),
-        Statement::Pragma { is_eq, value, .. } => {
-            if *is_eq || (value.is_some() && pragma_has_assignment(raw_sql)) {
+        Statement::Pragma { name, is_eq, value } => {
+            if *is_eq || (value.is_some() && !is_sqlite_readonly_pragma_name(name)) {
                 (StatementRisk::WriteDdl, "PRAGMA".to_owned())
             } else {
                 (StatementRisk::ReadOnly, "PRAGMA".to_owned())
@@ -1216,13 +1312,111 @@ fn classify_ast_statement(engine: DbEngine, stmt: &Statement, raw_sql: &str) -> 
         | Statement::DropFunction(_)
         | Statement::DropDomain(_)
         | Statement::DropProcedure { .. }
+        | Statement::DropSecret { .. }
         | Statement::DropPolicy(_)
         | Statement::DropRule(_)
+        | Statement::DropConnector { .. }
         | Statement::DropExtension(_)
         | Statement::DropOperator(_)
         | Statement::DropOperatorFamily(_)
         | Statement::DropOperatorClass(_)
         | Statement::DropTrigger(_) => (StatementRisk::Destructive, "DROP".to_owned()),
+        Statement::RenameTable(_) => (StatementRisk::Destructive, "RENAME TABLE".to_owned()),
+        Statement::CreateTable(ct) if ct.or_replace => {
+            (StatementRisk::Destructive, "CREATE OR REPLACE TABLE".to_owned())
+        }
+        Statement::CreateView(cv) if cv.or_replace || cv.or_alter => {
+            (StatementRisk::Destructive, "CREATE OR REPLACE VIEW".to_owned())
+        }
+        Statement::CreateFunction(cf) if cf.or_replace || cf.or_alter => {
+            (StatementRisk::Destructive, "CREATE OR REPLACE FUNCTION".to_owned())
+        }
+        Statement::CreateTrigger(ct) if ct.or_replace || ct.or_alter => {
+            (StatementRisk::Destructive, "CREATE OR REPLACE TRIGGER".to_owned())
+        }
+        Statement::CreateRule(cr) if cr.or_replace => {
+            (StatementRisk::Destructive, "CREATE OR REPLACE RULE".to_owned())
+        }
+        Statement::CreateAggregate(ca) if ca.or_replace => {
+            (StatementRisk::Destructive, "CREATE OR REPLACE AGGREGATE".to_owned())
+        }
+        Statement::CreateSchema {
+            or_replace: true, ..
+        } => (StatementRisk::Destructive, "CREATE OR REPLACE SCHEMA".to_owned()),
+        Statement::CreateSecret {
+            or_replace: true, ..
+        } => (StatementRisk::Destructive, "CREATE OR REPLACE SECRET".to_owned()),
+        Statement::CreateMacro {
+            or_replace: true, ..
+        } => (StatementRisk::Destructive, "CREATE OR REPLACE MACRO".to_owned()),
+        Statement::CreateStage {
+            or_replace: true, ..
+        } => (StatementRisk::Destructive, "CREATE OR REPLACE STAGE".to_owned()),
+        Statement::CreateFileFormat {
+            or_replace: true, ..
+        } => (
+            StatementRisk::Destructive,
+            "CREATE OR REPLACE FILE FORMAT".to_owned(),
+        ),
+        Statement::CreateProcedure { or_alter: true, .. } => {
+            (StatementRisk::Destructive, "CREATE OR ALTER PROCEDURE".to_owned())
+        }
+        Statement::AlterIndex {
+            operation: AlterIndexOperation::RenameIndex { .. },
+            ..
+        } => (StatementRisk::Destructive, "ALTER INDEX RENAME".to_owned()),
+        Statement::AlterFunction(af)
+            if matches!(
+                af.operation,
+                AlterFunctionOperation::RenameTo { .. } | AlterFunctionOperation::SetSchema { .. }
+            ) =>
+        {
+            (StatementRisk::Destructive, "ALTER FUNCTION (RENAME / MOVE)".to_owned())
+        }
+        Statement::AlterTable(alter) => {
+            if let Some(summary) = alter_table_is_destructive(alter) {
+                (StatementRisk::Destructive, summary.to_owned())
+            } else {
+                (StatementRisk::WriteDdl, "ALTER TABLE".to_owned())
+            }
+        }
+        Statement::AlterSchema(alter) => {
+            let destructive = alter.operations.iter().any(|op| {
+                matches!(
+                    op,
+                    AlterSchemaOperation::DropReplica { .. } | AlterSchemaOperation::Rename { .. }
+                )
+            });
+            if destructive {
+                (StatementRisk::Destructive, "ALTER SCHEMA (DROP / RENAME)".to_owned())
+            } else {
+                (StatementRisk::WriteDdl, "ALTER SCHEMA".to_owned())
+            }
+        }
+        Statement::AlterView(alter) => {
+            let destructive = matches!(
+                alter.operation,
+                AlterViewOperation::RenameColumn { .. }
+                    | AlterViewOperation::RenameTo { .. }
+                    | AlterViewOperation::SetSchema { .. }
+            );
+            if destructive {
+                (StatementRisk::Destructive, "ALTER VIEW (RENAME / MOVE)".to_owned())
+            } else {
+                (StatementRisk::WriteDdl, "ALTER VIEW".to_owned())
+            }
+        }
+        Statement::AlterType(alter) => {
+            let destructive = matches!(
+                alter.operation,
+                AlterTypeOperation::Rename(_) | AlterTypeOperation::RenameValue(_)
+            );
+            if destructive {
+                (StatementRisk::Destructive, "ALTER TYPE (RENAME)".to_owned())
+            } else {
+                (StatementRisk::WriteDdl, "ALTER TYPE".to_owned())
+            }
+        }
         Statement::Set(Set::SetTransaction { modes, .. })
             if !modes.is_empty()
                 && modes
@@ -1249,14 +1443,9 @@ fn classify_ast_statement(engine: DbEngine, stmt: &Statement, raw_sql: &str) -> 
         | Statement::CreateRole(_)
         | Statement::CreatePolicy(_)
         | Statement::CreateSequence { .. }
-        | Statement::AlterTable(_)
-        | Statement::AlterIndex { .. }
-        | Statement::AlterView { .. }
-        | Statement::AlterSchema(_)
         | Statement::AlterRole { .. }
         | Statement::AlterPolicy(_)
         | Statement::AlterFunction(_)
-        | Statement::AlterType(_)
         | Statement::Grant { .. }
         | Statement::Revoke { .. }
         | Statement::Comment { .. }
@@ -1270,38 +1459,635 @@ fn classify_ast_statement(engine: DbEngine, stmt: &Statement, raw_sql: &str) -> 
     }
 }
 
+fn alter_table_is_destructive(alter: &AlterTable) -> Option<&'static str> {
+    for op in &alter.operations {
+        match op {
+            AlterTableOperation::DropColumn { .. }
+            | AlterTableOperation::DropConstraint { .. }
+            | AlterTableOperation::DropPrimaryKey { .. }
+            | AlterTableOperation::DropForeignKey { .. }
+            | AlterTableOperation::DropIndex { .. }
+            | AlterTableOperation::DropPartitions { .. }
+            | AlterTableOperation::DropProjection { .. }
+            | AlterTableOperation::DropClusteringKey => {
+                return Some("ALTER TABLE DROP");
+            }
+            AlterTableOperation::DetachPartition { .. }
+            | AlterTableOperation::DetachPartitionOf { .. } => {
+                return Some("ALTER TABLE DETACH PARTITION");
+            }
+            AlterTableOperation::AlterColumn {
+                op: AlterColumnOperation::SetDataType { .. },
+                ..
+            } => {
+                return Some("ALTER TABLE ALTER COLUMN TYPE");
+            }
+            AlterTableOperation::ChangeColumn { .. } | AlterTableOperation::ModifyColumn { .. } => {
+                return Some("ALTER TABLE MODIFY / CHANGE COLUMN");
+            }
+            AlterTableOperation::RenameColumn { .. }
+            | AlterTableOperation::RenameTable { .. }
+            | AlterTableOperation::RenamePartitions { .. }
+            | AlterTableOperation::RenameConstraint { .. }
+            | AlterTableOperation::SwapWith { .. } => {
+                return Some("ALTER TABLE RENAME / SWAP");
+            }
+            AlterTableOperation::DisableRowLevelSecurity
+            | AlterTableOperation::NoForceRowLevelSecurity
+            | AlterTableOperation::DisableRule { .. }
+            | AlterTableOperation::DisableTrigger { .. } => {
+                return Some("ALTER TABLE DISABLE SECURITY / TRIGGER");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn escalate_risk(worst: &mut (StatementRisk, String), candidate: (StatementRisk, String)) {
+    if candidate.0 > worst.0 {
+        *worst = candidate;
+    }
+}
+
 fn classify_query(engine: DbEngine, query: &Query, raw_sql: &str) -> (StatementRisk, String) {
-    let mut worst_risk = StatementRisk::ReadOnly;
-    let mut best_summary = "SELECT".to_owned();
+    let mut worst = (StatementRisk::ReadOnly, "SELECT".to_owned());
 
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let (risk, summary) = classify_query(engine, &cte.query, raw_sql);
-            if risk > worst_risk {
-                worst_risk = risk;
-                best_summary = format!("WITH CTE ({summary})");
-            }
+            escalate_risk(&mut worst, (risk, format!("WITH CTE ({summary})")));
         }
     }
 
-    let (body_risk, body_summary) = classify_set_expr(engine, &query.body, raw_sql);
-    if body_risk > worst_risk {
-        worst_risk = body_risk;
-        best_summary = body_summary;
+    escalate_risk(&mut worst, classify_set_expr(engine, &query.body, raw_sql));
+
+    if let Some(order_by) = &query.order_by
+        && let OrderByKind::Expressions(exprs) = &order_by.kind
+    {
+        classify_order_by_exprs(engine, exprs, raw_sql, &mut worst);
+    }
+    if let Some(limit_clause) = &query.limit_clause {
+        match limit_clause {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if let Some(e) = limit {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+                }
+                if let Some(o) = offset {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, &o.value, raw_sql));
+                }
+                for e in limit_by {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+                }
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, offset, raw_sql));
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, limit, raw_sql));
+            }
+        }
+    }
+    if let Some(fetch) = &query.fetch
+        && let Some(qty) = &fetch.quantity
+    {
+        escalate_risk(&mut worst, classify_expr_subqueries(engine, qty, raw_sql));
     }
 
-    (worst_risk, best_summary)
+    if !query.locks.is_empty() {
+        escalate_risk(
+            &mut worst,
+            (StatementRisk::WriteDml, "SELECT FOR UPDATE / LOCKING READ".to_owned()),
+        );
+    }
+
+    worst
+}
+
+fn classify_order_by_exprs(
+    engine: DbEngine,
+    exprs: &[OrderByExpr],
+    raw_sql: &str,
+    worst: &mut (StatementRisk, String),
+) {
+    for obe in exprs {
+        escalate_risk(worst, classify_expr_subqueries(engine, &obe.expr, raw_sql));
+    }
+}
+
+fn classify_function_arg(
+    engine: DbEngine,
+    arg: &FunctionArg,
+    raw_sql: &str,
+    worst: &mut (StatementRisk, String),
+) {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => {
+            escalate_risk(worst, classify_expr_subqueries(engine, e, raw_sql));
+        }
+        FunctionArg::ExprNamed { name, arg, .. } => {
+            escalate_risk(worst, classify_expr_subqueries(engine, name, raw_sql));
+            if let FunctionArgExpr::Expr(e) = arg {
+                escalate_risk(worst, classify_expr_subqueries(engine, e, raw_sql));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn classify_function_args(
+    engine: DbEngine,
+    args: &FunctionArguments,
+    raw_sql: &str,
+    worst: &mut (StatementRisk, String),
+) {
+    if let FunctionArguments::List(list) = args {
+        for arg in &list.args {
+            classify_function_arg(engine, arg, raw_sql, worst);
+        }
+    }
+}
+
+fn classify_join_constraint(
+    engine: DbEngine,
+    constraint: &JoinConstraint,
+    raw_sql: &str,
+    worst: &mut (StatementRisk, String),
+) {
+    if let JoinConstraint::On(expr) = constraint {
+        escalate_risk(worst, classify_expr_subqueries(engine, expr, raw_sql));
+    }
+}
+
+fn classify_join_operator(engine: DbEngine, op: &JoinOperator, raw_sql: &str) -> (StatementRisk, String) {
+    let mut worst = (StatementRisk::ReadOnly, "SELECT".to_owned());
+    match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => classify_join_constraint(engine, c, raw_sql, &mut worst),
+        JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, match_condition, raw_sql));
+            classify_join_constraint(engine, constraint, raw_sql, &mut worst);
+        }
+        JoinOperator::CrossApply
+        | JoinOperator::OuterApply
+        | JoinOperator::ArrayJoin
+        | JoinOperator::LeftArrayJoin
+        | JoinOperator::InnerArrayJoin => {}
+    }
+    worst
+}
+
+fn classify_table_factor(engine: DbEngine, factor: &TableFactor, raw_sql: &str) -> (StatementRisk, String) {
+    let mut worst = (StatementRisk::ReadOnly, "SELECT".to_owned());
+    match factor {
+        TableFactor::Derived { subquery, .. } => {
+            escalate_risk(&mut worst, classify_query(engine, subquery, raw_sql));
+        }
+        TableFactor::NestedJoin { table_with_joins, .. } => {
+            escalate_risk(
+                &mut worst,
+                classify_table_factor(engine, &table_with_joins.relation, raw_sql),
+            );
+            for join in &table_with_joins.joins {
+                escalate_risk(
+                    &mut worst,
+                    classify_join_operator(engine, &join.join_operator, raw_sql),
+                );
+                escalate_risk(&mut worst, classify_table_factor(engine, &join.relation, raw_sql));
+            }
+        }
+        TableFactor::Table {
+            args, with_hints, ..
+        } => {
+            if let Some(tfa) = args {
+                for arg in &tfa.args {
+                    classify_function_arg(engine, arg, raw_sql, &mut worst);
+                }
+            }
+            for hint in with_hints {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, hint, raw_sql));
+            }
+        }
+        TableFactor::TableFunction { expr, .. } | TableFactor::JsonTable { json_expr: expr, .. }
+        | TableFactor::OpenJsonTable { json_expr: expr, .. } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+        }
+        TableFactor::Function { args, .. } => {
+            for arg in args {
+                classify_function_arg(engine, arg, raw_sql, &mut worst);
+            }
+        }
+        TableFactor::UNNEST { array_exprs, .. } => {
+            for expr in array_exprs {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            }
+        }
+        TableFactor::Pivot {
+            table,
+            aggregate_functions,
+            value_column,
+            value_source,
+            default_on_null,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_table_factor(engine, table, raw_sql));
+            for af in aggregate_functions {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, &af.expr, raw_sql));
+            }
+            for vc in value_column {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, vc, raw_sql));
+            }
+            match value_source {
+                PivotValueSource::List(items) => {
+                    for item in items {
+                        escalate_risk(&mut worst, classify_expr_subqueries(engine, &item.expr, raw_sql));
+                    }
+                }
+                PivotValueSource::Any(exprs) => classify_order_by_exprs(engine, exprs, raw_sql, &mut worst),
+                PivotValueSource::Subquery(q) => {
+                    escalate_risk(&mut worst, classify_query(engine, q, raw_sql));
+                }
+            }
+            if let Some(def) = default_on_null {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, def, raw_sql));
+            }
+        }
+        TableFactor::Unpivot { table, value, .. } => {
+            escalate_risk(&mut worst, classify_table_factor(engine, table, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, value, raw_sql));
+        }
+        TableFactor::UnpivotExpr { expression, .. } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expression, raw_sql));
+        }
+        TableFactor::MatchRecognize {
+            table,
+            partition_by,
+            order_by,
+            measures,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_table_factor(engine, table, raw_sql));
+            for e in partition_by {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+            }
+            classify_order_by_exprs(engine, order_by, raw_sql, &mut worst);
+            for m in measures {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, &m.expr, raw_sql));
+            }
+        }
+        TableFactor::XmlTable {
+            row_expression,
+            passing,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, row_expression, raw_sql));
+            for arg in &passing.arguments {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, &arg.expr, raw_sql));
+            }
+        }
+        TableFactor::SemanticView {
+            dimensions,
+            metrics,
+            facts,
+            where_clause,
+            ..
+        } => {
+            for e in dimensions.iter().chain(metrics.iter()).chain(facts.iter()) {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+            }
+            if let Some(w) = where_clause {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, w, raw_sql));
+            }
+        }
+    }
+    worst
+}
+
+fn classify_expr_subqueries(engine: DbEngine, expr: &Expr, raw_sql: &str) -> (StatementRisk, String) {
+    let mut worst = (StatementRisk::ReadOnly, "SELECT".to_owned());
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            escalate_risk(&mut worst, classify_query(engine, q, raw_sql));
+        }
+        Expr::In { expr, target, .. } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            match target {
+                InTarget::List(list) => {
+                    for item in list {
+                        escalate_risk(&mut worst, classify_expr_subqueries(engine, item, raw_sql));
+                    }
+                }
+                InTarget::Subquery(subquery) => {
+                    escalate_risk(&mut worst, classify_query(engine, subquery, raw_sql));
+                }
+                InTarget::Unnest(array_expr) => {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, array_expr, raw_sql));
+                }
+                InTarget::Table {
+                    args: Some(args), ..
+                } => {
+                    for arg in args {
+                        classify_function_arg(engine, arg, raw_sql, &mut worst);
+                    }
+                }
+                InTarget::Table { args: None, .. } => {}
+            }
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right)
+        | Expr::AtTimeZone {
+            timestamp: left,
+            time_zone: right,
+        }
+        | Expr::Position {
+            expr: left,
+            r#in: right,
+        }
+        | Expr::RLike {
+            expr: left,
+            pattern: right,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, left, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, right, raw_sql));
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | Expr::ILike {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | Expr::SimilarTo {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, pattern, raw_sql));
+            if let Some(esc) = escape_char {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, esc, raw_sql));
+            }
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::IsJson { expr, .. }
+        | Expr::IsNormalized { expr, .. }
+        | Expr::OuterJoin(expr)
+        | Expr::Prior(expr)
+        | Expr::Collate { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
+        | Expr::Extract { expr, .. }
+        | Expr::Prefixed { value: expr, .. }
+        | Expr::Named { expr, .. }
+        | Expr::JsonAccess { value: expr, .. } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+        }
+        Expr::Convert { expr, styles, .. } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            for style in styles {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, style, raw_sql));
+            }
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            if let Some(from_e) = substring_from {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, from_e, raw_sql));
+            }
+            if let Some(for_e) = substring_for {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, for_e, raw_sql));
+            }
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            if let Some(what) = trim_what {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, what, raw_sql));
+            }
+            if let Some(chars) = trim_characters {
+                for c in chars {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, c, raw_sql));
+                }
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, overlay_what, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, overlay_from, raw_sql));
+            if let Some(for_e) = overlay_for {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, for_e, raw_sql));
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, low, raw_sql));
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, high, raw_sql));
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, op, raw_sql));
+            }
+            for cw in conditions {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, &cw.condition, raw_sql));
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, &cw.result, raw_sql));
+            }
+            if let Some(els) = else_result {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, els, raw_sql));
+            }
+        }
+        Expr::Function(func) => {
+            classify_function_args(engine, &func.parameters, raw_sql, &mut worst);
+            classify_function_args(engine, &func.args, raw_sql, &mut worst);
+            classify_order_by_exprs(engine, &func.within_group, raw_sql, &mut worst);
+            if let Some(filter) = &func.filter {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, filter, raw_sql));
+            }
+            if let Some(WindowType::WindowSpec(spec)) = &func.over {
+                for p in &spec.partition_by {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, p, raw_sql));
+                }
+                classify_order_by_exprs(engine, &spec.order_by, raw_sql, &mut worst);
+            }
+        }
+        Expr::Tuple(items) | Expr::Struct { values: items, .. } => {
+            for item in items {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, item, raw_sql));
+            }
+        }
+        Expr::Array(arr) => {
+            for item in &arr.elem {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, item, raw_sql));
+            }
+        }
+        Expr::Dictionary(fields) => {
+            for field in fields {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, &field.value, raw_sql));
+            }
+        }
+        Expr::GroupingSets(sets) | Expr::Cube(sets) | Expr::Rollup(sets) => {
+            for group in sets {
+                for item in group {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, item, raw_sql));
+                }
+            }
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, root, raw_sql));
+            for access in access_chain {
+                match access {
+                    AccessExpr::Dot(e) => {
+                        escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+                    }
+                    AccessExpr::Subscript(Subscript::Index { index }) => {
+                        escalate_risk(&mut worst, classify_expr_subqueries(engine, index, raw_sql));
+                    }
+                    AccessExpr::Subscript(Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride,
+                    }) => {
+                        for bound in [lower_bound, upper_bound, stride].into_iter().flatten() {
+                            escalate_risk(&mut worst, classify_expr_subqueries(engine, bound, raw_sql));
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Interval(iv) => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, &iv.value, raw_sql));
+        }
+        Expr::Lambda(lf) => {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, &lf.body, raw_sql));
+        }
+        _ => {}
+    }
+    worst
+}
+
+fn classify_select_subqueries(engine: DbEngine, sel: &Select, raw_sql: &str) -> (StatementRisk, String) {
+    let mut worst = if sel.into.is_some() {
+        (StatementRisk::WriteDml, "SELECT INTO".to_owned())
+    } else {
+        (StatementRisk::ReadOnly, "SELECT".to_owned())
+    };
+    if let Some(Distinct::On(exprs)) = &sel.distinct {
+        for e in exprs {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+        }
+    }
+    for twj in &sel.from {
+        escalate_risk(&mut worst, classify_table_factor(engine, &twj.relation, raw_sql));
+        for join in &twj.joins {
+            escalate_risk(
+                &mut worst,
+                classify_join_operator(engine, &join.join_operator, raw_sql),
+            );
+            escalate_risk(&mut worst, classify_table_factor(engine, &join.relation, raw_sql));
+        }
+    }
+    for lv in &sel.lateral_views {
+        escalate_risk(
+            &mut worst,
+            classify_expr_subqueries(engine, &lv.lateral_view, raw_sql),
+        );
+    }
+    for item in &sel.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+            }
+            _ => {}
+        }
+    }
+    if let Some(prewhere) = &sel.prewhere {
+        escalate_risk(&mut worst, classify_expr_subqueries(engine, prewhere, raw_sql));
+    }
+    if let Some(selection) = &sel.selection {
+        escalate_risk(&mut worst, classify_expr_subqueries(engine, selection, raw_sql));
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &sel.group_by {
+        for e in exprs {
+            escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+        }
+    }
+    for e in sel
+        .cluster_by
+        .iter()
+        .chain(sel.distribute_by.iter())
+        .chain(sel.having.iter())
+        .chain(sel.qualify.iter())
+    {
+        escalate_risk(&mut worst, classify_expr_subqueries(engine, e, raw_sql));
+    }
+    classify_order_by_exprs(engine, &sel.sort_by, raw_sql, &mut worst);
+    worst
 }
 
 fn classify_set_expr(engine: DbEngine, expr: &SetExpr, raw_sql: &str) -> (StatementRisk, String) {
     match expr {
-        SetExpr::Select(sel) => {
-            if sel.into.is_some() {
-                (StatementRisk::WriteDml, "SELECT INTO".to_owned())
-            } else {
-                (StatementRisk::ReadOnly, "SELECT".to_owned())
-            }
-        }
+        SetExpr::Select(sel) => classify_select_subqueries(engine, sel, raw_sql),
         SetExpr::Query(q) => classify_query(engine, q, raw_sql),
         SetExpr::SetOperation { left, right, .. } => {
             let (lr, ls) = classify_set_expr(engine, left, raw_sql);
@@ -1312,11 +2098,374 @@ fn classify_set_expr(engine: DbEngine, expr: &SetExpr, raw_sql: &str) -> (Statem
                 (rr, rs)
             }
         }
-        SetExpr::Values(_) | SetExpr::Table(_) => (StatementRisk::ReadOnly, "SELECT".to_owned()),
+        SetExpr::Values(values) => {
+            let mut worst = (StatementRisk::ReadOnly, "VALUES".to_owned());
+            for row in &values.rows {
+                for expr in row.iter() {
+                    escalate_risk(&mut worst, classify_expr_subqueries(engine, expr, raw_sql));
+                }
+            }
+            worst
+        }
+        SetExpr::Table(_) => (StatementRisk::ReadOnly, "SELECT".to_owned()),
         SetExpr::Insert(s) | SetExpr::Update(s) | SetExpr::Delete(s) | SetExpr::Merge(s) => {
             classify_ast_statement(engine, s, raw_sql)
         }
     }
+}
+
+/// Validates a user-supplied table `WHERE` filter so it cannot escape `WHERE (...)`, stack
+/// statements, or embed writes, DDL, locking reads, or file output clauses.
+pub fn validate_table_filter_where(
+    engine: DbEngine,
+    filter: &str,
+    session_mode: crate::sql::SqlSessionMode,
+) -> Result<(), String> {
+    let trimmed = trim_sql_whitespace(engine, filter.strip_prefix('\u{feff}').unwrap_or(filter));
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    scan_table_filter_tokens(engine, trimmed, &session_mode, false)?;
+
+    let parse_inner: String = match engine {
+        DbEngine::Mysql => {
+            let mode = session_mode.mysql.unwrap_or(crate::sql::MysqlQuoteMode::DEFAULT);
+            crate::sql::mysql_normalize_for_parser(trimmed, mode)
+        }
+        DbEngine::Postgres if !session_mode.pg_standard_conforming_strings() => {
+            crate::sql::pg_normalize_legacy_escape_strings(trimmed).into_owned()
+        }
+        _ => trimmed.to_owned(),
+    };
+    let wrapped = format!("SELECT 1 FROM _tv_filter_target WHERE ({parse_inner}\n)");
+    let parsed = match engine {
+        DbEngine::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, &wrapped),
+        DbEngine::Mysql => Parser::parse_sql(&MySqlDialect {}, &wrapped),
+        DbEngine::Sqlite => Parser::parse_sql(&SQLiteDialect {}, &wrapped),
+    };
+
+    if let Ok(stmts) = parsed {
+        let Some(stmt) = stmts.first().filter(|_| stmts.len() == 1) else {
+            return Err("Table filter must be a single WHERE expression".to_owned());
+        };
+        let Statement::Query(query) = stmt else {
+            return Err("Table filter must be a read-only WHERE predicate".to_owned());
+        };
+        if query.with.is_some()
+            || !query.locks.is_empty()
+            || query.order_by.is_some()
+            || query.limit_clause.is_some()
+            || query.fetch.is_some()
+            || !matches!(query.body.as_ref(), SetExpr::Select(sel) if sel.into.is_none())
+        {
+            return Err("Table filter must be a read-only WHERE predicate".to_owned());
+        }
+        if classify_ast_statement(engine, stmt, &wrapped).0 != StatementRisk::ReadOnly {
+            return Err("Table filter cannot contain mutating or locking SQL".to_owned());
+        }
+    } else {
+        scan_table_filter_tokens(engine, trimmed, &session_mode, true)?;
+        if engine == DbEngine::Mysql
+            && mysql_valid_select_into_outfile_or_dumpfile(&wrapped, session_mode.mysql.unwrap_or_default())
+        {
+            return Err("Table filter cannot write to OUTFILE or DUMPFILE".to_owned());
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_pg_dollar_tag(s: &str, start: usize) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut i = start + 1;
+    if i < bytes.len() && bytes[i] == b'$' {
+        return Some(&s[start..=i]);
+    }
+    if i >= bytes.len() || !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            return Some(&s[start..=i]);
+        }
+        if !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn scan_table_filter_tokens(
+    engine: DbEngine,
+    sql: &str,
+    session_mode: &crate::sql::SqlSessionMode,
+    enforce_unparsed_keywords: bool,
+) -> Result<(), String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut paren_depth = 0usize;
+    let mysql_bs = engine == DbEngine::Mysql && !session_mode.mysql.is_some_and(|m| m.no_backslash_escapes);
+    let pg_legacy_bs = engine == DbEngine::Postgres && !session_mode.pg_standard_conforming_strings();
+    let ansi_quotes = engine != DbEngine::Mysql || session_mode.mysql.is_some_and(|m| m.ansi_quotes);
+    let allow_brackets =
+        engine == DbEngine::Sqlite || (engine == DbEngine::Mysql && session_mode.mysql.is_some_and(|m| m.mssql_quotes));
+    let mut prev_any_kw: Option<String> = None;
+    let mut mysql_lock_stage = 0u8;
+
+    while i < len {
+        let b = bytes[i];
+        if crate::sql::is_dash_comment_start(engine, sql, i) {
+            i += 2;
+            while i < len && bytes[i] != b'\n' && !(engine == DbEngine::Postgres && bytes[i] == b'\r') {
+                i += 1;
+            }
+            if i >= len {
+                return Err("Table filter cannot end in an unterminated line comment".to_owned());
+            }
+            continue;
+        }
+        if engine == DbEngine::Mysql && b == b'#' {
+            i += 1;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i >= len {
+                return Err("Table filter cannot end in an unterminated '#' comment".to_owned());
+            }
+            continue;
+        }
+        if i + 1 < len && b == b'/' && bytes[i + 1] == b'*' {
+            if engine == DbEngine::Mysql && (sql[i..].starts_with("/*!") || sql[i..].starts_with("/*M!")) {
+                return Err("Executable comments are not allowed in table filters".to_owned());
+            }
+            i += 2;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if engine == DbEngine::Postgres && i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += sql[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            if depth > 0 {
+                return Err("Table filter contains an unclosed block comment".to_owned());
+            }
+            continue;
+        }
+        if b == b'\'' {
+            let escaped_prefix = engine == DbEngine::Postgres
+                && i > 0
+                && matches!(bytes[i - 1], b'e' | b'E')
+                && (i == 1 || !(bytes[i - 2].is_ascii_alphanumeric() || bytes[i - 2] == b'_'));
+            let allow_bs = mysql_bs || pg_legacy_bs || escaped_prefix;
+            i += 1;
+            let mut closed = false;
+            while i < len {
+                if allow_bs && bytes[i] == b'\\' {
+                    i += 1 + sql[i + 1..].chars().next().map_or(0, char::len_utf8);
+                } else if bytes[i] == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if !closed {
+                return Err("Table filter contains an unclosed string literal".to_owned());
+            }
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if b == b'"' {
+            let allow_bs = !ansi_quotes && mysql_bs;
+            i += 1;
+            let mut closed = false;
+            while i < len {
+                if allow_bs && bytes[i] == b'\\' {
+                    i += 1 + sql[i + 1..].chars().next().map_or(0, char::len_utf8);
+                } else if bytes[i] == b'"' {
+                    if i + 1 < len && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if !closed {
+                return Err("Table filter contains an unclosed quoted identifier or literal".to_owned());
+            }
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if (engine == DbEngine::Mysql || engine == DbEngine::Sqlite) && b == b'`' {
+            i += 1;
+            let mut closed = false;
+            while i < len {
+                if bytes[i] == b'`' {
+                    if i + 1 < len && bytes[i + 1] == b'`' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if !closed {
+                return Err("Table filter contains an unclosed backtick identifier".to_owned());
+            }
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if allow_brackets && b == b'[' {
+            i += 1;
+            let mut closed = false;
+            while i < len {
+                if bytes[i] == b']' {
+                    if engine == DbEngine::Mysql && i + 1 < len && bytes[i + 1] == b']' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if !closed {
+                return Err("Table filter contains an unclosed bracket identifier".to_owned());
+            }
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if engine == DbEngine::Postgres
+            && b == b'$'
+            && let Some(tag) = parse_pg_dollar_tag(sql, i)
+        {
+            let body_start = i + tag.len();
+            let Some(rel_end) = sql[body_start..].find(tag) else {
+                return Err("Table filter contains an unclosed dollar-quoted string".to_owned());
+            };
+            i = body_start + rel_end + tag.len();
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if b == b';' {
+            return Err("Semicolons are not allowed in table filters".to_owned());
+        }
+        if b == b'(' {
+            paren_depth += 1;
+            i += 1;
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if b == b')' {
+            if paren_depth == 0 {
+                return Err("Table filter cannot break out of WHERE (...) with an unmatched ')'".to_owned());
+            }
+            paren_depth -= 1;
+            i += 1;
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+            continue;
+        }
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let preceded_by_dot = i > 0 && bytes[i - 1] == b'.';
+            let start = i;
+            i += 1;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') {
+                i += 1;
+            }
+            let followed_by_dot = i < len && bytes[i] == b'.';
+            if preceded_by_dot || followed_by_dot {
+                prev_any_kw = None;
+                mysql_lock_stage = 0;
+                continue;
+            }
+            let kw = sql[start..i].to_ascii_uppercase();
+            if enforce_unparsed_keywords
+                && matches!(
+                    kw.as_str(),
+                    "INSERT" | "UPDATE" | "DELETE" | "DROP" | "ALTER" | "TRUNCATE" | "CREATE" | "ATTACH"
+                        | "DETACH" | "PRAGMA" | "MERGE" | "REPLACE" | "GRANT" | "REVOKE" | "COPY" | "CALL"
+                        | "EXECUTE"
+                )
+                && !(kw == "UPDATE" && prev_any_kw.as_deref() == Some("FOR"))
+            {
+                let next_is_paren = sql[i..]
+                    .trim_start_matches(|c: char| crate::sql::is_sql_whitespace(engine, c))
+                    .starts_with('(');
+                if !(kw == "REPLACE" && next_is_paren) {
+                    return Err(format!("Keyword '{kw}' is not allowed in a table filter"));
+                }
+            }
+            if prev_any_kw.as_deref() == Some("FOR")
+                && matches!(kw.as_str(), "UPDATE" | "SHARE" | "NO" | "KEY")
+            {
+                return Err("Locking clauses (FOR UPDATE / SHARE) are not allowed in table filters".to_owned());
+            }
+            if engine == DbEngine::Mysql {
+                if mysql_lock_stage == 3 && kw == "MODE" {
+                    return Err("Locking clauses (LOCK IN SHARE MODE) are not allowed in table filters".to_owned());
+                }
+                mysql_lock_stage = match (mysql_lock_stage, kw.as_str()) {
+                    (_, "LOCK") => 1,
+                    (1, "IN") => 2,
+                    (2, "SHARE") => 3,
+                    _ => 0,
+                };
+            }
+            if engine == DbEngine::Mysql
+                && prev_any_kw.as_deref() == Some("INTO")
+                && matches!(kw.as_str(), "OUTFILE" | "DUMPFILE")
+            {
+                return Err("Table filter cannot write to OUTFILE or DUMPFILE".to_owned());
+            }
+            if paren_depth == 0
+                && matches!(kw.as_str(), "UNION" | "INTERSECT" | "EXCEPT" | "INTO" | "RETURNING")
+            {
+                return Err(format!("Clause '{kw}' is not allowed in a table filter"));
+            }
+            prev_any_kw = Some(kw);
+            continue;
+        }
+        let ch = sql[i..].chars().next().unwrap_or('\0');
+        i += ch.len_utf8();
+        if !crate::sql::is_sql_whitespace(engine, ch) {
+            prev_any_kw = None;
+            mysql_lock_stage = 0;
+        }
+    }
+    Ok(())
 }
 
 fn is_truthy_analyze_option(opt: &UtilityOption) -> bool {

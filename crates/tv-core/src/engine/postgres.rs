@@ -7,6 +7,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_core::Stream;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
@@ -17,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use crate::connection::{ConnectionProfile, DbEngine, PasswordMode, SslConfig, SslMode};
+use crate::connection::{ConnectionProfile, DbEngine, EnvTag, PasswordMode, SafetyPolicy, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
     FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, PostgresRawValue, QueryBatchResult, QueryStatementResult,
@@ -393,6 +394,8 @@ fn is_pg_top_level_syntax_error(err: &tokio_postgres::Error, from_prepare: bool)
 pub struct PostgresSession {
     client: Arc<tokio_postgres::Client>,
     server_info: ServerInfo,
+    read_only: bool,
+    grid_cfg: Config,
     ssl: SslConfig,
     use_tls_for_cancel: bool,
     disconnected: Arc<AtomicBool>,
@@ -403,6 +406,55 @@ pub struct PostgresSession {
     cancel_in_flight_tx: tokio::sync::watch::Sender<usize>,
     conn_task: Mutex<Option<JoinHandle<()>>>,
     client_lock: tokio::sync::Mutex<()>,
+    grid_tx_lock: tokio::sync::Mutex<()>,
+}
+
+struct GridConnGuard(Option<JoinHandle<()>>);
+
+impl Drop for GridConnGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn map_isolated_pg_err(err: tokio_postgres::Error, conn_disconnected: &AtomicBool) -> DbError {
+    if err.is_closed() {
+        conn_disconnected.store(true, Ordering::Release);
+        return DbError::Disconnected;
+    }
+    if let Some(db) = err.as_db_error()
+        && is_pg_disconnect_sqlstate(db.code().code())
+    {
+        conn_disconnected.store(true, Ordering::Release);
+        return DbError::Disconnected;
+    }
+    if err.as_db_error().is_none() && conn_disconnected.load(Ordering::Acquire) {
+        return DbError::Disconnected;
+    }
+    map_pg_err(err)
+}
+
+fn map_isolated_grid_commit_err(err: tokio_postgres::Error, conn_disconnected: &AtomicBool) -> DbError {
+    match map_isolated_pg_err(err, conn_disconnected) {
+        err @ (DbError::Disconnected
+        | DbError::ConnectionFailed(_)
+        | DbError::AuthFailed(_)
+        | DbError::TlsConfig(_)) => DbError::QueryFailed {
+            message: format!("isolated grid commit connection failed: {err}"),
+            code: None,
+            detail: None,
+            hint: None,
+        },
+        other => other,
+    }
+}
+
+async fn next_simple_query_msg(
+    mut stream: Pin<&mut tokio_postgres::SimpleQueryStream>,
+) -> Option<Result<SimpleQueryMessage, tokio_postgres::Error>> {
+    std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
 }
 
 impl Drop for PostgresSession {
@@ -432,14 +484,16 @@ impl PostgresSession {
             .or_else(|| profile.database.as_deref().map(str::trim).filter(|s| !s.is_empty()));
 
         let effective_db = target_db.unwrap_or("postgres");
-        let (client, conn_task, disconnected, standard_conforming_strings, param_sync_tx, used_tls) =
+        let (resolved_db, (client, conn_task, disconnected, standard_conforming_strings, param_sync_tx, used_tls)) =
             match connect_raw(profile, password, effective_db).await {
-                Ok(ok) => ok,
+                Ok(ok) => (effective_db, ok),
                 Err(err) if target_db.is_none() && is_missing_database_error(&err) && profile.user.trim() != "postgres" => {
-                    connect_raw(profile, password, profile.user.trim()).await?
+                    let user_db = profile.user.trim();
+                    (user_db, connect_raw(profile, password, user_db).await?)
                 }
                 Err(err) => return Err(err),
             };
+        let (grid_cfg, _) = build_pg_config(profile, password, resolved_db);
 
         let (cancel_in_flight_tx, _) = tokio::sync::watch::channel(0usize);
         let initial_scs = standard_conforming_strings.load(Ordering::Acquire);
@@ -447,9 +501,11 @@ impl PostgresSession {
             client: Arc::new(client),
             server_info: ServerInfo {
                 version: String::new(),
-                current_database: effective_db.to_owned(),
+                current_database: resolved_db.to_owned(),
                 current_user: profile.user.trim().to_owned(),
             },
+            read_only: profile.safety == SafetyPolicy::ReadOnly,
+            grid_cfg,
             ssl: profile.ssl.clone(),
             use_tls_for_cancel: used_tls,
             disconnected,
@@ -460,6 +516,7 @@ impl PostgresSession {
             cancel_in_flight_tx,
             conn_task: Mutex::new(Some(conn_task)),
             client_lock: tokio::sync::Mutex::new(()),
+            grid_tx_lock: tokio::sync::Mutex::new(()),
         };
 
         let (info, log) = session.fetch_server_info().await?;
@@ -558,13 +615,23 @@ impl PostgresSession {
         self.map_session_err(err)
     }
 
-    fn record_pg_transaction_ended(&self, after_scs: bool) {
-        if let Ok(mut guard) = self.live_state.lock() {
-            guard.tx_state = Some(crate::sql::PostgresTxState::Idle);
-            guard.savepoints.clear();
-            guard.has_untracked_savepoints = false;
-            guard.session_scs = Some(after_scs);
-            guard.pre_tx_scs = Some(after_scs);
+    async fn connect_isolated_grid_client(
+        &self,
+    ) -> Result<(tokio_postgres::Client, Arc<AtomicBool>, GridConnGuard), DbError> {
+        let mut cfg = self.grid_cfg.clone();
+        if !self.use_tls_for_cancel {
+            cfg.ssl_mode(tokio_postgres::config::SslMode::Disable);
+        }
+        match connect_raw_cfg(cfg, &self.ssl, self.use_tls_for_cancel).await {
+            Ok((client, handle, grid_disconnected, _, _, _)) => {
+                Ok((client, grid_disconnected, GridConnGuard(Some(handle))))
+            }
+            Err(err) => Err(DbError::QueryFailed {
+                message: format!("failed to open isolated grid commit connection: {err}"),
+                code: None,
+                detail: None,
+                hint: None,
+            }),
         }
     }
 
@@ -939,6 +1006,15 @@ impl DbSession for PostgresSession {
     async fn fetch_table_page(&self, req: &PageRequest) -> Result<(TablePage, Vec<ExecutedSql>), DbError> {
         let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
+        let before_scs = self.sync_standard_conforming_strings().await;
+        if let Some(where_clause) = req.filter_where.as_deref() {
+            crate::safety::validate_table_filter_where(
+                DbEngine::Postgres,
+                where_clause,
+                crate::sql::SqlSessionMode::postgres(before_scs),
+            )
+            .map_err(DbError::InvalidInput)?;
+        }
         let limit = req.limit.clamp(1, 5000);
         let offset = req.offset.max(0);
         let (columns, _) = self.fetch_column_metas(&req.schema, &req.table).await?;
@@ -971,7 +1047,6 @@ impl DbSession for PostgresSession {
         }
 
         let sql = build_table_page_sql(&req.schema, &req.table, &columns, req, limit, offset);
-        let before_scs = self.sync_standard_conforming_strings().await;
         let start = Instant::now();
         let pg_rows = self
             .client
@@ -1299,20 +1374,26 @@ impl DbSession for PostgresSession {
         &self,
         statements: &[String],
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if self.read_only {
+            return Err(DbError::InvalidInput(
+                "Read-Only connection blocks write transactions".to_owned(),
+            ));
+        }
         if statements.is_empty() {
             return Err(DbError::InvalidInput("no SQL statements to execute in transaction".to_owned()));
         }
-        let _guard = self.client_lock.lock().await;
         self.ensure_alive()
             .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
+        let _grid_guard = self.grid_tx_lock.lock().await;
+        let (grid_client, grid_disconnected, _conn_guard) = self.connect_isolated_grid_client().await?;
         let total_start = Instant::now();
         let mut logs = Vec::with_capacity(statements.len() + 2);
         let mut total_rows_affected = 0u64;
         let mut executed = 0usize;
 
         let begin_start = Instant::now();
-        if let Err(pg_err) = self.client.simple_query("BEGIN").await {
-            let mapped = self.map_aux_query_err(pg_err);
+        if let Err(pg_err) = grid_client.simple_query("BEGIN").await {
+            let mapped = map_isolated_grid_commit_err(pg_err, &grid_disconnected);
             logs.push(ExecutedSql {
                 sql: "BEGIN;".to_owned(),
                 duration_ms: begin_start.elapsed().as_millis() as u64,
@@ -1332,7 +1413,7 @@ impl DbSession for PostgresSession {
                 continue;
             }
             let stmt_start = Instant::now();
-            match self.client.simple_query(stmt).await {
+            match grid_client.simple_query(stmt).await {
                 Ok(messages) => {
                     for msg in messages {
                         if let SimpleQueryMessage::CommandComplete(affected) = msg {
@@ -1347,20 +1428,16 @@ impl DbSession for PostgresSession {
                     });
                 }
                 Err(pg_err) => {
-                    let mapped = self.map_session_err(pg_err);
-                    drop(self.client.simple_query("ROLLBACK").await);
-                    let after_scs = self.sync_standard_conforming_strings().await;
-                    self.record_pg_transaction_ended(after_scs);
+                    let mapped = map_isolated_grid_commit_err(pg_err, &grid_disconnected);
+                    drop(grid_client.simple_query("ROLLBACK").await);
                     return Err(mapped);
                 }
             }
         }
 
         let commit_start = Instant::now();
-        match self.client.simple_query("COMMIT").await {
+        let outcome = match grid_client.simple_query("COMMIT").await {
             Ok(_) => {
-                let after_scs = self.sync_standard_conforming_strings().await;
-                self.record_pg_transaction_ended(after_scs);
                 logs.push(ExecutedSql {
                     sql: "COMMIT;".to_owned(),
                     duration_ms: commit_start.elapsed().as_millis() as u64,
@@ -1376,33 +1453,39 @@ impl DbSession for PostgresSession {
                 ))
             }
             Err(pg_err) => {
-                let mapped = self.map_session_err(pg_err);
-                drop(self.client.simple_query("ROLLBACK").await);
-                let after_scs = self.sync_standard_conforming_strings().await;
-                self.record_pg_transaction_ended(after_scs);
+                let mapped = map_isolated_grid_commit_err(pg_err, &grid_disconnected);
+                drop(grid_client.simple_query("ROLLBACK").await);
                 Err(mapped)
             }
-        }
+        };
+        drop(grid_client);
+        outcome
     }
 
     async fn execute_staged_mutations(
         &self,
         batch: &StagedCommitBatch,
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if self.read_only {
+            return Err(DbError::InvalidInput(
+                "Read-Only connection blocks write transactions".to_owned(),
+            ));
+        }
         if batch.mutations.is_empty() {
             return Err(DbError::InvalidInput("no staged changes to execute".to_owned()));
         }
-        let _guard = self.client_lock.lock().await;
         self.ensure_alive()
             .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
+        let _grid_guard = self.grid_tx_lock.lock().await;
+        let (grid_client, grid_disconnected, _conn_guard) = self.connect_isolated_grid_client().await?;
         let total_start = Instant::now();
         let mut logs = Vec::with_capacity(batch.mutations.len() + 2);
         let mut total_rows_affected = 0u64;
         let mut executed = 0usize;
 
         let begin_start = Instant::now();
-        if let Err(pg_err) = self.client.simple_query("BEGIN").await {
-            let mapped = self.map_aux_query_err(pg_err);
+        if let Err(pg_err) = grid_client.simple_query("BEGIN").await {
+            let mapped = map_isolated_grid_commit_err(pg_err, &grid_disconnected);
             logs.push(ExecutedSql {
                 sql: "BEGIN;".to_owned(),
                 duration_ms: begin_start.elapsed().as_millis() as u64,
@@ -1421,9 +1504,7 @@ impl DbSession for PostgresSession {
                 match build_pg_staged_mutation_sql(&batch.schema, &batch.table, mutation) {
                     Ok(plan) => plan,
                     Err(err) => {
-                        drop(self.client.simple_query("ROLLBACK").await);
-                        let after_scs = self.sync_standard_conforming_strings().await;
-                        self.record_pg_transaction_ended(after_scs);
+                        drop(grid_client.simple_query("ROLLBACK").await);
                         return Err(err);
                     }
                 };
@@ -1432,7 +1513,7 @@ impl DbSession for PostgresSession {
                 .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
             let stmt_start = Instant::now();
-            match self.client.execute(&sql, &param_refs).await {
+            match grid_client.execute(&sql, &param_refs).await {
                 Ok(1) => {
                     total_rows_affected = total_rows_affected.saturating_add(1);
                     executed += 1;
@@ -1443,9 +1524,7 @@ impl DbSession for PostgresSession {
                     });
                 }
                 Ok(affected) => {
-                    drop(self.client.simple_query("ROLLBACK").await);
-                    let after_scs = self.sync_standard_conforming_strings().await;
-                    self.record_pg_transaction_ended(after_scs);
+                    drop(grid_client.simple_query("ROLLBACK").await);
                     let msg = if affected == 0 {
                         format!(
                             "Staged {op_kind} ({row_label}) matched 0 rows: the row was modified or deleted since it was loaded. Transaction rolled back; review your staged changes and reload."
@@ -1458,20 +1537,16 @@ impl DbSession for PostgresSession {
                     return Err(DbError::StaleRowConflict(msg));
                 }
                 Err(pg_err) => {
-                    let mapped = self.map_session_err(pg_err);
-                    drop(self.client.simple_query("ROLLBACK").await);
-                    let after_scs = self.sync_standard_conforming_strings().await;
-                    self.record_pg_transaction_ended(after_scs);
+                    let mapped = map_isolated_grid_commit_err(pg_err, &grid_disconnected);
+                    drop(grid_client.simple_query("ROLLBACK").await);
                     return Err(mapped);
                 }
             }
         }
 
         let commit_start = Instant::now();
-        match self.client.simple_query("COMMIT").await {
+        let outcome = match grid_client.simple_query("COMMIT").await {
             Ok(_) => {
-                let after_scs = self.sync_standard_conforming_strings().await;
-                self.record_pg_transaction_ended(after_scs);
                 logs.push(ExecutedSql {
                     sql: "COMMIT;".to_owned(),
                     duration_ms: commit_start.elapsed().as_millis() as u64,
@@ -1487,13 +1562,13 @@ impl DbSession for PostgresSession {
                 ))
             }
             Err(pg_err) => {
-                let mapped = self.map_session_err(pg_err);
-                drop(self.client.simple_query("ROLLBACK").await);
-                let after_scs = self.sync_standard_conforming_strings().await;
-                self.record_pg_transaction_ended(after_scs);
+                let mapped = map_isolated_grid_commit_err(pg_err, &grid_disconnected);
+                drop(grid_client.simple_query("ROLLBACK").await);
                 Err(mapped)
             }
-        }
+        };
+        drop(grid_client);
+        outcome
     }
 
     async fn explain_sql(&self, statement: &str, analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError> {
@@ -1665,19 +1740,33 @@ impl PostgresSession {
             return Err(DbError::InvalidInput("cannot explain an empty SQL statement".to_owned()));
         }
         let live_scs = self.sync_standard_conforming_strings().await;
-        if let Some(ref expected) = expected_pg_mode {
-            if &self.current_postgres_session_mode(live_scs) != expected {
-                return Err(DbError::PostgresStringModeMismatch);
-            }
-            if crate::sql::postgres_slice_has_multiple_statements(trimmed, live_scs) {
-                return Err(DbError::InvalidInput(
-                    "cannot EXPLAIN a PostgreSQL slice containing multiple statements; select or split a single statement"
-                        .to_owned(),
-                ));
-            }
+        if let Some(ref expected) = expected_pg_mode
+            && &self.current_postgres_session_mode(live_scs) != expected
+        {
+            return Err(DbError::PostgresStringModeMismatch);
+        }
+        if (expected_pg_mode.is_some() || self.read_only)
+            && crate::sql::postgres_slice_has_multiple_statements(trimmed, live_scs)
+        {
+            return Err(DbError::InvalidInput(
+                "cannot EXPLAIN a PostgreSQL slice containing multiple statements; select or split a single statement"
+                    .to_owned(),
+            ));
         }
         let explain_query = build_explain_sql(trimmed, analyze);
-        if expected_pg_mode.is_some()
+        if self.read_only && analyze {
+            let decision = crate::safety::evaluate_sql_safety_for_engine_with_session_mode(
+                DbEngine::Postgres,
+                SafetyPolicy::ReadOnly,
+                EnvTag::Local,
+                std::slice::from_ref(&explain_query),
+                crate::sql::SqlSessionMode::postgres(live_scs),
+            );
+            if let crate::safety::SafetyDecision::Block { reason, .. } = decision {
+                return Err(DbError::InvalidInput(reason));
+            }
+        }
+        if (expected_pg_mode.is_some() || self.read_only)
             && let Err(prep_err) = self.client.prepare(&explain_query).await
             && is_pg_multi_command_prepare_error(&prep_err)
         {
@@ -1688,8 +1777,19 @@ impl PostgresSession {
                     .to_owned(),
             ));
         }
+        let mut ro_tx_started = false;
+        if self.read_only {
+            if let Err(err) = self.client.simple_query("BEGIN READ ONLY").await {
+                return Err(self.map_session_err(err));
+            }
+            ro_tx_started = true;
+        }
         let start = Instant::now();
-        let messages = match self.client.simple_query(&explain_query).await {
+        let query_res = self.client.simple_query(&explain_query).await;
+        if ro_tx_started {
+            drop(self.client.simple_query("ROLLBACK").await);
+        }
+        let messages = match query_res {
             Ok(msgs) => msgs,
             Err(err) => {
                 let after_scs = self.sync_standard_conforming_strings().await;
@@ -1746,20 +1846,34 @@ impl PostgresSession {
         self.ensure_alive()
             .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
         let mut live_scs = self.sync_standard_conforming_strings().await;
-        if let Some(ref expected) = expected_pg_mode {
-            if &self.current_postgres_session_mode(live_scs) != expected {
-                return Err(DbError::PostgresStringModeMismatch);
+        if let Some(ref expected) = expected_pg_mode
+            && &self.current_postgres_session_mode(live_scs) != expected
+        {
+            return Err(DbError::PostgresStringModeMismatch);
+        }
+        if expected_pg_mode.is_some() || self.read_only {
+            for raw_stmt in statements {
+                let trimmed = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Postgres, raw_stmt);
+                if !trimmed.is_empty()
+                    && crate::sql::postgres_slice_has_multiple_statements(trimmed, live_scs)
+                {
+                    return Err(DbError::InvalidInput(
+                        "PostgreSQL statement contains multiple semicolon-separated statements; split statements before executing"
+                            .to_owned(),
+                    ));
+                }
             }
-            if let Some(first_stmt) = statements
-                .iter()
-                .map(|s| crate::sql::trim_sql_whitespace_for_engine(DbEngine::Postgres, s))
-                .find(|s| !s.is_empty())
-                && crate::sql::postgres_slice_has_multiple_statements(first_stmt, live_scs)
-            {
-                return Err(DbError::InvalidInput(
-                    "PostgreSQL statement contains multiple semicolon-separated statements; split statements before executing"
-                        .to_owned(),
-                ));
+        }
+        if self.read_only {
+            let decision = crate::safety::evaluate_sql_safety_for_engine_with_session_mode(
+                DbEngine::Postgres,
+                SafetyPolicy::ReadOnly,
+                EnvTag::Local,
+                statements,
+                crate::sql::SqlSessionMode::postgres(live_scs),
+            );
+            if let crate::safety::SafetyDecision::Block { reason, .. } = decision {
+                return Err(DbError::InvalidInput(reason));
             }
         }
         {
@@ -1872,26 +1986,49 @@ impl PostgresSession {
                     break;
                 }
 
-                match self.client.simple_query(stmt).await {
-                    Ok(messages) => {
-                        let after_scs = self.sync_standard_conforming_strings().await;
-                        self.record_pg_stmt_success(stmt, live_scs, after_scs);
-                        if let Some(ref mut tracker) = expected_tracker {
-                            tracker.apply(stmt);
+                let mut ro_tx_started = false;
+                if self.read_only {
+                    if let Err(pg_err) = self.client.simple_query("BEGIN READ ONLY").await {
+                        let mapped = self.map_session_err(pg_err);
+                        if matches!(mapped, DbError::Disconnected) && results.is_empty() {
+                            return Err(DbError::Disconnected);
                         }
-                        prev_live_scs = after_scs;
-                        live_scs = after_scs;
-                        dispatched_any = true;
                         let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let err_msg = mapped.to_string();
+                        logs.push(ExecutedSql {
+                            sql: stmt.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: Some(err_msg.clone()),
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt.to_owned(),
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            rows_affected: None,
+                            truncated: false,
+                            total_rows_seen: 0,
+                            elapsed_ms,
+                            error: Some(err_msg),
+                        });
+                        break;
+                    }
+                    ro_tx_started = true;
+                }
+
+                let stream_res = self.client.simple_query_raw(stmt).await;
+                let stream_result = match stream_res {
+                    Ok(stream) => {
                         let mut columns: Vec<ColumnMeta> = Vec::new();
                         let mut rows: Vec<Vec<CellValue>> = Vec::new();
                         let mut rows_affected: Option<u64> = None;
                         let mut truncated = false;
                         let mut total_rows_seen = 0usize;
+                        let mut stream_err: Option<tokio_postgres::Error> = None;
 
-                        for msg in messages {
-                            match msg {
-                                SimpleQueryMessage::RowDescription(desc) => {
+                        tokio::pin!(stream);
+                        while let Some(item) = next_simple_query_msg(stream.as_mut()).await {
+                            match item {
+                                Ok(SimpleQueryMessage::RowDescription(desc)) => {
                                     columns = desc
                                         .iter()
                                         .enumerate()
@@ -1899,7 +2036,9 @@ impl PostgresSession {
                                             let udt_name = prepared_cols
                                                 .as_ref()
                                                 .and_then(|pc| pc.get(idx))
-                                                .filter(|(_, _)| prepared_cols.as_ref().is_some_and(|p| p.len() == desc.len()))
+                                                .filter(|(_, _)| {
+                                                    prepared_cols.as_ref().is_some_and(|p| p.len() == desc.len())
+                                                })
                                                 .map_or_else(|| "text".to_owned(), |(_, ty)| ty.clone());
                                             ColumnMeta {
                                                 name: col.name().to_owned(),
@@ -1915,7 +2054,7 @@ impl PostgresSession {
                                         })
                                         .collect();
                                 }
-                                SimpleQueryMessage::Row(row) => {
+                                Ok(SimpleQueryMessage::Row(row)) => {
                                     total_rows_seen += 1;
                                     if row_limit.is_none_or(|lim| rows.len() < lim) {
                                         let mut decoded = Vec::with_capacity(columns.len());
@@ -1928,12 +2067,39 @@ impl PostgresSession {
                                         truncated = true;
                                     }
                                 }
-                                SimpleQueryMessage::CommandComplete(affected) => {
+                                Ok(SimpleQueryMessage::CommandComplete(affected)) => {
                                     rows_affected = Some(affected);
                                 }
-                                _ => {}
+                                Ok(_) => {}
+                                Err(pg_err) => {
+                                    stream_err = Some(pg_err);
+                                    break;
+                                }
                             }
                         }
+
+                        match stream_err {
+                            Some(pg_err) => Err(pg_err),
+                            None => Ok((columns, rows, rows_affected, truncated, total_rows_seen)),
+                        }
+                    }
+                    Err(pg_err) => Err(pg_err),
+                };
+                if ro_tx_started {
+                    drop(self.client.simple_query("ROLLBACK").await);
+                }
+
+                match stream_result {
+                    Ok((columns, rows, rows_affected, truncated, total_rows_seen)) => {
+                        let after_scs = self.sync_standard_conforming_strings().await;
+                        self.record_pg_stmt_success(stmt, live_scs, after_scs);
+                        if let Some(ref mut tracker) = expected_tracker {
+                            tracker.apply(stmt);
+                        }
+                        prev_live_scs = after_scs;
+                        live_scs = after_scs;
+                        dispatched_any = true;
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
 
                         logs.push(ExecutedSql {
                             sql: stmt.to_owned(),
@@ -2406,6 +2572,9 @@ fn build_pg_config(
     cfg.dbname(database);
     cfg.connect_timeout(CONNECT_TIMEOUT);
     cfg.application_name("TableView");
+    if profile.safety == SafetyPolicy::ReadOnly {
+        cfg.options("-c default_transaction_read_only=on");
+    }
 
     let (pg_ssl_mode, use_tls) = match profile.ssl.mode {
         SslMode::Disable => (tokio_postgres::config::SslMode::Disable, false),
@@ -2433,14 +2602,21 @@ async fn connect_raw(
     password: Option<&str>,
     database: &str,
 ) -> Result<RawPgConnect, DbError> {
-    let (mut cfg, use_tls) = build_pg_config(profile, password, database);
+    let (cfg, use_tls) = build_pg_config(profile, password, database);
+    connect_raw_cfg(cfg, &profile.ssl, use_tls).await
+}
 
+async fn connect_raw_cfg(
+    mut cfg: Config,
+    ssl: &SslConfig,
+    use_tls: bool,
+) -> Result<RawPgConnect, DbError> {
     if !use_tls {
         let (c, h, d, scs, tx) = connect_no_tls(&cfg).await?;
         return Ok((c, h, d, scs, tx, false));
     }
 
-    let tls_cfg = build_rustls_config(&profile.ssl)?;
+    let tls_cfg = build_rustls_config(ssl)?;
     let connector = MakeRustlsConnect::new(tls_cfg);
     match tokio::time::timeout(CONNECT_TIMEOUT, cfg.connect(connector)).await {
         Ok(Ok((client, connection))) => {
@@ -2448,7 +2624,7 @@ async fn connect_raw(
             Ok((client, handle, disconnected, scs, tx, true))
         }
         Ok(Err(err)) => {
-            if profile.ssl.mode == SslMode::Prefer && err.as_db_error().is_none() {
+            if ssl.mode == SslMode::Prefer && err.as_db_error().is_none() {
                 cfg.ssl_mode(tokio_postgres::config::SslMode::Disable);
                 let (c, h, d, scs, tx) = connect_no_tls(&cfg).await?;
                 Ok((c, h, d, scs, tx, false))
@@ -3591,5 +3767,32 @@ mod tests {
         assert!(tp_sql.contains("\"code\" = $2::text"));
         assert!(tp_sql.contains("\"code\"::text COLLATE \"C\" = $3::text COLLATE \"C\""));
         assert_eq!(tp_params, vec!["1111", "Troy", "Troy", "1010"]);
+    }
+
+    #[test]
+    fn build_pg_config_sets_default_transaction_read_only_when_read_only() {
+        let mut ro_profile =
+            ConnectionProfile::new_postgres("Greendale RO", "127.0.0.1", "troy_barnes");
+        ro_profile.safety = crate::connection::SafetyPolicy::ReadOnly;
+        let (ro_cfg, _) = build_pg_config(&ro_profile, None, "greendale");
+        assert_eq!(ro_cfg.get_options(), Some("-c default_transaction_read_only=on"));
+
+        let mut rw_profile = ro_profile.clone();
+        rw_profile.safety = crate::connection::SafetyPolicy::Unrestricted;
+        let (rw_cfg, _) = build_pg_config(&rw_profile, None, "greendale");
+        assert_eq!(rw_cfg.get_options(), None);
+    }
+
+    #[test]
+    fn map_isolated_grid_commit_err_never_triggers_editor_disconnect() {
+        let grid_disconnected = std::sync::atomic::AtomicBool::new(true);
+        let mapped = super::map_isolated_grid_commit_err(
+            tokio_postgres::Error::__private_api_timeout(),
+            &grid_disconnected,
+        );
+        assert!(
+            matches!(mapped, crate::engine::DbError::QueryFailed { .. }),
+            "expected QueryFailed for isolated grid failure, got {mapped:?}"
+        );
     }
 }

@@ -532,6 +532,48 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
             .await
             .expect("refetch after rollback");
         assert_eq!(after_rollback.rows[0][2], CellValue::Text("Troy 'T-Bone' Barnes".to_owned()));
+
+        // 5. #5: Grid commits run on an isolated connection and do not affect an open editor tx.
+        shared
+            .execute_sql(
+                &[
+                    "BEGIN".to_owned(),
+                    "INSERT INTO public.students (student_id, id, full_name, major) VALUES (77, '77777777-7777-7777-7777-777777777777', 'Dean Craig Pelton', 'Administration')".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("editor BEGIN + INSERT");
+        shared
+            .execute_transaction(&[
+                "INSERT INTO public.students (student_id, id, full_name, major) VALUES (78, '78787878-7878-7878-7878-787878787878', 'Ben Chang', 'Spanish')".to_owned(),
+            ])
+            .await
+            .expect("isolated grid transaction commit");
+        shared
+            .execute_sql(&["ROLLBACK".to_owned()], None)
+            .await
+            .expect("editor ROLLBACK only rolls back editor insert");
+        let (iso_check, _) = shared
+            .execute_sql(
+                &["SELECT student_id FROM public.students WHERE student_id IN (77, 78) ORDER BY student_id".to_owned()],
+                None,
+            )
+            .await
+            .expect("verify isolation");
+        assert_eq!(iso_check.results[0].rows, vec![vec![CellValue::Int(78)]]);
+
+        // 6. #15: Streaming result truncation respects row_limit while reporting exact total_rows_seen.
+        let (streamed, _) = shared
+            .execute_sql(
+                &["SELECT g FROM generate_series(1, 5000) AS g".to_owned()],
+                Some(10),
+            )
+            .await
+            .expect("streamed large query");
+        assert_eq!(streamed.results[0].rows.len(), 10);
+        assert!(streamed.results[0].truncated);
+        assert_eq!(streamed.results[0].total_rows_seen, 5000);
     });
 }
 

@@ -178,6 +178,7 @@ fn scene_workspace_no_db(s: &mut AppState) {
         server_version: "PostgreSQL 18.4".to_owned(),
         mode_seq: 0,
         mysql_quote_mode: None,
+        mysql_grid_quote_mode: None,
         postgres_session_mode: Some(tv_core::PostgresSessionMode::new(true)),
         databases: sample_databases(),
         active_database: None,
@@ -211,6 +212,7 @@ fn scene_workspace_sqlite_dark(s: &mut AppState) {
         server_version: "SQLite 3.49.1".to_owned(),
         mode_seq: 0,
         mysql_quote_mode: None,
+        mysql_grid_quote_mode: None,
         postgres_session_mode: None,
         databases: vec![DatabaseInfo {
             name: "greendale.db".to_owned(),
@@ -337,6 +339,7 @@ fn setup_connected_workspace(
         server_version: "PostgreSQL 18.4".to_owned(),
         mode_seq: 0,
         mysql_quote_mode: None,
+        mysql_grid_quote_mode: None,
         postgres_session_mode: Some(tv_core::PostgresSessionMode::new(true)),
         databases: sample_databases(),
         active_database: Some("greendale_idp_dev".to_owned()),
