@@ -401,12 +401,13 @@ fn build_connection_row(s: &AppState, profile: &ConnectionProfile, k: &Kit) -> E
 
     let engine_emblem = el()
         .key(format!("launcher/conn/{id}/emblem"))
+        .label(profile.engine.label())
         .size(34.0, 34.0)
         .radius(17.0)
         .fill(env_pal.pill_bg)
         .border(1.0, env_pal.pill_border)
         .center()
-        .child(text(profile.engine.short_badge()).font(k.ty.ui_medium).color(env_pal.pill_fg));
+        .child(icon(icons::engine(profile.engine), 20.0).color(env_pal.pill_fg));
 
     let mut top_line = row()
         .w_full()

@@ -1,4 +1,35 @@
 use rune::Icon;
+use tv_core::DbEngine;
+
+/// Returns the original monochrome symbol representing `engine` (elephant, dolphin, or feather).
+pub const fn engine(engine: DbEngine) -> &'static Icon {
+    match engine {
+        DbEngine::Postgres => &ENGINE_POSTGRES,
+        DbEngine::Mysql => &ENGINE_MYSQL,
+        DbEngine::Sqlite => &ENGINE_SQLITE,
+    }
+}
+
+/// Elephant silhouette representing PostgreSQL.
+pub static ENGINE_POSTGRES: Icon = Icon {
+    name: "tv-engine-postgres",
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M4.4 10.4C4.9 6.9 7.8 5.1 12.3 5.1C16.1 5.1 18.4 7.1 18.6 10.2C18.8 12.4 19.1 14.1 20.1 14.1C20.5 14.1 20.8 13.8 20.6 13.4C20.3 12.9 20.6 12.3 21.2 12.3C21.8 12.3 22.2 13.0 22.0 13.9C21.8 15.2 20.8 16.0 19.6 16.0C18.0 15.9 17.1 14.4 16.8 12.4C16.4 13.0 15.9 13.4 15.3 13.7V18.0C15.3 18.5 14.9 18.9 14.4 18.9H12.7C12.2 18.9 11.8 18.5 11.8 18.0V15.3H8.4V18.0C8.4 18.5 8.0 18.9 7.5 18.9H5.8C5.3 18.9 4.9 18.5 4.9 18.0V14.6C4.5 13.7 4.3 12.7 4.3 11.6L3.4 12.6C3.1 13.0 2.5 12.9 2.4 12.4C2.2 11.6 2.9 10.6 4.4 10.4ZM15.5 8.0A0.9 0.9 0 1 0 15.5 9.8A0.9 0.9 0 1 0 15.5 8.0ZM11.7 7.6C11.9 7.2 11.3 6.9 10.9 7.2C9.5 8.3 9.2 10.6 10.3 12.5C10.6 13.0 11.4 12.7 11.2 12.1C10.6 10.6 10.7 8.9 11.7 7.6Z"/>"#,
+};
+
+/// Dolphin silhouette representing MySQL.
+pub static ENGINE_MYSQL: Icon = Icon {
+    name: "tv-engine-mysql",
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M21.4 12.1C20.0 12.9 17.9 12.6 15.8 12.3C14.8 13.0 14.4 14.2 14.5 15.8C12.7 15.3 11.8 13.7 12.0 11.7C9.2 11.7 7.5 13.4 7.5 15.6C8.3 16.7 8.8 17.9 9.0 19.5C7.5 19.2 6.4 18.0 6.0 16.7C5.1 17.5 3.9 18.1 2.5 18.1C2.6 16.8 3.6 15.7 5.0 15.2C4.1 11.8 5.5 8.7 8.6 7.3C9.0 6.4 9.1 5.3 8.5 3.9C10.0 3.8 11.5 4.9 12.4 6.6C15.6 6.4 18.3 8.1 19.0 11.0L21.4 12.1ZM16.5 9.1A0.9 0.9 0 1 0 16.5 10.9A0.9 0.9 0 1 0 16.5 9.1Z"/>"#,
+};
+
+/// Quill feather silhouette representing SQLite.
+pub static ENGINE_SQLITE: Icon = Icon {
+    name: "tv-engine-sqlite",
+    view: 24.0,
+    body: r#"<path fill="currentColor" fill-rule="evenodd" d="M20.3 3.7C18.3 3.6 16.6 4.0 15.2 4.8L14.9 7.2L14.2 5.3C12.3 6.2 10.8 7.5 9.6 8.9L10.3 11.0L8.7 9.6C6.6 11.9 5.7 14.7 6.3 17.0L3.9 19.4C3.5 19.8 3.5 20.3 3.9 20.6C4.2 20.9 4.7 20.9 5.1 20.6L7.5 18.2C10.8 18.2 14.2 16.5 16.6 13.7L14.8 12.2L17.6 12.1C19.5 9.7 20.3 6.8 20.3 3.7ZM16.8 7.0C17.1 7.3 17.1 7.7 16.8 8.0C13.9 10.7 11.1 13.5 8.5 16.3C8.2 16.6 7.8 16.6 7.5 16.3C7.2 16.0 7.2 15.6 7.5 15.3C10.1 12.5 12.9 9.7 15.8 7.0C16.1 6.7 16.5 6.7 16.8 7.0Z"/>"#,
+};
 
 /// TableView geometric mark (table grid with subtle accent header).
 pub static LOGO: Icon = Icon {

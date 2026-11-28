@@ -1657,6 +1657,7 @@ fn import_url_modal_supports_mysql_and_sqlite_urls() {
 #[test]
 fn launcher_displays_engine_badges_and_sqlite_subtitles_for_mixed_connections() {
     let mut rt = sample_runtime(true);
+    let pg_id = rt.state.connections[0].id;
     let mysql_prof = ConnectionProfile::new_mysql("greendale_mysql", "127.0.0.1", "troy_barnes");
     let sqlite_prof = ConnectionProfile::new_sqlite("greendale_sqlite", "/tmp/greendale.sqlite3");
     let mysql_id = mysql_prof.id;
@@ -1667,12 +1668,27 @@ fn launcher_displays_engine_badges_and_sqlite_subtitles_for_mixed_connections() 
     });
     rt.frame(0.1);
 
-    assert!(has_text(&rt, "PG"));
-    assert!(has_text(&rt, "MY"));
-    assert!(has_text(&rt, "SL"));
+    assert!(!has_text(&rt, "PG"));
+    assert!(!has_text(&rt, "MY"));
+    assert!(!has_text(&rt, "SL"));
+    assert!(rt.find(&format!("launcher/conn/{pg_id}/emblem")).is_some());
     assert!(rt.find(&format!("launcher/conn/{mysql_id}/emblem")).is_some());
     assert!(rt.find(&format!("launcher/conn/{sqlite_id}/emblem")).is_some());
+
+    let tree = rt.accessibility_tree();
+    let has_label = |label: &str| tree.nodes.iter().any(|(_, n)| n.label() == Some(label));
+    assert!(has_label("PostgreSQL"));
+    assert!(has_label("MySQL"));
+    assert!(has_label("SQLite"));
     assert!(has_text(&rt, "/tmp/greendale.sqlite3"));
+
+    // Engine catalog helper maps each engine to a distinct 24x24 symbol.
+    let pg_icon = tv_app::icons::engine(DbEngine::Postgres);
+    let my_icon = tv_app::icons::engine(DbEngine::Mysql);
+    let sl_icon = tv_app::icons::engine(DbEngine::Sqlite);
+    assert_ne!(pg_icon.name, my_icon.name);
+    assert_ne!(my_icon.name, sl_icon.name);
+    assert_ne!(pg_icon.name, sl_icon.name);
 
     // Search matches SQLite file path and MySQL engine label.
     rt.update(|s, _| s.launcher_search = rune::TextEdit::new("greendale.sqlite3"));
