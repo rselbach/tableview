@@ -6,11 +6,12 @@ use rune::Waker;
 use rune::credentials::Credentials;
 use tv_core::engine::{connect_session, test_connection};
 use tv_core::{
-    CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine, DbError, DbObject,
-    DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode, NewHistoryEntry, PageRequest,
-    PasswordMode, PostgresSessionMode, QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId, SavedQuery,
-    SavedQueryId, SchemaInfo, ServerInfo, SessionId, SqlSessionMode, TabId, TablePage, TableStructure,
-    TransactionOutcome, batch_sets_credentials_with_session_mode, trim_sql_whitespace_for_engine,
+    AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine,
+    DbError, DbObject, DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode,
+    NewHistoryEntry, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult, QueryHistoryEntry,
+    QueryStore, RequestId, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo, SessionId, SqlSessionMode, TabId,
+    TablePage, TableStructure, TransactionOutcome, batch_sets_credentials_with_session_mode,
+    trim_sql_whitespace_for_engine,
 };
 
 const QUERY_HISTORY_LIMIT: usize = 200;
@@ -43,10 +44,11 @@ pub enum WorkerCmd {
         database: Option<String>,
         preferred_schema: Option<String>,
     },
-    UpdateSessionProfile {
+    UpdateSessionMetadata {
         session_id: SessionId,
-        profile: ConnectionProfile,
-        password_update: Option<Option<String>>,
+        name: String,
+        folder: Option<String>,
+        color: AccentColor,
     },
     SelectDatabase {
         session_id: SessionId,
@@ -64,6 +66,7 @@ pub enum WorkerCmd {
     LoadColumns {
         session_id: SessionId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         schema: String,
         object: String,
     },
@@ -77,12 +80,14 @@ pub enum WorkerCmd {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         request: PageRequest,
     },
     DescribeTable {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         schema: String,
         table: String,
     },
@@ -173,6 +178,7 @@ pub enum WorkerCmd {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        connect_req_id: RequestId,
         fk: ForeignKeyRef,
         value: CellValue,
         source_col: ColumnMeta,
@@ -665,8 +671,8 @@ async fn resolve_password_with_rx(
     explicit: Option<String>,
     cred_rx: Option<PendingCredentialRx>,
 ) -> Result<Option<String>, String> {
-    if let Some(pw) = explicit.filter(|s| !s.is_empty()) {
-        return Ok(Some(pw));
+    if let Some(pw) = explicit {
+        return Ok((!pw.is_empty()).then_some(pw));
     }
     if profile.password_mode != PasswordMode::Keychain {
         return Ok(None);
@@ -849,7 +855,6 @@ async fn emit_session_mode(
 async fn reconnect_session(
     sessions: &SessionMap,
     connector: &SessionConnector,
-    credentials: &CredentialRunner,
     session_id: SessionId,
     stale_session: &Arc<dyn DbSession>,
     stale_connect_req_id: RequestId,
@@ -896,25 +901,9 @@ async fn reconnect_session(
         return Err((still_current, err.clone()));
     }
 
-    let pw = if cached_pw.is_some() {
-        cached_pw
-    } else if profile.password_mode == PasswordMode::Keychain {
-        let rx = credentials.enqueue_read(&profile.credential_service());
-        match resolve_password_with_rx(&profile, None, Some(PendingCredentialRx::Read(rx))).await {
-            Ok(pw) => pw,
-            Err(msg) => {
-                let err = DbError::ConnectionFailed(format!("keychain read failed: {msg}"));
-                gate_guard.last_failure = Some((Instant::now(), err.clone()));
-                let still_current =
-                    current_connect_req_id(sessions, session_id, stale_connect_req_id).await;
-                return Err((still_current, err));
-            }
-        }
-    } else {
-        None
-    };
+    let pw = cached_pw;
 
-    match (connector)(profile, pw.clone(), database).await {
+    match (connector)(profile, pw, database).await {
         Ok((new_session, _connect_logs)) => {
             gate_guard.last_failure = None;
             let mut map = sessions.lock().await;
@@ -925,9 +914,6 @@ async fn reconnect_session(
                 return Err((None, DbError::Disconnected));
             }
             entry.session = Arc::clone(&new_session);
-            if entry.password.is_none() {
-                entry.password = pw;
-            }
             Ok((new_session, entry.connect_req_id))
         }
         Err(err) => {
@@ -941,7 +927,6 @@ async fn reconnect_session(
 async fn prepare_session(
     sessions: &SessionMap,
     connector: &SessionConnector,
-    credentials: &CredentialRunner,
     session_id: SessionId,
     liveness: LivenessCheck,
     expected_connect_req_id: Option<RequestId>,
@@ -971,7 +956,6 @@ async fn prepare_session(
         return reconnect_session(
             sessions,
             connector,
-            credentials,
             session_id,
             &session,
             connect_req_id,
@@ -990,7 +974,6 @@ async fn prepare_session(
             return reconnect_session(
                 sessions,
                 connector,
-                credentials,
                 session_id,
                 &session,
                 connect_req_id,
@@ -1014,7 +997,6 @@ async fn prepare_session(
 struct WorkerCtx<'a> {
     sessions: &'a SessionMap,
     connector: &'a SessionConnector,
-    credentials: &'a CredentialRunner,
     event_tx: &'a mpsc::Sender<WorkerEvent>,
     waker: &'a Arc<std::sync::Mutex<Option<Waker>>>,
 }
@@ -1034,14 +1016,12 @@ where
     let WorkerCtx {
         sessions,
         connector,
-        credentials,
         event_tx,
         waker,
     } = ctx;
     let (session, connect_req_id) = match prepare_session(
         sessions,
         connector,
-        credentials,
         session_id,
         liveness,
         expected_connect_req_id,
@@ -1074,7 +1054,6 @@ where
             let (fresh_session, fresh_cid) = reconnect_session(
                 sessions,
                 connector,
-                credentials,
                 session_id,
                 &session,
                 connect_req_id,
@@ -1162,13 +1141,8 @@ async fn worker_loop(
                 profile,
                 prompt_password,
                 ..
-            }
-            | WorkerCmd::SelectDatabase {
-                profile,
-                prompt_password,
-                ..
             } => {
-                if prompt_password.as_deref().is_some_and(|s| !s.is_empty())
+                if prompt_password.is_some()
                     || profile.password_mode != PasswordMode::Keychain
                 {
                     None
@@ -1183,7 +1157,7 @@ async fn worker_loop(
                 password_override,
                 ..
             } => {
-                if password_override.as_deref().is_some_and(|s| !s.is_empty())
+                if password_override.is_some()
                     || profile.password_mode != PasswordMode::Keychain
                 {
                     None
@@ -1285,7 +1259,6 @@ async fn handle_cmd(
     let worker_ctx = WorkerCtx {
         sessions: &sessions,
         connector: &connector,
-        credentials: &credentials,
         event_tx: &event_tx,
         waker: &waker,
     };
@@ -1431,17 +1404,17 @@ async fn handle_cmd(
             }
         }
 
-        WorkerCmd::UpdateSessionProfile {
+        WorkerCmd::UpdateSessionMetadata {
             session_id,
-            profile,
-            password_update,
+            name,
+            folder,
+            color,
         } => {
             let mut map = sessions.lock().await;
             if let Some(entry) = map.get_mut(&session_id) {
-                entry.profile = profile;
-                if let Some(updated_pw) = password_update {
-                    entry.password = updated_pw;
-                }
+                entry.profile.name = name;
+                entry.profile.folder = folder;
+                entry.profile.color = color;
             }
         }
 
@@ -1452,24 +1425,47 @@ async fn handle_cmd(
             prompt_password,
             database,
         } => {
-            let pw = match resolve_password_with_rx(&profile, prompt_password, cred_rx).await {
-                Ok(pw) => pw,
-                Err(msg) => {
-                    if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
-                        emit(
-                            &event_tx,
-                            &waker,
-                            WorkerEvent::OperationFailed {
-                                session_id,
-                                req_id,
-                                error: DbError::ConnectionFailed(format!("keychain read failed: {msg}")),
-                            },
-                        );
-                    }
-                    return;
-                }
+            let existing_session = {
+                let map = sessions.lock().await;
+                map.get(&session_id)
+                    .map(|e| (e.profile.clone(), e.password.clone()))
             };
-            let connected = (connector)(profile.clone(), pw.clone(), Some(database.clone())).await;
+            let (target_profile, pw) = if let Some((bound_profile, bound_pw)) = existing_session {
+                let resolved_pw = match prompt_password {
+                    Some(pw) => (!pw.is_empty()).then_some(pw),
+                    None => bound_pw,
+                };
+                (bound_profile, resolved_pw)
+            } else {
+                let fallback_rx = if prompt_password.is_some()
+                    || profile.password_mode != PasswordMode::Keychain
+                {
+                    None
+                } else {
+                    Some(PendingCredentialRx::Read(
+                        credentials.enqueue_read(&profile.credential_service()),
+                    ))
+                };
+                let resolved = match resolve_password_with_rx(&profile, prompt_password, fallback_rx).await {
+                    Ok(pw) => pw,
+                    Err(msg) => {
+                        if is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
+                            emit(
+                                &event_tx,
+                                &waker,
+                                WorkerEvent::OperationFailed {
+                                    session_id,
+                                    req_id,
+                                    error: DbError::ConnectionFailed(format!("keychain read failed: {msg}")),
+                                },
+                            );
+                        }
+                        return;
+                    }
+                };
+                (profile, resolved)
+            };
+            let connected = (connector)(target_profile.clone(), pw.clone(), Some(database.clone())).await;
             let (session, mut logs) = match connected {
                 Ok(ok) => ok,
                 Err(error) => {
@@ -1534,7 +1530,7 @@ async fn handle_cmd(
                         connect_req_id: req_id,
                         mode_seq: 0,
                         session,
-                        profile,
+                        profile: target_profile,
                         password: pw,
                         database: Some(database.clone()),
                         reconnect_gate: Arc::new(tokio::sync::Mutex::new(ReconnectGate::default())),
@@ -1615,6 +1611,7 @@ async fn handle_cmd(
         WorkerCmd::LoadColumns {
             session_id,
             req_id,
+            connect_req_id,
             schema,
             object,
         } => {
@@ -1623,7 +1620,7 @@ async fn handle_cmd(
                 session_id,
                 LivenessCheck::Fast,
                 true,
-                None,
+                Some(connect_req_id),
                 |session| {
                     let schema = schema.clone();
                     let object = object.clone();
@@ -1767,6 +1764,7 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            connect_req_id,
             request,
         } => {
             let outcome = run_with_reconnect(
@@ -1774,7 +1772,7 @@ async fn handle_cmd(
                 session_id,
                 LivenessCheck::Fast,
                 true,
-                None,
+                Some(connect_req_id),
                 |session| {
                     let req = request.clone();
                     async move { session.fetch_table_page(&req).await }
@@ -1834,6 +1832,7 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            connect_req_id,
             schema,
             table,
         } => {
@@ -1842,7 +1841,7 @@ async fn handle_cmd(
                 session_id,
                 LivenessCheck::Fast,
                 true,
-                None,
+                Some(connect_req_id),
                 |session| {
                     let schema = schema.clone();
                     let table = table.clone();
@@ -1941,7 +1940,6 @@ async fn handle_cmd(
                 let prep_fut = prepare_session(
                     &sessions,
                     &connector,
-                    &credentials,
                     session_id,
                     LivenessCheck::AlwaysPing,
                     Some(connect_req_id),
@@ -2060,7 +2058,6 @@ async fn handle_cmd(
                                         let rec_fut = reconnect_session(
                                             &sessions,
                                             &connector,
-                                            &credentials,
                                             session_id,
                                             &session,
                                             session_cid,
@@ -2596,6 +2593,7 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            connect_req_id,
             fk,
             value,
             source_col,
@@ -2605,7 +2603,7 @@ async fn handle_cmd(
                 session_id,
                 LivenessCheck::Fast,
                 true,
-                None,
+                Some(connect_req_id),
                 |session| {
                     let fk = fk.clone();
                     let value = value.clone();

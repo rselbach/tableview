@@ -636,3 +636,194 @@ fn live_sqlite_in_memory_and_attached_temp_schemas() {
         assert_eq!(temp_objs[0].name, "scratch_notes");
     });
 }
+
+#[test]
+fn live_sqlite_cancellation_is_scoped_to_matching_query() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let rt = Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let profile = ConnectionProfile::new_sqlite("Scoped Cancel", ":memory:");
+        let (shared, _) = connect_session(&profile, None, None)
+            .await
+            .expect("connect :memory:");
+
+        shared
+            .execute_sql(
+                &["CREATE TABLE greendale_cancel_log (id INTEGER PRIMARY KEY, label TEXT NOT NULL)".to_owned()],
+                None,
+            )
+            .await
+            .expect("create log table");
+
+        // 1. Cancelling a waiting Query B (key 102) MUST NOT interrupt running Query A (key 101).
+        let long_sql_a = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 8000000) SELECT count(*) FROM c".to_owned();
+        let flag_a = Arc::new(AtomicBool::new(false));
+        let flag_b = Arc::new(AtomicBool::new(false));
+        let sess_a = Arc::clone(&shared);
+        let flag_a_task = Arc::clone(&flag_a);
+        let task_a = tokio::spawn(async move {
+            sess_a
+                .execute_sql_cancellable(&[long_sql_a], None, 101, Some(&flag_a_task))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let sess_b = Arc::clone(&shared);
+        let flag_b_task = Arc::clone(&flag_b);
+        let task_b = tokio::spawn(async move {
+            sess_b
+                .execute_sql_cancellable(&["SELECT 'Troy Barnes'".to_owned()], None, 102, Some(&flag_b_task))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        flag_b.store(true, Ordering::Release);
+        shared
+            .cancel_query_by_key(102)
+            .await
+            .expect("cancel waiting query B");
+
+        let res_b = task_b.await.expect("join query B");
+        assert!(
+            matches!(res_b, Err(DbError::Cancelled)),
+            "waiting query B should cancel cleanly, got {res_b:?}"
+        );
+        let (batch_a, _) = task_a
+            .await
+            .expect("join query A")
+            .expect("query A must finish unharmed");
+        assert!(!batch_a.cancelled, "query A must not be interrupted by cancelling query B");
+        assert_eq!(batch_a.results[0].rows[0][0], CellValue::Int(8_000_000));
+
+        // 2. Cancelling active Query C (key 103) interrupts Query C cleanly without breaking subsequent queries.
+        let long_sql_c = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 500000000) SELECT count(*) FROM c".to_owned();
+        let flag_c = Arc::new(AtomicBool::new(false));
+        let sess_c = Arc::clone(&shared);
+        let flag_c_task = Arc::clone(&flag_c);
+        let task_c = tokio::spawn(async move {
+            sess_c
+                .execute_sql_cancellable(&[long_sql_c], None, 103, Some(&flag_c_task))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        flag_c.store(true, Ordering::Release);
+        shared
+            .cancel_query_by_key(103)
+            .await
+            .expect("cancel active query C");
+        let res_c = task_c.await.expect("join query C");
+        assert!(
+            matches!(res_c, Err(DbError::Cancelled))
+                || matches!(res_c, Ok((ref batch, _)) if batch.cancelled),
+            "active query C should be cancelled, got {res_c:?}"
+        );
+
+        let (batch_d, _) = shared
+            .execute_sql_cancellable(&["SELECT 42".to_owned()], None, 104, None)
+            .await
+            .expect("query D after cancel succeeds");
+        assert!(!batch_d.cancelled);
+        assert_eq!(batch_d.results[0].rows[0][0], CellValue::Int(42));
+
+        // 3. Setting cancel_flag on queued Query E behind execute_transaction prevents E from running.
+        let sess_tx = Arc::clone(&shared);
+        let tx_task = tokio::spawn(async move {
+            sess_tx
+                .execute_transaction(&[
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 8000000) SELECT count(*) FROM c".to_owned(),
+                    "INSERT INTO greendale_cancel_log (id, label) VALUES (1, 'Annie Edison')".to_owned(),
+                ])
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let flag_e = Arc::new(AtomicBool::new(false));
+        let sess_e = Arc::clone(&shared);
+        let flag_e_task = Arc::clone(&flag_e);
+        let task_e = tokio::spawn(async move {
+            sess_e
+                .execute_sql_cancellable(
+                    &["INSERT INTO greendale_cancel_log (id, label) VALUES (2, 'Pierce Hawthorne')".to_owned()],
+                    None,
+                    105,
+                    Some(&flag_e_task),
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        flag_e.store(true, Ordering::Release);
+
+        tx_task
+            .await
+            .expect("join tx task")
+            .expect("tx commits without interruption");
+        let res_e = task_e.await.expect("join query E");
+        assert!(
+            matches!(res_e, Err(DbError::Cancelled)),
+            "queued query E with cancel_flag should not execute, got {res_e:?}"
+        );
+
+        let (verify_batch, _) = shared
+            .execute_sql(
+                &["SELECT id, label FROM greendale_cancel_log ORDER BY id".to_owned()],
+                None,
+            )
+            .await
+            .expect("verify table contents");
+        assert_eq!(verify_batch.results[0].rows.len(), 1);
+        assert_eq!(verify_batch.results[0].rows[0][0], CellValue::Int(1));
+        assert_eq!(
+            verify_batch.results[0].rows[0][1],
+            CellValue::Text("Annie Edison".to_owned())
+        );
+
+        // 4. Dropping an unkeyed query future while running MUST keep conn_gate held until cleanup,
+        // so a subsequently queued & cancelled keyed INSERT still cancels cleanly without executing.
+        let unkeyed_sess = Arc::clone(&shared);
+        let unkeyed_handle = tokio::spawn(async move {
+            let slow = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 6000000) SELECT count(*) FROM c".to_owned();
+            unkeyed_sess.execute_sql(&[slow], None).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        unkeyed_handle.abort();
+        drop(unkeyed_handle.await);
+
+        let flag_f = Arc::new(AtomicBool::new(false));
+        let sess_f = Arc::clone(&shared);
+        let flag_f_task = Arc::clone(&flag_f);
+        let task_f = tokio::spawn(async move {
+            sess_f
+                .execute_sql_cancellable(
+                    &["INSERT INTO greendale_cancel_log (id, label) VALUES (3, 'Shirley Bennett')".to_owned()],
+                    None,
+                    106,
+                    Some(&flag_f_task),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        flag_f.store(true, Ordering::Release);
+        shared
+            .cancel_query_by_key(106)
+            .await
+            .expect("cancel queued INSERT after dropped unkeyed future");
+
+        let res_f = task_f.await.expect("join query F");
+        assert!(
+            matches!(res_f, Err(DbError::Cancelled)),
+            "queued INSERT after dropped unkeyed future should cancel cleanly, got {res_f:?}"
+        );
+
+        let (verify_after_drop, _) = shared
+            .execute_sql(
+                &["SELECT id, label FROM greendale_cancel_log ORDER BY id".to_owned()],
+                None,
+            )
+            .await
+            .expect("verify table after dropped future cancel");
+        assert_eq!(verify_after_drop.results[0].rows.len(), 1);
+    });
+}

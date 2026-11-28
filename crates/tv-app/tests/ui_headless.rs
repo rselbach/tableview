@@ -2612,10 +2612,15 @@ struct MockSession {
     ping_delay: Mutex<Duration>,
     pre_dispatch_delay: Mutex<Duration>,
     sql_delay_once: Mutex<Option<Duration>>,
+    page_delay_once: Mutex<Option<Duration>>,
+    objects_delay_once: Mutex<Option<Duration>>,
+    columns_delay_once: Mutex<Option<Duration>>,
+    columns_override: Mutex<Option<Vec<ColumnSummary>>>,
     cancelled_keys: Mutex<Vec<u64>>,
     executed_batches: Mutex<Vec<Vec<String>>>,
     ping_calls: AtomicUsize,
     page_calls: AtomicUsize,
+    objects_calls: AtomicUsize,
     describe_calls: AtomicUsize,
     sql_calls: AtomicUsize,
     pre_dispatch_entries: AtomicUsize,
@@ -2651,10 +2656,15 @@ impl MockSession {
             ping_delay: Mutex::new(Duration::ZERO),
             pre_dispatch_delay: Mutex::new(Duration::ZERO),
             sql_delay_once: Mutex::new(None),
+            page_delay_once: Mutex::new(None),
+            objects_delay_once: Mutex::new(None),
+            columns_delay_once: Mutex::new(None),
+            columns_override: Mutex::new(None),
             cancelled_keys: Mutex::new(Vec::new()),
             executed_batches: Mutex::new(Vec::new()),
             ping_calls: AtomicUsize::new(0),
             page_calls: AtomicUsize::new(0),
+            objects_calls: AtomicUsize::new(0),
             describe_calls: AtomicUsize::new(0),
             sql_calls: AtomicUsize::new(0),
             pre_dispatch_entries: AtomicUsize::new(0),
@@ -3053,6 +3063,15 @@ impl DbSession for MockSession {
     {
         Box::pin(async move {
             self.check_transport()?;
+            let delay = self
+                .objects_delay_once
+                .lock()
+                .expect("objects_delay_once lock")
+                .take();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            self.objects_calls.fetch_add(1, Ordering::AcqRel);
             let objects = if schema == "study_room" {
                 vec![
                     DbObject {
@@ -3103,15 +3122,29 @@ impl DbSession for MockSession {
     {
         Box::pin(async move {
             self.check_transport()?;
-            let cols = mock_columns_for(object)
-                .into_iter()
-                .map(|c| ColumnSummary {
-                    name: c.name,
-                    data_type: c.data_type,
-                    nullable: c.nullable,
-                    is_primary_key: c.is_primary_key,
-                })
-                .collect();
+            let delay = self
+                .columns_delay_once
+                .lock()
+                .expect("columns_delay_once lock")
+                .take();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let cols = if let Some(custom) =
+                self.columns_override.lock().expect("columns_override lock").clone()
+            {
+                custom
+            } else {
+                mock_columns_for(object)
+                    .into_iter()
+                    .map(|c| ColumnSummary {
+                        name: c.name,
+                        data_type: c.data_type,
+                        nullable: c.nullable,
+                        is_primary_key: c.is_primary_key,
+                    })
+                    .collect()
+            };
             Ok((
                 cols,
                 ExecutedSql {
@@ -3146,6 +3179,10 @@ impl DbSession for MockSession {
                     mode.tx_state = Some(tv_core::PostgresTxState::Aborted);
                 }
                 return Err(DbError::InvalidInput("ERROR: division by zero".to_owned()));
+            }
+            let delay = self.page_delay_once.lock().expect("page_delay_once lock").take();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
             let columns = mock_columns_for(&req.table);
             let rows = if req.table == "courses" {
@@ -3846,6 +3883,7 @@ impl DbSession for MockSession {
 
 struct MockCluster {
     connect_calls: Mutex<Vec<(Option<String>, Option<String>)>>,
+    connect_hosts: Mutex<Vec<String>>,
     fail_connect: Mutex<Option<DbError>>,
     expected_password: Mutex<Option<String>>,
     mysql_quote_mode: Mutex<Option<MysqlQuoteMode>>,
@@ -3857,6 +3895,7 @@ impl MockCluster {
     fn new(connect_delay: Duration) -> Arc<Self> {
         Arc::new(Self {
             connect_calls: Mutex::new(Vec::new()),
+            connect_hosts: Mutex::new(Vec::new()),
             fail_connect: Mutex::new(None),
             expected_password: Mutex::new(None),
             mysql_quote_mode: Mutex::new(None),
@@ -3870,6 +3909,7 @@ impl MockCluster {
         Arc::new(move |profile, password, database| {
             let cluster = Arc::clone(&cluster);
             let engine = profile.engine;
+            let host = profile.host.clone();
             Box::pin(async move {
                 if !cluster.connect_delay.is_zero() {
                     tokio::time::sleep(cluster.connect_delay).await;
@@ -3879,6 +3919,11 @@ impl MockCluster {
                     .lock()
                     .expect("connect_calls lock")
                     .push((password.clone(), database.clone()));
+                cluster
+                    .connect_hosts
+                    .lock()
+                    .expect("connect_hosts lock")
+                    .push(host);
 
                 if let Some(err) = cluster.fail_connect.lock().expect("fail_connect lock").clone() {
                     return Err(err);
@@ -3918,6 +3963,10 @@ impl MockCluster {
 
     fn connect_calls(&self) -> Vec<(Option<String>, Option<String>)> {
         self.connect_calls.lock().expect("connect_calls lock").clone()
+    }
+
+    fn connect_hosts(&self) -> Vec<String> {
+        self.connect_hosts.lock().expect("connect_hosts lock").clone()
     }
 
     fn latest_session(&self) -> Arc<MockSession> {
@@ -8853,5 +8902,846 @@ fn pending_save_preserves_concurrent_recent_timestamp() {
             .and_then(|c| c.last_connected_at)
             .is_some(),
         "disk Recent timestamp should be persisted after pending save completion"
+    );
+}
+
+#[test]
+fn staged_edits_preserved_across_reload_close_db_switch_fk_jump_and_races() {
+    let mut rt = sample_runtime(true);
+    apply_scene(&mut rt, "workspace-data-grid-dark");
+    rt.frame(0.5);
+
+    rt.update(|s, tx| {
+        s.begin_cell_edit(RowKey::Existing(0), 2, tx);
+    });
+    rt.frame(0.2);
+    rt.key(KeyEvent::from(Key::Text("Troy Updated".to_owned())));
+    rt.frame(0.0);
+    rt.key(KeyEvent::from(Key::Enter));
+    rt.frame(0.1);
+
+    let (table_tab_id, schema, obj) = {
+        let sess = rt.state.active_session().expect("session");
+        let tab = sess.active_table_tab().expect("table tab");
+        assert_eq!(tab.staged.update_count(), 1);
+        (tab.tab_id, tab.schema.clone(), tab.object_name.clone())
+    };
+
+    // 1. Reload is blocked when edits are staged.
+    rt.update(|s, _| s.reload_active_tab());
+    rt.frame(0.1);
+    {
+        let tab = rt
+            .state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab");
+        assert_eq!(tab.staged.update_count(), 1);
+        assert!(tab.diff_drawer_open);
+        assert!(
+            rt.state
+                .status_notice
+                .as_ref()
+                .is_some_and(|n| n.message.contains("reloading table"))
+        );
+    }
+
+    // 2. Close tab is blocked and focuses/keeps the dirty tab.
+    rt.update(|s, tx| {
+        s.close_staged_diff_drawer();
+        s.close_tab(table_tab_id, tx);
+    });
+    rt.frame(0.1);
+    {
+        let sess = rt.state.active_session().expect("session");
+        assert!(sess.tabs.iter().any(|t| t.id == table_tab_id));
+        let tab = sess.active_table_tab().expect("table tab");
+        assert_eq!(tab.staged.update_count(), 1);
+        assert!(tab.diff_drawer_open);
+        assert!(
+            rt.state
+                .status_notice
+                .as_ref()
+                .is_some_and(|n| n.message.contains("closing tab"))
+        );
+    }
+
+    // 3. Database switch is blocked when any tab in the session has staged edits.
+    rt.update(|s, tx| {
+        s.close_staged_diff_drawer();
+        s.select_database("greendale_other".to_owned(), tx);
+    });
+    rt.frame(0.1);
+    {
+        let sess = rt.state.active_session().expect("session");
+        let tab = sess.active_table_tab().expect("table tab");
+        assert_eq!(tab.staged.update_count(), 1);
+        assert!(tab.diff_drawer_open);
+        assert!(
+            rt.state
+                .status_notice
+                .as_ref()
+                .is_some_and(|n| n.message.contains("switching database"))
+        );
+    }
+
+    // 4. FK jump onto an already-open dirty tab focuses it without clearing edits or replacing its filter.
+    let source_col = ColumnMeta {
+        name: "student_id".to_owned(),
+        data_type: "integer".to_owned(),
+        udt_name: "int4".to_owned(),
+        nullable: false,
+        default_expr: None,
+        is_primary_key: true,
+        is_unique: true,
+        comment: None,
+        foreign_key: None,
+    };
+    rt.update(|s, tx| {
+        s.close_staged_diff_drawer();
+        s.open_new_query_tab(tx);
+        s.jump_to_foreign_key(
+            tv_core::ForeignKeyRef {
+                constraint_name: "fk_student".to_owned(),
+                target_schema: schema.clone(),
+                target_table: obj.clone(),
+                target_column: "student_id".to_owned(),
+            },
+            CellValue::Int(1),
+            source_col,
+            tx,
+        );
+    });
+    rt.frame(0.1);
+    {
+        let sess = rt.state.active_session().expect("session");
+        assert_eq!(sess.active_tab, Some(table_tab_id));
+        let tab = sess.active_table_tab().expect("table tab");
+        assert_eq!(tab.staged.update_count(), 1);
+        assert!(tab.applied_filter.is_none());
+        assert!(tab.diff_drawer_open);
+    }
+
+    // 5. Mutations and discard are frozen while a commit is in flight.
+    rt.update(|s, tx| {
+        if let Some(tab) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.committing = true;
+            tab.commit_req_id = Some(tv_core::RequestId::new(999));
+            tab.commit_staged_gen = Some(tab.staged_gen);
+        }
+        assert!(!s.insert_staged_row(tx));
+        s.toggle_delete_row(RowKey::Existing(1));
+        s.stage_cell_null(RowKey::Existing(0), 3);
+        s.discard_staged_changes();
+    });
+    {
+        let tab = rt
+            .state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab");
+        assert_eq!(tab.staged.update_count(), 1);
+        assert_eq!(tab.staged.insert_count(), 0);
+        assert_eq!(tab.staged.delete_count(), 0);
+    }
+
+    // 6. Late TablePageLoaded arriving after edits are staged does not discard them.
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt_worker = worker_runtime(&cluster);
+    let conn_id = rt_worker.state.connections[0].id;
+    rt_worker.update(|s, tx| s.start_or_focus_connection(conn_id, None, None, tx));
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    rt_worker.update(|s, tx| s.select_object("public".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+
+    *cluster
+        .latest_session()
+        .page_delay_once
+        .lock()
+        .expect("page_delay_once") = Some(Duration::from_millis(250));
+    rt_worker.update(|s, _| {
+        s.reload_active_tab();
+        assert!(
+            s.active_session()
+                .and_then(SessionState::active_table_tab)
+                .is_some_and(|t| t.page_loading)
+        );
+        s.toggle_delete_row(RowKey::Existing(0));
+    });
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading)
+    });
+    let tab_after = rt_worker
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab");
+    assert_eq!(tab_after.staged.delete_count(), 1);
+
+    // 7. Discarding an edit during an in-flight page fetch accepts the latest response.
+    rt_worker.update(|s, _| s.discard_staged_changes());
+    *cluster
+        .latest_session()
+        .page_delay_once
+        .lock()
+        .expect("page_delay_once") = Some(Duration::from_millis(200));
+    rt_worker.update(|s, _| {
+        s.set_active_tab_page_size(100);
+        s.toggle_delete_row(RowKey::Existing(0));
+        s.discard_staged_changes();
+    });
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading)
+    });
+    let page_after_discard = rt_worker
+        .state
+        .active_session()
+        .expect("session")
+        .active_table_tab()
+        .expect("table tab")
+        .page
+        .as_ref()
+        .expect("updated page");
+    assert_eq!(page_after_discard.limit, 100);
+
+    // 7b. Deferred TablePageLoaded received while edits are staged is applied once edits are cleared.
+    *cluster
+        .latest_session()
+        .page_delay_once
+        .lock()
+        .expect("page_delay_once") = Some(Duration::from_millis(200));
+    rt_worker.update(|s, _| s.set_active_tab_page_size(50));
+    rt_worker.update(|s, _| s.toggle_delete_row(RowKey::Existing(0)));
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading)
+    });
+    {
+        let tab = rt_worker
+            .state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab");
+        assert_eq!(tab.page.as_ref().expect("old page").limit, 100);
+        assert_eq!(tab.staged.delete_count(), 1);
+        assert_eq!(tab.pending_page.as_ref().expect("deferred page").limit, 50);
+    }
+    rt_worker.update(|s, _| s.discard_staged_changes());
+    {
+        let tab = rt_worker
+            .state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab");
+        assert_eq!(tab.page.as_ref().expect("applied deferred page").limit, 50);
+        assert!(tab.pending_page.is_none());
+    }
+
+    *cluster
+        .latest_session()
+        .page_delay_once
+        .lock()
+        .expect("page_delay_once") = Some(Duration::from_millis(200));
+    rt_worker.update(|s, _| s.set_active_tab_page_size(25));
+    rt_worker.update(|s, _| s.toggle_delete_row(RowKey::Existing(0)));
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading)
+    });
+    rt_worker.update(|s, _| s.toggle_delete_row(RowKey::Existing(0)));
+    {
+        let tab = rt_worker
+            .state
+            .active_session()
+            .expect("session")
+            .active_table_tab()
+            .expect("table tab");
+        assert_eq!(tab.staged.delete_count(), 0);
+        assert_eq!(tab.page.as_ref().expect("applied deferred page on undo").limit, 25);
+        assert!(tab.pending_page.is_none());
+    }
+
+    // 8. Stale ColumnsLoaded response from previous database does not overwrite current metadata.
+    let stale_sess = cluster.latest_session();
+    *stale_sess.columns_delay_once.lock().expect("columns_delay_once") =
+        Some(Duration::from_millis(250));
+    *stale_sess.columns_override.lock().expect("columns_override") = Some(vec![
+        tv_core::ColumnSummary {
+            name: "stale_db_a_col".to_owned(),
+            data_type: "text".to_owned(),
+            nullable: false,
+            is_primary_key: false,
+        },
+    ]);
+    rt_worker.update(|s, _| {
+        s.toggle_object_expand("public".to_owned(), "students".to_owned());
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    rt_worker.update(|s, tx| {
+        s.select_database("greendale_idp_dev".to_owned(), tx);
+    });
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|sess| {
+            sess.pending_db_switch_req.is_none()
+                && sess
+                    .status
+                    .as_connected()
+                    .and_then(|c| c.active_database.as_deref())
+                    == Some("greendale_idp_dev")
+        })
+    });
+    rt_worker.update(|s, _| {
+        s.toggle_object_expand("public".to_owned(), "students".to_owned());
+    });
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(|sess| sess.status.as_connected())
+            .and_then(|c| c.expanded_columns.get(&("public".to_owned(), "students".to_owned())))
+            .is_some_and(|st| matches!(st, tv_app::state::ColumnLoadState::Loaded(_)))
+    });
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(50));
+        rt_worker.frame(0.05);
+    }
+    let final_col_state = rt_worker
+        .state
+        .active_session()
+        .and_then(|sess| sess.status.as_connected())
+        .and_then(|c| c.expanded_columns.get(&("public".to_owned(), "students".to_owned())))
+        .expect("expanded columns present");
+    match final_col_state {
+        tv_app::state::ColumnLoadState::Loaded(cols) => {
+            assert!(cols.iter().any(|c| c.name == "student_id"));
+            assert!(!cols.iter().any(|c| c.name == "stale_db_a_col"));
+        }
+        other => panic!("expected DB B loaded columns, got {other:?}"),
+    }
+
+    // 9. Late workspace refresh completing after disconnect must not delete table tabs with staged edits.
+    rt_worker.update(|s, tx| s.select_object("public".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+    rt_worker.update(|s, _| s.toggle_delete_row(RowKey::Existing(0)));
+    let race_sess = cluster.latest_session();
+    let objects_before = race_sess.objects_calls.load(Ordering::Acquire);
+    *race_sess
+        .objects_delay_once
+        .lock()
+        .expect("objects_delay_once") = Some(Duration::from_millis(250));
+    rt_worker.update(|s, _| s.reload_workspace());
+    std::thread::sleep(Duration::from_millis(30));
+    race_sess.set_half_open(true);
+    cluster.set_fail_connect(Some(DbError::AuthFailed("Access denied".to_owned())));
+    rt_worker.update(|s, _| s.toggle_object_expand("public".to_owned(), "campus_news".to_owned()));
+    poll_until(&mut rt_worker, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Disconnected { .. }))
+    });
+    poll_until(&mut rt_worker, Duration::from_secs(3), |_| {
+        race_sess.objects_calls.load(Ordering::Acquire) > objects_before
+    });
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(25));
+        rt_worker.frame(0.05);
+    }
+    let race_tab = rt_worker
+        .state
+        .active_session()
+        .expect("session still present")
+        .active_table_tab()
+        .expect("table tab must survive late refresh after disconnect");
+    assert_eq!(race_tab.staged.delete_count(), 1);
+}
+
+#[test]
+fn profile_edits_bind_active_session_and_guard_pending_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store_path = dir.path().join("connections.json");
+    let store = ConnectionStore::at(store_path.clone());
+
+    let mut prof_ro = ConnectionProfile::new_postgres("greendale_ro", "greendale-a.local", "troy_barnes");
+    prof_ro.safety = SafetyPolicy::ReadOnly;
+    prof_ro.env = EnvTag::Production;
+    prof_ro.password_mode = tv_core::PasswordMode::Keychain;
+
+    let mut prof_cw = ConnectionProfile::new_postgres("greendale_cw", "studya.local", "abed_nadir");
+    prof_cw.safety = SafetyPolicy::ConfirmWrites;
+    prof_cw.env = EnvTag::Production;
+    prof_cw.password_mode = tv_core::PasswordMode::Keychain;
+
+    let initial_store = StoreData {
+        connections: vec![prof_ro.clone(), prof_cw.clone()],
+        ..StoreData::default()
+    };
+    store.save(&initial_store).expect("seed store");
+
+    let cluster = MockCluster::new(Duration::ZERO);
+    let cred_backend = Arc::new(MockCredentialBackend::new());
+    cred_backend.secrets.lock().expect("secrets").insert(
+        prof_ro.credential_service(),
+        ("troy_barnes".to_owned(), "human_beings".to_owned()),
+    );
+    cred_backend.secrets.lock().expect("secrets").insert(
+        prof_cw.credential_service(),
+        ("abed_nadir".to_owned(), "cool_cool_cool".to_owned()),
+    );
+    let cred_trait: Arc<dyn CredentialBackend> = cred_backend.clone();
+
+    let mut state = AppState::init_in_memory(initial_store);
+    state.persist_enabled = true;
+    state.store_path = store_path;
+    state.appearance = ColorScheme::Dark;
+    state.worker = Some(
+        WorkerBridge::spawn_with_connector_and_credentials(cluster.connector(), cred_trait)
+            .expect("spawn worker"),
+    );
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(true, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+
+    // 1. Connect to greendale_ro on greendale-a.local (ReadOnly, Production).
+    let ro_id = prof_ro.id;
+    let cw_id = prof_cw.id;
+    rt.update(|s, tx| s.start_or_focus_connection(ro_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    assert_eq!(cluster.connect_hosts(), vec!["greendale-a.local".to_owned()]);
+    let gen_ro = rt
+        .state
+        .active_session()
+        .expect("ro session")
+        .active_connect_req_id;
+
+    // 2. Edit greendale_ro to greendale-b.local + Unrestricted + Local and Save (without connecting).
+    rt.update(|s, tx| s.open_edit_connection_form(ro_id, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        matches!(
+            &rt.state.overlay,
+            OverlayState::ConnectionForm(f) if !f.loading_credential
+        )
+    });
+    rt.update(|s, tx| {
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.host = rune::TextEdit::new("greendale-b.local");
+            form.password = rune::TextEdit::new("new_host_b_secret");
+            form.password_touched = true;
+            form.safety = SafetyPolicy::Unrestricted;
+            form.env = EnvTag::Local;
+        }
+        s.save_connection_form(false, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+    });
+    rt.frame(0.1);
+    assert!(rt.find("toolbar-apply-profile").is_some());
+    {
+        let sess = rt.state.active_session().expect("ro session");
+        assert_eq!(sess.profile.host, "greendale-a.local");
+        assert_eq!(sess.profile.safety, SafetyPolicy::ReadOnly);
+        assert_eq!(sess.profile.env, EnvTag::Production);
+        assert!(sess.profile_out_of_sync);
+    }
+
+    // Active ReadOnly policy remains enforced on greendale-a.local even after profile edit.
+    rt.update(|s, tx| s.select_object("public".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+    rt.update(|s, tx| {
+        assert!(!s.insert_staged_row(tx));
+        assert!(
+            s.status_notice
+                .as_ref()
+                .is_some_and(|n| n.message.contains("Read-Only"))
+        );
+        s.open_new_query_tab(tx);
+        if let Some(q) = s.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+            q.editor = rune::TextEdit::new("DELETE FROM public.students;");
+        }
+        s.run_active_query(true);
+    });
+    rt.frame(0.1);
+    assert!(
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_query_tab)
+            .and_then(|q| q.batch_error.as_deref())
+            .is_some_and(|e| e.contains("Read-Only"))
+    );
+
+    // 3. Silent worker reconnect after half-open disconnect MUST stay on greendale-a.local.
+    let ro_mock = cluster.latest_session();
+    ro_mock.set_disconnected(true);
+    rt.update(|s, tx| {
+        s.select_object("public".to_owned(), "students".to_owned(), tx);
+        s.reload_active_tab();
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+            && cluster.connect_hosts().len() >= 2
+    });
+    assert_eq!(
+        cluster.connect_hosts().last().map(String::as_str),
+        Some("greendale-a.local")
+    );
+    assert_eq!(
+        rt.state
+            .active_session()
+            .expect("ro session")
+            .active_connect_req_id,
+        gen_ro
+    );
+
+    // 3b. Switching database in the existing session uses its bound host and credentials,
+    // NOT the newly saved Keychain password meant for greendale-b.local.
+    rt.update(|s, tx| s.select_database("greendale_idp_dev".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|sess| {
+            sess.pending_db_switch_req.is_none()
+                && sess
+                    .status
+                    .as_connected()
+                    .and_then(|c| c.active_database.as_deref())
+                    == Some("greendale_idp_dev")
+        })
+    });
+    assert_eq!(
+        cluster.connect_hosts().last().map(String::as_str),
+        Some("greendale-a.local")
+    );
+    assert_eq!(
+        cluster
+            .connect_calls()
+            .last()
+            .and_then(|(pw, _)| pw.as_deref()),
+        Some("human_beings")
+    );
+
+    // 3c. Reopening a disconnected workspace keeps it bound to greendale-a.local and preserves unsaved SQL.
+    let unsaved_q_tab = {
+        rt.update(|s, tx| {
+            s.open_new_query_tab(tx);
+            if let Some(q) = s.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+                q.editor = rune::TextEdit::new("SELECT 'unsaved_sql';");
+            }
+            s.disconnect_active(tx);
+            s.start_or_focus_connection(ro_id, None, None, tx);
+        });
+        assert!(matches!(
+            &rt.state.overlay,
+            OverlayState::PasswordPrompt(p) if p.error.as_deref().is_some_and(|e| e.contains("Profile settings changed"))
+        ));
+        let connects_before_empty_submit = cluster.connect_count();
+        rt.update(|s, tx| s.submit_password_prompt(tx));
+        assert_eq!(cluster.connect_count(), connects_before_empty_submit);
+        assert!(matches!(
+            &rt.state.overlay,
+            OverlayState::PasswordPrompt(p) if p.error.as_deref().is_some_and(|e| e.contains("Enter a password"))
+        ));
+        let sess = rt.state.active_session().expect("ro session");
+        assert_eq!(sess.profile.host, "greendale-a.local");
+        let q = sess.active_query_tab().expect("preserved query tab");
+        assert_eq!(q.editor.text, "SELECT 'unsaved_sql';");
+        q.tab_id
+    };
+    assert!(
+        rt.state
+            .active_session()
+            .expect("ro session")
+            .tabs
+            .iter()
+            .any(|t| t.id == unsaved_q_tab)
+    );
+    rt.update(|s, _| s.overlay = OverlayState::None);
+
+    // 4. Switch to editable profile greendale_cw on studya.local (ConfirmWrites, Production).
+    rt.update(|s, tx| s.start_or_focus_connection(cw_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| sess.profile.id == cw_id && matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    assert_eq!(
+        cluster.connect_hosts().last().map(String::as_str),
+        Some("studya.local")
+    );
+    let gen_cw = rt
+        .state
+        .active_session()
+        .expect("cw session")
+        .active_connect_req_id;
+
+    rt.update(|s, tx| s.select_object("public".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+    let cw_table_tab = rt
+        .state
+        .active_session()
+        .expect("cw session")
+        .active_tab
+        .expect("table tab id");
+    rt.update(|s, _| s.toggle_delete_row(RowKey::Existing(0)));
+
+    // Cosmetic rename updates session.profile.name in-place without marking out_of_sync or clearing tabs.
+    rt.update(|s, tx| s.open_edit_connection_form(cw_id, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        matches!(
+            &rt.state.overlay,
+            OverlayState::ConnectionForm(f) if !f.loading_credential
+        )
+    });
+    rt.update(|s, tx| {
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.name = rune::TextEdit::new("greendale_cw_renamed");
+        }
+        s.save_connection_form(false, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+    });
+    {
+        let sess = rt.state.active_session().expect("cw session");
+        assert_eq!(sess.profile.name, "greendale_cw_renamed");
+        assert!(!sess.profile_out_of_sync);
+        assert_eq!(sess.active_connect_req_id, gen_cw);
+        assert_eq!(
+            sess.active_table_tab().expect("table tab").staged.delete_count(),
+            1
+        );
+    }
+
+    // Capture a SafetyConfirmModalState bound to gen_cw before switching target.
+    let stale_safety_overlay = {
+        rt.update(|s, tx| {
+            s.open_new_query_tab(tx);
+            if let Some(q) = s.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+                q.editor = rune::TextEdit::new("DELETE FROM public.students;");
+            }
+            s.run_active_query(true);
+        });
+        let captured = match &rt.state.overlay {
+            OverlayState::SafetyConfirm(m) => {
+                let mut cloned = (**m).clone();
+                cloned.destructive_ack = true;
+                cloned
+            }
+            other => panic!("expected SafetyConfirm modal, got {other:?}"),
+        };
+        assert_eq!(captured.connect_req_id, gen_cw);
+        rt.update(|s, _| s.overlay = OverlayState::None);
+        captured
+    };
+
+    // Edit greendale_cw to studyb.local + Unrestricted + Local and click Save & Connect while staged edits exist.
+    rt.update(|s, tx| s.open_edit_connection_form(cw_id, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        matches!(
+            &rt.state.overlay,
+            OverlayState::ConnectionForm(f) if !f.loading_credential
+        )
+    });
+    rt.update(|s, tx| {
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.host = rune::TextEdit::new("studyb.local");
+            form.safety = SafetyPolicy::Unrestricted;
+            form.env = EnvTag::Local;
+        }
+        s.save_connection_form(true, tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+    });
+    {
+        let sess = rt.state.active_session().expect("cw session");
+        assert_eq!(sess.profile.host, "studya.local");
+        assert_eq!(sess.active_connect_req_id, gen_cw);
+        assert!(sess.profile_out_of_sync);
+        assert_eq!(sess.active_tab, Some(cw_table_tab));
+        let tab = sess.active_table_tab().expect("dirty table tab");
+        assert_eq!(tab.staged.delete_count(), 1);
+        assert!(tab.diff_drawer_open);
+        assert!(
+            rt.state
+                .status_notice
+                .as_ref()
+                .is_some_and(|n| n.message.contains("staged edits"))
+        );
+    }
+
+    // Apply Profile remains blocked until staged edits are resolved.
+    rt.update(|s, tx| s.apply_updated_profile_to_active_session(tx));
+    assert_eq!(
+        rt.state.active_session().expect("cw session").profile.host,
+        "studya.local"
+    );
+
+    // Discard staged edits and apply the updated profile -> fresh generation, studyb.local, clean tabs.
+    rt.update(|s, tx| {
+        s.discard_staged_changes();
+        s.apply_updated_profile_to_active_session(tx);
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|sess| {
+            sess.active_connect_req_id != gen_cw
+                && matches!(sess.status, ConnectionState::Connected(_))
+        })
+    });
+    let studyb_mock = cluster.latest_session();
+    {
+        let sess = rt.state.active_session().expect("rebound cw session");
+        assert_ne!(sess.active_connect_req_id, gen_cw);
+        assert_eq!(sess.profile.host, "studyb.local");
+        assert_eq!(sess.profile.safety, SafetyPolicy::Unrestricted);
+        assert!(!sess.profile_out_of_sync);
+        assert!(sess.tabs.is_empty());
+        assert_eq!(
+            cluster.connect_hosts().last().map(String::as_str),
+            Some("studyb.local")
+        );
+    }
+
+    // Stale SafetyConfirm modal captured under gen_cw is rejected after connection generation changed.
+    rt.update(|s, _| {
+        s.overlay = OverlayState::SafetyConfirm(Box::new(stale_safety_overlay));
+        s.confirm_safety_modal();
+    });
+    assert!(
+        rt.state
+            .status_notice
+            .as_ref()
+            .is_some_and(|n| n.message.contains("Connection or safety policy changed")),
+        "expected stale confirmation notice, got {:?}",
+        rt.state.status_notice
+    );
+    assert_eq!(studyb_mock.sql_calls.load(Ordering::Acquire), 0);
+
+    // 5. Passwordless Keychain session + pending save must not send newly saved password to old host.
+    let mut prof_nokey =
+        ConnectionProfile::new_postgres("greendale_nokey", "host-a.greendale.test", "chang");
+    prof_nokey.password_mode = tv_core::PasswordMode::Keychain;
+    let nokey_id = prof_nokey.id;
+    rt.update(|s, _| {
+        s.connections.push(prof_nokey.clone());
+    });
+    let mut updated_store = store.load().expect("reload store");
+    updated_store.connections.push(prof_nokey);
+    store.save(&updated_store).expect("save store with nokey");
+
+    rt.update(|s, tx| s.start_or_focus_connection(nokey_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|sess| {
+            sess.profile.id == nokey_id && matches!(sess.status, ConnectionState::Connected(_))
+        })
+    });
+    assert_eq!(
+        cluster.connect_hosts().last().map(String::as_str),
+        Some("host-a.greendale.test")
+    );
+    assert_eq!(
+        cluster
+            .connect_calls()
+            .last()
+            .and_then(|(pw, _)| pw.as_deref()),
+        None
+    );
+
+    // Slow keychain write keeps pending_profile_save active; manual reconnect must be refused.
+    rt.update(|s, tx| s.open_edit_connection_form(nokey_id, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        matches!(
+            &rt.state.overlay,
+            OverlayState::ConnectionForm(f) if !f.loading_credential
+        )
+    });
+    *cred_backend.write_delay.lock().expect("write_delay") = Duration::from_millis(250);
+    let connects_before_pending = cluster.connect_count();
+    rt.update(|s, tx| {
+        if let OverlayState::ConnectionForm(ref mut form) = s.overlay {
+            form.host = rune::TextEdit::new("host-b.greendale.test");
+            form.password = rune::TextEdit::new("new_host_b_secret");
+            form.password_touched = true;
+        }
+        s.save_connection_form(false, tx);
+    });
+    assert!(rt.state.pending_profile_save.is_some());
+    rt.update(|s, tx| s.reconnect_active(tx));
+    assert_eq!(cluster.connect_count(), connects_before_pending);
+    assert!(
+        rt.state
+            .status_notice
+            .as_ref()
+            .is_some_and(|n| n.message.contains("pending profile save"))
+    );
+
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.pending_profile_save.is_none()
+    });
+    *cred_backend.write_delay.lock().expect("write_delay") = Duration::ZERO;
+
+    // Background reconnect after half-open disconnect keeps original host and original password (None).
+    let nokey_mock = cluster.latest_session();
+    nokey_mock.set_disconnected(true);
+    rt.update(|s, tx| s.select_object("public".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+            && cluster.connect_count() > connects_before_pending
+    });
+    assert_eq!(
+        cluster.connect_hosts().last().map(String::as_str),
+        Some("host-a.greendale.test")
+    );
+    assert_eq!(
+        cluster
+            .connect_calls()
+            .last()
+            .and_then(|(pw, _)| pw.as_deref()),
+        None
     );
 }

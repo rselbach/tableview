@@ -126,6 +126,18 @@ fn build_toolbar(s: &AppState, session: &SessionState, k: &Kit) -> Toolbar {
     let status_pill = build_status_pill(session, k);
 
     let mut trailing = row().gap(4.0).center_y();
+    if session.profile_out_of_sync {
+        trailing = trailing.child(
+            Button::new("Apply Profile")
+                .variant(ButtonVariant::Outline)
+                .control_size(ControlSize::Small)
+                .on_press_tx(|s: &mut AppState, tx: &mut Tx| {
+                    s.apply_updated_profile_to_active_session(tx);
+                })
+                .build(k)
+                .key("toolbar-apply-profile"),
+        );
+    }
     if session.profile.safety != SafetyPolicy::Unrestricted {
         let short_safety = match session.profile.safety {
             SafetyPolicy::Unrestricted => "",
@@ -693,7 +705,7 @@ fn build_object_item(data: &ConnectedData, obj: &DbObject, k: &Kit) -> El {
     let mut wrapper = col().w_full().gap(1.0).child(item_row);
     if let Some(state) = col_state {
         match state {
-            ColumnLoadState::Loading => {
+            ColumnLoadState::Loading(_) => {
                 wrapper = wrapper.child(
                     row()
                         .pl(28.0)

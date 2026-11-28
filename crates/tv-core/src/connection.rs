@@ -442,6 +442,24 @@ impl ConnectionProfile {
         format!("dev.tableview.connection.{}", self.id)
     }
 
+    /// Returns `true` when changing from `self` to `other` changes the database target,
+    /// engine, transport, or authentication settings (requiring a fresh connection generation).
+    pub fn connection_target_changed(&self, other: &Self) -> bool {
+        self.engine != other.engine
+            || self.host != other.host
+            || self.port != other.port
+            || self.user != other.user
+            || self.password_mode != other.password_mode
+            || self.database != other.database
+            || self.file_path != other.file_path
+            || self.ssl != other.ssl
+    }
+
+    /// Returns `true` when changing from `self` to `other` alters environment or safety rules.
+    pub fn safety_context_changed(&self, other: &Self) -> bool {
+        self.env != other.env || self.safety != other.safety
+    }
+
     /// Validates required fields and TLS path invariants at the boundary before saving or connecting.
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.name.trim().is_empty() {

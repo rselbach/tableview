@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rusqlite::types::ValueRef;
@@ -16,9 +17,53 @@ use crate::engine::{
 use crate::explain::{ExplainPlan, build_explain_sql_for_engine};
 use crate::staging::build_fk_where_clause_for_engine;
 
+#[derive(Default)]
+struct SqliteCancelState {
+    active_key: Option<u64>,
+    cancel_requested: bool,
+    waiters: HashMap<u64, tokio::sync::oneshot::Sender<()>>,
+    cancelled_keys: HashSet<u64>,
+}
+
+struct SqliteWaiterGuard {
+    cancel_state: Arc<Mutex<SqliteCancelState>>,
+    cancel_key: u64,
+}
+
+impl Drop for SqliteWaiterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.cancel_state.lock() {
+            state.waiters.remove(&self.cancel_key);
+            state.cancelled_keys.remove(&self.cancel_key);
+        }
+    }
+}
+
+struct SqliteActiveKeyGuard {
+    cancel_state: Arc<Mutex<SqliteCancelState>>,
+    cancel_key: Option<u64>,
+}
+
+impl Drop for SqliteActiveKeyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.cancel_state.lock()
+            && state.active_key == self.cancel_key
+        {
+            state.active_key = None;
+            state.cancel_requested = false;
+        }
+    }
+}
+
+fn flag_cancelled(cancel_flag: Option<&AtomicBool>) -> bool {
+    cancel_flag.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
+
 /// Active SQLite database session backed by `rusqlite` on Tokio's blocking pool.
 pub struct SqliteSession {
     conn: Arc<Mutex<Connection>>,
+    conn_gate: Arc<tokio::sync::Mutex<()>>,
+    cancel_state: Arc<Mutex<SqliteCancelState>>,
     interrupt_handle: InterruptHandle,
     server_info: ServerInfo,
     file_path: Option<PathBuf>,
@@ -95,6 +140,8 @@ impl SqliteSession {
 
         let session = Self {
             conn: Arc::new(Mutex::new(conn)),
+            conn_gate: Arc::new(tokio::sync::Mutex::new(())),
+            cancel_state: Arc::new(Mutex::new(SqliteCancelState::default())),
             interrupt_handle,
             server_info: ServerInfo {
                 version: format!("SQLite {version}"),
@@ -120,13 +167,154 @@ impl SqliteSession {
         F: FnOnce(&mut Connection) -> Result<R, DbError> + Send + 'static,
         R: Send + 'static,
     {
+        let gate = Arc::clone(&self.conn_gate).lock_owned().await;
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
+            let _gate = gate;
             let mut guard = conn.lock().map_err(|_| DbError::Disconnected)?;
             f(&mut guard)
         })
         .await
         .map_err(|e| DbError::ConnectionFailed(format!("SQLite worker task failed: {e}")))?
+    }
+
+    async fn execute_sql_inner(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: Option<u64>,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        let (gate, _waiter_guard) = if let Some(key) = cancel_key {
+            if flag_cancelled(cancel_flag) {
+                return Err(DbError::Cancelled);
+            }
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+            {
+                let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+                if state.cancelled_keys.remove(&key) {
+                    return Err(DbError::Cancelled);
+                }
+                state.waiters.insert(key, cancel_tx);
+            }
+            let waiter_guard = SqliteWaiterGuard {
+                cancel_state: Arc::clone(&self.cancel_state),
+                cancel_key: key,
+            };
+            if flag_cancelled(cancel_flag) {
+                return Err(DbError::Cancelled);
+            }
+            let gate = tokio::select! {
+                biased;
+                _ = &mut cancel_rx => return Err(DbError::Cancelled),
+                guard = Arc::clone(&self.conn_gate).lock_owned() => guard,
+            };
+            {
+                let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+                state.waiters.remove(&key);
+                if flag_cancelled(cancel_flag) || state.cancelled_keys.remove(&key) {
+                    return Err(DbError::Cancelled);
+                }
+                state.active_key = Some(key);
+                state.cancel_requested = false;
+            }
+            (gate, Some(waiter_guard))
+        } else {
+            let gate = Arc::clone(&self.conn_gate).lock_owned().await;
+            let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+            state.active_key = None;
+            state.cancel_requested = false;
+            (gate, None)
+        };
+
+        let conn = Arc::clone(&self.conn);
+        let cancel_state = Arc::clone(&self.cancel_state);
+        let statements = statements.to_vec();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let _active_guard = SqliteActiveKeyGuard {
+                cancel_state: Arc::clone(&cancel_state),
+                cancel_key,
+            };
+            let mut conn_guard = conn.lock().map_err(|_| DbError::Disconnected)?;
+            let is_cancelled = || cancel_state.lock().is_ok_and(|s| s.cancel_requested);
+            if is_cancelled() {
+                return Err(DbError::Cancelled);
+            }
+
+            let batch_start = Instant::now();
+            let mut results = Vec::new();
+            let mut logs = Vec::new();
+            let mut cancelled = false;
+
+            for raw_stmt in &statements {
+                if is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let stmt_sql = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Sqlite, raw_stmt);
+                if stmt_sql.is_empty() {
+                    continue;
+                }
+                let start = Instant::now();
+                match execute_single_sqlite_stmt(&mut conn_guard, stmt_sql, row_limit, &is_cancelled) {
+                    Ok(stmt_outcome) => {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        logs.push(ExecutedSql {
+                            sql: stmt_sql.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: None,
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt_sql.to_owned(),
+                            columns: stmt_outcome.columns,
+                            rows: stmt_outcome.rows,
+                            rows_affected: stmt_outcome.rows_affected,
+                            truncated: stmt_outcome.truncated,
+                            total_rows_seen: stmt_outcome.total_rows_seen,
+                            elapsed_ms,
+                            error: None,
+                        });
+                    }
+                    Err(err) => {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        if matches!(err, DbError::Cancelled) {
+                            cancelled = true;
+                        }
+                        let err_msg = err.to_string();
+                        logs.push(ExecutedSql {
+                            sql: stmt_sql.to_owned(),
+                            duration_ms: elapsed_ms,
+                            error: Some(err_msg.clone()),
+                        });
+                        results.push(QueryStatementResult {
+                            sql: stmt_sql.to_owned(),
+                            columns: Vec::new(),
+                            rows: Vec::new(),
+                            rows_affected: None,
+                            truncated: false,
+                            total_rows_seen: 0,
+                            elapsed_ms,
+                            error: Some(err_msg),
+                        });
+                        break;
+                    }
+                }
+            }
+
+            Ok((
+                QueryBatchResult {
+                    results,
+                    total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
+                    cancelled,
+                },
+                logs,
+            ))
+        })
+        .await
+        .map_err(|e| DbError::ConnectionFailed(format!("SQLite worker task failed: {e}")))?;
+        drop(_waiter_guard);
+        outcome
     }
 }
 
@@ -469,74 +657,18 @@ impl DbSession for SqliteSession {
         statements: &[String],
         row_limit: Option<usize>,
     ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
-        let statements = statements.to_vec();
-        self.with_conn(move |conn| {
-            let batch_start = Instant::now();
-            let mut results = Vec::new();
-            let mut logs = Vec::new();
-            let mut cancelled = false;
+        self.execute_sql_inner(statements, row_limit, None, None).await
+    }
 
-            for raw_stmt in &statements {
-                let stmt_sql = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Sqlite, raw_stmt);
-                if stmt_sql.is_empty() {
-                    continue;
-                }
-                let start = Instant::now();
-                match execute_single_sqlite_stmt(conn, stmt_sql, row_limit) {
-                    Ok(outcome) => {
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        logs.push(ExecutedSql {
-                            sql: stmt_sql.to_owned(),
-                            duration_ms: elapsed_ms,
-                            error: None,
-                        });
-                        results.push(QueryStatementResult {
-                            sql: stmt_sql.to_owned(),
-                            columns: outcome.columns,
-                            rows: outcome.rows,
-                            rows_affected: outcome.rows_affected,
-                            truncated: outcome.truncated,
-                            total_rows_seen: outcome.total_rows_seen,
-                            elapsed_ms,
-                            error: None,
-                        });
-                    }
-                    Err(err) => {
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        if matches!(err, DbError::Cancelled) {
-                            cancelled = true;
-                        }
-                        let err_msg = err.to_string();
-                        logs.push(ExecutedSql {
-                            sql: stmt_sql.to_owned(),
-                            duration_ms: elapsed_ms,
-                            error: Some(err_msg.clone()),
-                        });
-                        results.push(QueryStatementResult {
-                            sql: stmt_sql.to_owned(),
-                            columns: Vec::new(),
-                            rows: Vec::new(),
-                            rows_affected: None,
-                            truncated: false,
-                            total_rows_seen: 0,
-                            elapsed_ms,
-                            error: Some(err_msg),
-                        });
-                        break;
-                    }
-                }
-            }
-
-            Ok((
-                QueryBatchResult {
-                    results,
-                    total_elapsed_ms: batch_start.elapsed().as_millis() as u64,
-                    cancelled,
-                },
-                logs,
-            ))
-        })
-        .await
+    async fn execute_sql_cancellable(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: u64,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        self.execute_sql_inner(statements, row_limit, Some(cancel_key), cancel_flag)
+            .await
     }
 
     async fn execute_transaction(
@@ -733,7 +865,39 @@ impl DbSession for SqliteSession {
     }
 
     async fn cancel_running_query(&self) -> Result<(), DbError> {
+        let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+        state.cancel_requested = true;
         self.interrupt_handle.interrupt();
+        Ok(())
+    }
+
+    async fn cancel_query_by_key(&self, cancel_key: u64) -> Result<(), DbError> {
+        let should_retry = {
+            let mut state = self.cancel_state.lock().map_err(|_| DbError::Disconnected)?;
+            if state.active_key == Some(cancel_key) {
+                state.cancel_requested = true;
+                self.interrupt_handle.interrupt();
+                true
+            } else {
+                if let Some(tx) = state.waiters.remove(&cancel_key) {
+                    state.cancelled_keys.insert(cancel_key);
+                    tx.send(()).unwrap_or(());
+                }
+                false
+            }
+        };
+        if should_retry {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                let Ok(state) = self.cancel_state.lock() else {
+                    break;
+                };
+                if state.active_key != Some(cancel_key) || !state.cancel_requested {
+                    break;
+                }
+                self.interrupt_handle.interrupt();
+            }
+        }
         Ok(())
     }
 
@@ -755,12 +919,22 @@ struct SingleStmtOutcome {
     total_rows_seen: usize,
 }
 
-fn execute_single_sqlite_stmt(
+fn execute_single_sqlite_stmt<F>(
     conn: &mut Connection,
     sql: &str,
     row_limit: Option<usize>,
-) -> Result<SingleStmtOutcome, DbError> {
+    is_cancelled: &F,
+) -> Result<SingleStmtOutcome, DbError>
+where
+    F: Fn() -> bool,
+{
+    if is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
     let mut prepared = conn.prepare(sql).map_err(map_sqlite_err)?;
+    if is_cancelled() {
+        return Err(DbError::Cancelled);
+    }
     let col_count = prepared.column_count();
     if col_count == 0 {
         let affected = prepared.execute([]).map_err(map_sqlite_err)?;
@@ -794,6 +968,9 @@ fn execute_single_sqlite_stmt(
     let mut query_rows = prepared.query([]).map_err(map_sqlite_err)?;
 
     while let Some(row) = query_rows.next().map_err(map_sqlite_err)? {
+        if is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
         total_rows_seen += 1;
         if row_limit.is_none_or(|lim| rows.len() < lim) {
             let mut decoded = Vec::with_capacity(col_count);

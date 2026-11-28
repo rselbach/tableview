@@ -793,6 +793,7 @@ fn scene_workspace_safety_confirm(s: &mut AppState) {
     let is_destructive = inspected.iter().any(|st| st.risk == StatementRisk::Destructive);
     s.overlay = OverlayState::SafetyConfirm(Box::new(SafetyConfirmModalState {
         session_id: sid,
+        connect_req_id: RequestId::new(1),
         tab_id: tid,
         policy: SafetyPolicy::ConfirmWrites,
         env: EnvTag::Production,

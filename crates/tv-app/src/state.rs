@@ -92,7 +92,7 @@ impl SidebarTab {
 /// Loading state for an expanded object's columns in the sidebar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ColumnLoadState {
-    Loading,
+    Loading(RequestId),
     Loaded(Vec<ColumnSummary>),
     Error(String),
 }
@@ -465,6 +465,7 @@ pub enum PendingProtectedAction {
 #[derive(Clone, Debug)]
 pub struct SafetyConfirmModalState {
     pub session_id: SessionId,
+    pub connect_req_id: RequestId,
     pub tab_id: TabId,
     pub policy: SafetyPolicy,
     pub env: EnvTag,
@@ -603,6 +604,7 @@ pub struct TableTabState {
     pub latest_page_req: Option<RequestId>,
     pub latest_structure_req: Option<RequestId>,
     pub page: Option<TablePage>,
+    pub pending_page: Option<TablePage>,
     pub page_error: Option<String>,
     pub reload_on_reconnect: bool,
     pub structure: Option<TableStructure>,
@@ -619,6 +621,8 @@ pub struct TableTabState {
     pub editing_cell: Option<ActiveCellEdit>,
     pub row_menu: Option<(RowKey, PointerPress)>,
     pub staged: StagedChanges,
+    pub staged_gen: u64,
+    pub commit_staged_gen: Option<u64>,
     pub diff_drawer_open: bool,
     pub diff_state: DiffState,
     pub committing: bool,
@@ -662,6 +666,7 @@ impl TableTabState {
             latest_page_req: page_req,
             latest_structure_req: structure_req,
             page: None,
+            pending_page: None,
             page_error: None,
             reload_on_reconnect: false,
             structure: None,
@@ -678,6 +683,8 @@ impl TableTabState {
             editing_cell: None,
             row_menu: None,
             staged: StagedChanges::new(),
+            staged_gen: 0,
+            commit_staged_gen: None,
             diff_drawer_open: false,
             diff_state: DiffState::default(),
             committing: false,
@@ -701,6 +708,49 @@ impl TableTabState {
             sort: self.sort.clone(),
             limit: self.page_size,
             offset: self.offset,
+        }
+    }
+
+    pub fn mark_staged_mutated(&mut self) {
+        self.staged_gen = self.staged_gen.wrapping_add(1);
+    }
+
+    pub fn apply_page(&mut self, page: TablePage, clear_staged: bool) {
+        let row_count = page.rows.len();
+        let auto_select = self.auto_select_first_row;
+        self.auto_select_first_row = false;
+        self.page = Some(page);
+        self.pending_page = None;
+        self.page_error = None;
+        self.filter_error = None;
+        self.reload_on_reconnect = false;
+        if clear_staged {
+            self.editing_cell = None;
+            self.staged.clear();
+            self.mark_staged_mutated();
+            self.rebuild_diff_state();
+        }
+        if auto_select && row_count > 0 {
+            self.selected_row = Some(0);
+            self.selected_row_key = Some(RowKey::Existing(0));
+            self.selected_cell = Some((RowKey::Existing(0), 0));
+            self.data_table.select("r-0".to_owned());
+        } else if let Some(sel) = self.selected_row
+            && sel >= row_count
+        {
+            self.selected_row = None;
+            self.selected_row_key = None;
+            self.selected_cell = None;
+            self.data_table.clear_selection();
+        }
+    }
+
+    pub fn apply_pending_page_if_clean(&mut self) {
+        if !self.committing
+            && !self.staged.has_changes()
+            && let Some(deferred) = self.pending_page.take()
+        {
+            self.apply_page(deferred, true);
         }
     }
 
@@ -1260,6 +1310,7 @@ pub struct ReconnectContext {
 pub struct SessionState {
     pub id: SessionId,
     pub profile: ConnectionProfile,
+    pub profile_out_of_sync: bool,
     pub session_password: Option<String>,
     pub latest_req_id: RequestId,
     pub active_connect_req_id: RequestId,
@@ -1289,6 +1340,7 @@ impl SessionState {
         Self {
             id,
             profile,
+            profile_out_of_sync: false,
             session_password: None,
             latest_req_id: req_id,
             active_connect_req_id: req_id,
@@ -1362,6 +1414,28 @@ impl SessionState {
             },
             _ => self.reconnect_context.clone(),
         }
+    }
+
+    pub fn first_dirty_table_tab_id(&self) -> Option<TabId> {
+        self.tabs
+            .iter()
+            .filter_map(WorkspaceTab::as_table)
+            .find(|t| t.staged.has_changes() || t.committing)
+            .map(|t| t.tab_id)
+    }
+
+    pub fn has_staged_edits_or_committing(&self) -> bool {
+        self.first_dirty_table_tab_id().is_some()
+    }
+
+    pub fn check_table_mutation_ready(&self, tab: &TableTabState) -> Result<(), &'static str> {
+        if tab.committing {
+            return Err("Wait for staged changes commit to finish before editing");
+        }
+        if self.pending_db_switch_req.is_some() {
+            return Err("Wait for database switch to finish before editing");
+        }
+        Ok(())
     }
 
     pub fn console_max_height(container_h: f32) -> f32 {
@@ -1465,7 +1539,7 @@ pub struct PendingProfileSave {
     pub previous_folders: Vec<String>,
     pub next_store: StoreData,
     pub connect_after: bool,
-    pub password_update: Option<Option<String>>,
+    pub password_mutated: bool,
     pub deleting_credential: bool,
     pub cancelled: bool,
 }
@@ -2244,11 +2318,6 @@ impl AppState {
             .as_ref()
             .is_some_and(|p| p.password_mode == PasswordMode::Keychain);
         let needs_cleanup = self.pending_credential_deletes.contains(&profile.id);
-        let password_update = match profile.password_mode {
-            PasswordMode::Keychain | PasswordMode::None => Some(None),
-            PasswordMode::AskEveryTime if switched_from_keychain => Some(None),
-            PasswordMode::AskEveryTime => None,
-        };
 
         enum CredMutation {
             SaveSecret(String),
@@ -2273,6 +2342,8 @@ impl AppState {
         } else {
             None
         };
+        let password_mutated = password_touched
+            || switched_from_keychain != (profile.password_mode == PasswordMode::Keychain);
 
         if let Some(mutation) = cred_mutation {
             let deleting_credential = matches!(mutation, CredMutation::DeleteSecret);
@@ -2291,7 +2362,7 @@ impl AppState {
                 previous_folders,
                 next_store,
                 connect_after,
-                password_update,
+                password_mutated,
                 deleting_credential,
                 cancelled: false,
             });
@@ -2325,7 +2396,7 @@ impl AppState {
             previous_folders,
             next_store,
             connect_after,
-            password_update,
+            password_mutated,
             deleting_credential: false,
             cancelled: false,
         };
@@ -2365,12 +2436,34 @@ impl AppState {
         }
     }
 
+    fn focus_dirty_table_tab(&mut self, session_id: SessionId, tab_id: TabId, tx: &mut Tx) {
+        self.screen = Screen::Workspace(session_id);
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.active_tab = Some(tab_id);
+            let target = session
+                .tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .and_then(WorkspaceTab::schema_and_name)
+                .map(|(s, n)| (s.to_owned(), n.to_owned()));
+            if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) {
+                tab.diff_drawer_open = true;
+            }
+            if let Some(obj) = target
+                && let ConnectionState::Connected(ref mut data) = session.status
+            {
+                data.selected_object = Some(obj);
+            }
+        }
+        self.sync_window_title(tx);
+    }
+
     fn apply_saved_profile_to_state(
         &mut self,
         profile: &ConnectionProfile,
         mut next_store: StoreData,
-        password_update: &Option<Option<String>>,
-    ) -> bool {
+        password_mutated: bool,
+    ) -> (bool, bool) {
         let merged_recent = self.merge_recent_timestamps(&mut next_store);
         self.folders = next_store.folders;
         self.connections = next_store.connections;
@@ -2383,22 +2476,34 @@ impl AppState {
             self.launcher_search = TextEdit::new("");
         }
 
+        let mut any_out_of_sync = false;
         for session in self.sessions.values_mut() {
             if session.profile.id == profile.id {
-                session.profile = profile.clone();
-                if let Some(updated_pw) = password_update {
-                    session.session_password = updated_pw.clone();
-                }
-                if let Some(worker) = &self.worker {
-                    worker.send(WorkerCmd::UpdateSessionProfile {
-                        session_id: session.id,
-                        profile: profile.clone(),
-                        password_update: password_update.clone(),
-                    });
+                let requires_fresh = session.profile.connection_target_changed(profile)
+                    || session.profile.safety_context_changed(profile)
+                    || password_mutated;
+                if requires_fresh {
+                    session.profile_out_of_sync = true;
+                    any_out_of_sync = true;
+                } else {
+                    session.profile.name = profile.name.clone();
+                    session.profile.folder = profile.folder.clone();
+                    session.profile.color = profile.color;
+                    if session.profile_out_of_sync {
+                        any_out_of_sync = true;
+                    }
+                    if let Some(worker) = &self.worker {
+                        worker.send(WorkerCmd::UpdateSessionMetadata {
+                            session_id: session.id,
+                            name: profile.name.clone(),
+                            folder: profile.folder.clone(),
+                            color: profile.color,
+                        });
+                    }
                 }
             }
         }
-        merged_recent
+        (merged_recent, any_out_of_sync)
     }
 
     fn finish_profile_save(
@@ -2407,10 +2512,10 @@ impl AppState {
         explicit_pw: Option<String>,
         tx: &mut Tx,
     ) {
-        let merged_recent = self.apply_saved_profile_to_state(
+        let (merged_recent, any_out_of_sync) = self.apply_saved_profile_to_state(
             &pending.profile,
             pending.next_store,
-            &pending.password_update,
+            pending.password_mutated,
         );
         self.overlay = OverlayState::None;
         if pending.connect_after {
@@ -2419,7 +2524,41 @@ impl AppState {
             } else {
                 explicit_pw
             };
-            self.start_connection_inner(pending.profile.id, pw, None, true, tx);
+            if let Some(existing_sid) = self.find_session_for_connection(pending.profile.id) {
+                let needs_fresh = self.sessions.get(&existing_sid).is_some_and(|session| {
+                    session.profile_out_of_sync
+                        || session.profile.connection_target_changed(&pending.profile)
+                        || session.profile.safety_context_changed(&pending.profile)
+                        || pending.password_mutated
+                });
+                if needs_fresh {
+                    if let Some(dirty_tab_id) = self
+                        .sessions
+                        .get(&existing_sid)
+                        .and_then(SessionState::first_dirty_table_tab_id)
+                    {
+                        self.focus_dirty_table_tab(existing_sid, dirty_tab_id, tx);
+                        self.set_notice(
+                            "Saved profile changes. Commit or discard staged edits before connecting to the updated target.",
+                            true,
+                        );
+                    } else {
+                        self.start_connection_inner(pending.profile.id, pw, None, true, tx);
+                    }
+                } else {
+                    self.start_connection_inner(pending.profile.id, pw, None, false, tx);
+                }
+            } else {
+                self.start_connection_inner(pending.profile.id, pw, None, false, tx);
+            }
+        } else if any_out_of_sync {
+            self.set_notice(
+                format!(
+                    "Saved connection \"{}\". Reconnect the active session to apply updated settings.",
+                    pending.profile.name
+                ),
+                false,
+            );
         } else {
             self.set_notice(format!("Saved connection \"{}\"", pending.profile.name), false);
         }
@@ -2693,6 +2832,21 @@ impl AppState {
         if let Some(sid) = session_id
             && self.sessions.contains_key(&sid)
         {
+            let requires_nonempty = self.sessions.get(&sid).is_some_and(|s| {
+                s.profile_out_of_sync
+                    && s.profile.engine != DbEngine::Sqlite
+                    && s.profile.password_mode == PasswordMode::Keychain
+            });
+            if requires_nonempty && pw.is_empty() {
+                if let OverlayState::PasswordPrompt(ref mut prompt) = self.overlay {
+                    prompt.error = Some(
+                        "Enter a password to reconnect to the previous target, or cancel and click Apply Profile."
+                            .to_owned(),
+                    );
+                }
+                tx.focus_when_shown("password-prompt-input", true);
+                return;
+            }
             let req_id = self.alloc_req_id();
             let profile = {
                 let Some(session) = self.sessions.get_mut(&sid) else {
@@ -2727,6 +2881,16 @@ impl AppState {
         let Screen::Workspace(session_id) = self.screen else {
             return;
         };
+        if let Some(dirty_tab_id) = self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionState::first_dirty_table_tab_id)
+        {
+            self.overlay = OverlayState::None;
+            self.focus_dirty_table_tab(session_id, dirty_tab_id, tx);
+            self.set_notice("Commit or discard staged changes before switching database", true);
+            return;
+        }
         let has_worker = self.worker.is_some();
         let req_id = self.alloc_req_id();
         let Some(session) = self.sessions.get_mut(&session_id) else {
@@ -2807,34 +2971,35 @@ impl AppState {
             return;
         };
         let key = (schema.clone(), object.clone());
-        let need_load = {
+        let req_id = self.alloc_req_id();
+        let (connect_req_id, need_load) = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
+            let connect_req_id = session.active_connect_req_id;
             let Some(connected) = session.status.as_connected_mut() else {
                 return;
             };
-            match connected.expanded_columns.entry(key) {
+            let need = match connected.expanded_columns.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => {
                     entry.remove();
                     false
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(ColumnLoadState::Loading);
+                    entry.insert(ColumnLoadState::Loading(req_id));
                     true
                 }
-            }
+            };
+            (connect_req_id, need)
         };
-        if need_load && self.worker.is_some() {
-            let req_id = self.alloc_req_id();
-            if let Some(worker) = &self.worker {
-                worker.send(WorkerCmd::LoadColumns {
-                    session_id,
-                    req_id,
-                    schema,
-                    object,
-                });
-            }
+        if need_load && let Some(worker) = &self.worker {
+            worker.send(WorkerCmd::LoadColumns {
+                session_id,
+                req_id,
+                connect_req_id,
+                schema,
+                object,
+            });
         }
     }
 
@@ -2872,10 +3037,11 @@ impl AppState {
         let page_req = has_worker.then(|| self.alloc_req_id());
         let struct_req = has_worker.then(|| self.alloc_req_id());
 
-        let page_request = {
+        let (connect_req_id, page_request) = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
+            let connect_req_id = session.active_connect_req_id;
             let kind = session
                 .status
                 .as_connected()
@@ -2898,7 +3064,7 @@ impl AppState {
             let req = tab.as_table().map(TableTabState::page_request);
             session.tabs.push(tab);
             session.active_tab = Some(tab_id);
-            req
+            (connect_req_id, req)
         };
 
         self.sync_window_title(tx);
@@ -2908,6 +3074,7 @@ impl AppState {
                     session_id,
                     tab_id,
                     req_id,
+                    connect_req_id,
                     request,
                 });
             }
@@ -2916,6 +3083,7 @@ impl AppState {
                     session_id,
                     tab_id,
                     req_id,
+                    connect_req_id,
                     schema,
                     table: object,
                 });
@@ -2947,10 +3115,31 @@ impl AppState {
         let Screen::Workspace(session_id) = self.screen else {
             return;
         };
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
+        let (is_dirty, pos) = {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                return;
+            };
+            let is_dirty = session
+                .tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .and_then(WorkspaceTab::as_table)
+                .is_some_and(|t| t.staged.has_changes() || t.committing);
+            if is_dirty {
+                (true, 0)
+            } else {
+                let Some(pos) = session.tabs.iter().position(|t| t.id == tab_id) else {
+                    return;
+                };
+                (false, pos)
+            }
         };
-        let Some(pos) = session.tabs.iter().position(|t| t.id == tab_id) else {
+        if is_dirty {
+            self.focus_dirty_table_tab(session_id, tab_id, tx);
+            self.set_notice("Commit or discard staged changes before closing tab", true);
+            return;
+        }
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
         session.tabs.remove(pos);
@@ -3019,6 +3208,7 @@ impl AppState {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
+            let connect_req_id = session.active_connect_req_id;
             let Some(tab_id) = session.active_tab else {
                 return;
             };
@@ -3036,16 +3226,19 @@ impl AppState {
             {
                 tab.structure_loading = true;
                 tab.latest_structure_req = Some(rid);
-                Some((tab_id, rid, tab.schema.clone(), tab.object_name.clone()))
+                Some((tab_id, rid, connect_req_id, tab.schema.clone(), tab.object_name.clone()))
             } else {
                 None
             }
         };
-        if let (Some(worker), Some((tab_id, rid, schema, table))) = (&self.worker, desc_target) {
+        if let (Some(worker), Some((tab_id, rid, connect_req_id, schema, table))) =
+            (&self.worker, desc_target)
+        {
             worker.send(WorkerCmd::DescribeTable {
                 session_id,
                 tab_id,
                 req_id: rid,
+                connect_req_id,
                 schema,
                 table,
             });
@@ -3061,6 +3254,7 @@ impl AppState {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
+        let connect_req_id = session.active_connect_req_id;
         let Some(tab_id) = session.active_tab else {
             return;
         };
@@ -3073,6 +3267,7 @@ impl AppState {
             return;
         };
         tab.page_loading = true;
+        tab.pending_page = None;
         tab.latest_page_req = Some(rid);
         let request = tab.page_request();
         if let Some(worker) = &self.worker {
@@ -3080,6 +3275,7 @@ impl AppState {
                 session_id,
                 tab_id,
                 req_id: rid,
+                connect_req_id,
                 request,
             });
         }
@@ -3090,7 +3286,7 @@ impl AppState {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if tab.staged.has_changes() {
+            if tab.staged.has_changes() || tab.committing {
                 tab.diff_drawer_open = true;
                 true
             } else {
@@ -3118,7 +3314,7 @@ impl AppState {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if tab.staged.has_changes() {
+            if tab.staged.has_changes() || tab.committing {
                 tab.diff_drawer_open = true;
                 true
             } else {
@@ -3146,7 +3342,7 @@ impl AppState {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if tab.staged.has_changes() {
+            if tab.staged.has_changes() || tab.committing {
                 tab.diff_drawer_open = true;
                 true
             } else {
@@ -3178,7 +3374,7 @@ impl AppState {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if tab.staged.has_changes() {
+            if tab.staged.has_changes() || tab.committing {
                 tab.diff_drawer_open = true;
                 true
             } else {
@@ -3205,7 +3401,7 @@ impl AppState {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if tab.staged.has_changes() {
+            if tab.staged.has_changes() || tab.committing {
                 tab.page_size_open = false;
                 tab.diff_drawer_open = true;
                 true
@@ -3234,7 +3430,7 @@ impl AppState {
             let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
                 return;
             };
-            if tab.staged.has_changes() {
+            if tab.staged.has_changes() || tab.committing {
                 tab.diff_drawer_open = true;
                 blocked = true;
                 false
@@ -3273,6 +3469,21 @@ impl AppState {
     }
 
     pub fn reload_active_tab(&mut self) {
+        let blocked = self
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .is_some_and(|t| {
+                if t.staged.has_changes() || t.committing {
+                    t.diff_drawer_open = true;
+                    true
+                } else {
+                    false
+                }
+            });
+        if blocked {
+            self.set_notice("Commit or discard staged changes before reloading table", true);
+            return;
+        }
         self.dispatch_active_tab_page();
         let Screen::Workspace(session_id) = self.screen else {
             return;
@@ -3284,6 +3495,7 @@ impl AppState {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
+        let connect_req_id = session.active_connect_req_id;
         let Some(tab_id) = session.active_tab else {
             return;
         };
@@ -3299,6 +3511,7 @@ impl AppState {
                 session_id,
                 tab_id,
                 req_id,
+                connect_req_id,
                 schema,
                 table,
             });
@@ -3491,6 +3704,10 @@ impl AppState {
         let Some(tab) = session.active_table_tab() else {
             return false;
         };
+        if let Err(reason) = session.check_table_mutation_ready(tab) {
+            self.set_notice(reason, true);
+            return false;
+        }
         if let Err(reason) = tab.can_edit_table(policy) {
             self.set_notice(reason, true);
             return false;
@@ -3544,133 +3761,203 @@ impl AppState {
     }
 
     pub fn commit_inline_cell_edit(&mut self) {
-        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
-            return;
-        };
-        let Some(editing) = tab.editing_cell.take() else {
-            return;
-        };
-        let new_val = if editing.set_null {
-            StagedCellValue::Null
-        } else if editing.set_default {
-            StagedCellValue::DefaultExpr
-        } else {
-            StagedCellValue::Literal(editing.edit.text.clone())
-        };
-        match editing.row_key {
-            RowKey::Draft(id) => {
-                tab.staged.stage_insert_cell_edit(id, editing.col_idx, new_val);
-            }
-            RowKey::Existing(idx) => {
-                if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned() {
-                    tab.staged.stage_cell_edit(idx, &orig_row, editing.col_idx, new_val);
+        let blocked_reason = {
+            let Some(session) = self.active_session_mut() else {
+                return;
+            };
+            let db_switching = session.pending_db_switch_req.is_some();
+            let Some(tab) = session.active_table_tab_mut() else {
+                return;
+            };
+            if tab.committing || db_switching {
+                tab.editing_cell = None;
+                Some(if tab.committing {
+                    "Wait for staged changes commit to finish before editing"
+                } else {
+                    "Wait for database switch to finish before editing"
+                })
+            } else {
+                let Some(editing) = tab.editing_cell.take() else {
+                    return;
+                };
+                let new_val = if editing.set_null {
+                    StagedCellValue::Null
+                } else if editing.set_default {
+                    StagedCellValue::DefaultExpr
+                } else {
+                    StagedCellValue::Literal(editing.edit.text.clone())
+                };
+                match editing.row_key {
+                    RowKey::Draft(id) => {
+                        tab.staged.stage_insert_cell_edit(id, editing.col_idx, new_val);
+                    }
+                    RowKey::Existing(idx) => {
+                        if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned()
+                        {
+                            tab.staged.stage_cell_edit(idx, &orig_row, editing.col_idx, new_val);
+                        }
+                    }
                 }
+                tab.mark_staged_mutated();
+                tab.commit_error = None;
+                tab.rebuild_diff_state();
+                tab.apply_pending_page_if_clean();
+                None
             }
+        };
+        if let Some(reason) = blocked_reason {
+            self.set_notice(reason, true);
         }
-        tab.commit_error = None;
-        tab.rebuild_diff_state();
     }
 
     pub fn stage_cell_null(&mut self, row_key: RowKey, col_idx: usize) {
-        let Some(policy) = self.active_session().map(|s| s.profile.safety) else {
-            return;
-        };
-        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
-            return;
-        };
-        if let Err(reason) = tab.can_edit_table(policy) {
-            self.set_notice(reason, true);
-            return;
-        }
-        if matches!(row_key, RowKey::Existing(_)) && !tab.has_primary_key() {
-            self.set_notice("Table requires a primary key to edit existing rows safely", true);
-            return;
-        }
-        if tab
-            .columns()
-            .and_then(|c| c.get(col_idx))
-            .is_some_and(|c| !c.nullable)
-        {
-            self.set_notice("Column is NOT NULL", true);
-            return;
-        }
-        tab.editing_cell = None;
-        match row_key {
-            RowKey::Draft(id) => tab.staged.stage_insert_cell_edit(id, col_idx, StagedCellValue::Null),
-            RowKey::Existing(idx) => {
-                if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned() {
-                    tab.staged.stage_cell_edit(idx, &orig_row, col_idx, StagedCellValue::Null);
+        let error_notice = {
+            let Some(session) = self.active_session_mut() else {
+                return;
+            };
+            let policy = session.profile.safety;
+            let db_switching = session.pending_db_switch_req.is_some();
+            let Some(tab) = session.active_table_tab_mut() else {
+                return;
+            };
+            if tab.committing {
+                Some("Wait for staged changes commit to finish before editing")
+            } else if db_switching {
+                Some("Wait for database switch to finish before editing")
+            } else if let Err(reason) = tab.can_edit_table(policy) {
+                Some(reason)
+            } else if matches!(row_key, RowKey::Existing(_)) && !tab.has_primary_key() {
+                Some("Table requires a primary key to edit existing rows safely")
+            } else if tab
+                .columns()
+                .and_then(|c| c.get(col_idx))
+                .is_some_and(|c| !c.nullable)
+            {
+                Some("Column is NOT NULL")
+            } else {
+                tab.editing_cell = None;
+                match row_key {
+                    RowKey::Draft(id) => {
+                        tab.staged.stage_insert_cell_edit(id, col_idx, StagedCellValue::Null);
+                    }
+                    RowKey::Existing(idx) => {
+                        if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned()
+                        {
+                            tab.staged
+                                .stage_cell_edit(idx, &orig_row, col_idx, StagedCellValue::Null);
+                        }
+                    }
                 }
+                tab.mark_staged_mutated();
+                tab.commit_error = None;
+                tab.rebuild_diff_state();
+                tab.apply_pending_page_if_clean();
+                None
             }
+        };
+        if let Some(msg) = error_notice {
+            self.set_notice(msg, true);
         }
-        tab.commit_error = None;
-        tab.rebuild_diff_state();
     }
 
     pub fn insert_staged_row(&mut self, tx: &mut Tx) -> bool {
-        let Some(policy) = self.active_session().map(|s| s.profile.safety) else {
-            return false;
-        };
-        let first_editable = {
-            let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
+        let outcome: Result<(RowKey, usize), &'static str> = {
+            let Some(session) = self.active_session_mut() else {
                 return false;
             };
-            if let Err(reason) = tab.can_edit_table(policy) {
-                self.set_notice(reason, true);
+            let policy = session.profile.safety;
+            let db_switching = session.pending_db_switch_req.is_some();
+            let Some(tab) = session.active_table_tab_mut() else {
                 return false;
+            };
+            if tab.committing {
+                Err("Wait for staged changes commit to finish before editing")
+            } else if db_switching {
+                Err("Wait for database switch to finish before editing")
+            } else if let Err(reason) = tab.can_edit_table(policy) {
+                Err(reason)
+            } else if let Some(cols) = tab.columns().map(|c| c.to_vec()) {
+                let draft_id = tab.staged.stage_insert_row(&cols);
+                let col_idx = cols
+                    .iter()
+                    .position(|c| c.default_expr.is_none() && !c.is_primary_key)
+                    .unwrap_or(0);
+                tab.mark_staged_mutated();
+                tab.commit_error = None;
+                tab.fk_peek = None;
+                tab.row_menu = None;
+                tab.rebuild_diff_state();
+                Ok((RowKey::Draft(draft_id), col_idx))
+            } else {
+                Err("Load table columns before inserting a row")
             }
-            let Some(cols) = tab.columns().map(|c| c.to_vec()) else {
-                self.set_notice("Load table columns before inserting a row", true);
-                return false;
-            };
-            let draft_id = tab.staged.stage_insert_row(&cols);
-            let col_idx = cols
-                .iter()
-                .position(|c| c.default_expr.is_none() && !c.is_primary_key)
-                .unwrap_or(0);
-            tab.commit_error = None;
-            tab.fk_peek = None;
-            tab.row_menu = None;
-            tab.rebuild_diff_state();
-            (RowKey::Draft(draft_id), col_idx)
         };
-        self.begin_cell_edit(first_editable.0, first_editable.1, tx)
+        match outcome {
+            Ok((row_key, col_idx)) => self.begin_cell_edit(row_key, col_idx, tx),
+            Err(reason) => {
+                self.set_notice(reason, true);
+                false
+            }
+        }
     }
 
     pub fn toggle_delete_row(&mut self, row_key: RowKey) {
-        let Some(policy) = self.active_session().map(|s| s.profile.safety) else {
-            return;
-        };
-        let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) else {
-            return;
-        };
-        if let Err(reason) = tab.can_edit_table(policy) {
-            self.set_notice(reason, true);
-            return;
-        }
-        tab.editing_cell = None;
-        tab.row_menu = None;
-        match row_key {
-            RowKey::Draft(id) => {
-                tab.staged.remove_insert_row(id);
-                if tab.selected_row_key == Some(row_key) {
-                    tab.selected_row_key = None;
-                    tab.selected_cell = None;
-                    tab.data_table.clear_selection();
+        let error_notice = {
+            let Some(session) = self.active_session_mut() else {
+                return;
+            };
+            let policy = session.profile.safety;
+            let db_switching = session.pending_db_switch_req.is_some();
+            let Some(tab) = session.active_table_tab_mut() else {
+                return;
+            };
+            if tab.committing {
+                Some("Wait for staged changes commit to finish before editing")
+            } else if db_switching {
+                Some("Wait for database switch to finish before editing")
+            } else if let Err(reason) = tab.can_edit_table(policy) {
+                Some(reason)
+            } else {
+                match row_key {
+                    RowKey::Draft(id) => {
+                        tab.editing_cell = None;
+                        tab.row_menu = None;
+                        tab.staged.remove_insert_row(id);
+                        if tab.selected_row_key == Some(row_key) {
+                            tab.selected_row_key = None;
+                            tab.selected_cell = None;
+                            tab.data_table.clear_selection();
+                        }
+                        tab.mark_staged_mutated();
+                        tab.commit_error = None;
+                        tab.rebuild_diff_state();
+                        tab.apply_pending_page_if_clean();
+                        None
+                    }
+                    RowKey::Existing(idx) => {
+                        if !tab.has_primary_key() {
+                            Some("Table requires a primary key to delete existing rows safely")
+                        } else {
+                            tab.editing_cell = None;
+                            tab.row_menu = None;
+                            if let Some(orig_row) =
+                                tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned()
+                            {
+                                tab.staged.toggle_delete_row(idx, &orig_row);
+                                tab.mark_staged_mutated();
+                            }
+                            tab.commit_error = None;
+                            tab.rebuild_diff_state();
+                            tab.apply_pending_page_if_clean();
+                            None
+                        }
+                    }
                 }
             }
-            RowKey::Existing(idx) => {
-                if !tab.has_primary_key() {
-                    self.set_notice("Table requires a primary key to delete existing rows safely", true);
-                    return;
-                }
-                if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned() {
-                    tab.staged.toggle_delete_row(idx, &orig_row);
-                }
-            }
+        };
+        if let Some(msg) = error_notice {
+            self.set_notice(msg, true);
         }
-        tab.commit_error = None;
-        tab.rebuild_diff_state();
     }
 
     pub fn toggle_delete_selected_row(&mut self) {
@@ -3704,19 +3991,39 @@ impl AppState {
     }
 
     pub fn discard_staged_changes(&mut self) {
-        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
-            tab.staged.clear();
-            tab.editing_cell = None;
-            tab.commit_error = None;
-            tab.diff_drawer_open = false;
-            if matches!(tab.selected_row_key, Some(RowKey::Draft(_))) {
-                tab.selected_row_key = None;
-                tab.selected_cell = None;
-                tab.data_table.clear_selection();
+        let blocked_reason = {
+            let Some(session) = self.active_session_mut() else {
+                return;
+            };
+            let db_switching = session.pending_db_switch_req.is_some();
+            let Some(tab) = session.active_table_tab_mut() else {
+                return;
+            };
+            if tab.committing {
+                Some("Wait for staged changes commit to finish before discarding")
+            } else if db_switching {
+                Some("Wait for database switch to finish before discarding")
+            } else {
+                tab.staged.clear();
+                tab.mark_staged_mutated();
+                tab.editing_cell = None;
+                tab.commit_error = None;
+                tab.diff_drawer_open = false;
+                if matches!(tab.selected_row_key, Some(RowKey::Draft(_))) {
+                    tab.selected_row_key = None;
+                    tab.selected_cell = None;
+                    tab.data_table.clear_selection();
+                }
+                tab.rebuild_diff_state();
+                tab.apply_pending_page_if_clean();
+                None
             }
-            tab.rebuild_diff_state();
+        };
+        if let Some(reason) = blocked_reason {
+            self.set_notice(reason, true);
+        } else {
+            self.set_notice("Discarded staged changes", false);
         }
-        self.set_notice("Discarded staged changes", false);
     }
 
     pub fn commit_staged_changes(&mut self) {
@@ -3728,43 +4035,56 @@ impl AppState {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
-            let engine = session.profile.engine;
-            let policy = session.profile.safety;
-            let connect_req_id = session.active_connect_req_id;
-            let Some(tab_id) = session.active_tab else {
-                return;
-            };
-            let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
-                return;
-            };
-            if tab.committing {
-                return;
-            }
-            if let Err(msg) = evaluate_staged_commit_safety(policy) {
-                tab.commit_error = Some(msg);
-                return;
-            }
-            let Some(cols) = tab.columns().map(|c| c.to_vec()) else {
-                tab.commit_error = Some("Missing table columns metadata".to_owned());
-                return;
-            };
-            let stmts = match tab
-                .staged
-                .build_statements_for_engine(engine, &tab.schema, &tab.object_name, &cols)
-            {
-                Ok(s) => s,
-                Err(err) => {
-                    tab.commit_error = Some(err.to_string());
+            if session.pending_db_switch_req.is_some() {
+                None
+            } else {
+                let engine = session.profile.engine;
+                let policy = session.profile.safety;
+                let connect_req_id = session.active_connect_req_id;
+                let Some(tab_id) = session.active_tab else {
+                    return;
+                };
+                let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+                    return;
+                };
+                if tab.committing {
                     return;
                 }
-            };
-            tab.committing = true;
-            tab.commit_req_id = Some(req_id);
-            tab.commit_error = None;
-            Some((tab_id, connect_req_id, stmts))
+                if let Err(msg) = evaluate_staged_commit_safety(policy) {
+                    tab.commit_error = Some(msg);
+                    return;
+                }
+                let Some(cols) = tab.columns().map(|c| c.to_vec()) else {
+                    tab.commit_error = Some("Missing table columns metadata".to_owned());
+                    return;
+                };
+                let stmts = match tab
+                    .staged
+                    .build_statements_for_engine(engine, &tab.schema, &tab.object_name, &cols)
+                {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tab.commit_error = Some(err.to_string());
+                        return;
+                    }
+                };
+                tab.editing_cell = None;
+                tab.committing = true;
+                tab.commit_req_id = Some(req_id);
+                tab.commit_staged_gen = Some(tab.staged_gen);
+                tab.commit_error = None;
+                Some((tab_id, connect_req_id, stmts))
+            }
         };
 
         let Some((tab_id, connect_req_id, statements)) = dispatch else {
+            if self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|s| s.pending_db_switch_req.is_some())
+            {
+                self.set_notice("Wait for database switch to finish before committing staged changes", true);
+            }
             return;
         };
         if let Some(worker) = &self.worker {
@@ -3778,7 +4098,9 @@ impl AppState {
         } else if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
             tab.committing = false;
             tab.commit_req_id = None;
+            tab.commit_staged_gen = None;
             tab.staged.clear();
+            tab.mark_staged_mutated();
             tab.diff_drawer_open = false;
             tab.rebuild_diff_state();
             self.set_notice("Committed staged changes", false);
@@ -3803,6 +4125,7 @@ impl AppState {
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
         };
+        let connect_req_id = session.active_connect_req_id;
         let Some(tab_id) = session.active_tab else {
             return;
         };
@@ -3824,6 +4147,7 @@ impl AppState {
                 session_id,
                 tab_id,
                 req_id: rid,
+                connect_req_id,
                 fk,
                 value,
                 source_col,
@@ -3855,12 +4179,25 @@ impl AppState {
             return;
         };
         self.close_fk_peek();
-        let existing_tab_id = self.sessions.get(&session_id).and_then(|sess| {
-            sess.tabs
-                .iter()
-                .find(|t| t.schema_and_name() == Some((fk.target_schema.as_str(), fk.target_table.as_str())))
-                .map(|t| t.id)
-        });
+        let (existing_tab_id, existing_dirty) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|sess| {
+                sess.tabs
+                    .iter()
+                    .find(|t| t.schema_and_name() == Some((fk.target_schema.as_str(), fk.target_table.as_str())))
+                    .map(|t| (Some(t.id), t.as_table().is_some_and(|tt| tt.staged.has_changes() || tt.committing)))
+            })
+            .unwrap_or((None, false));
+
+        if let (Some(dirty_tid), true) = (existing_tab_id, existing_dirty) {
+            self.focus_dirty_table_tab(session_id, dirty_tid, tx);
+            self.set_notice(
+                "Commit or discard staged changes on target table before filtering by foreign key",
+                true,
+            );
+            return;
+        }
 
         let has_worker = self.worker.is_some();
         let page_req = has_worker.then(|| self.alloc_req_id());
@@ -3872,10 +4209,11 @@ impl AppState {
             self.alloc_tab_id()
         };
 
-        let request = {
+        let (connect_req_id, request) = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
+            let connect_req_id = session.active_connect_req_id;
             if existing_tab_id.is_none() {
                 let kind = session
                     .status
@@ -3920,9 +4258,10 @@ impl AppState {
             tab.auto_select_first_row = true;
             if let Some(rid) = page_req {
                 tab.page_loading = true;
+                tab.pending_page = None;
                 tab.latest_page_req = Some(rid);
             }
-            tab.page_request()
+            (connect_req_id, tab.page_request())
         };
 
         self.sync_window_title(tx);
@@ -3932,6 +4271,7 @@ impl AppState {
                     session_id,
                     tab_id,
                     req_id: rid,
+                    connect_req_id,
                     request,
                 });
             }
@@ -3940,6 +4280,7 @@ impl AppState {
                     session_id,
                     tab_id,
                     req_id: rid,
+                    connect_req_id,
                     schema: fk.target_schema,
                     table: fk.target_table,
                 });
@@ -4068,6 +4409,7 @@ impl AppState {
             return false;
         };
         struct ReadyQuery {
+            connect_req_id: RequestId,
             tab_id: TabId,
             engine: DbEngine,
             sql_mode: SqlSessionMode,
@@ -4081,6 +4423,7 @@ impl AppState {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return false;
             };
+            let connect_req_id = session.active_connect_req_id;
             let engine = session.profile.engine;
             let policy = session.profile.safety;
             let env = session.profile.env;
@@ -4113,6 +4456,7 @@ impl AppState {
             };
 
             ReadyQuery {
+                connect_req_id,
                 tab_id,
                 engine,
                 sql_mode,
@@ -4125,6 +4469,7 @@ impl AppState {
         };
 
         let ReadyQuery {
+            connect_req_id,
             tab_id,
             engine,
             sql_mode,
@@ -4172,6 +4517,7 @@ impl AppState {
             } => {
                 self.overlay = OverlayState::SafetyConfirm(Box::new(SafetyConfirmModalState {
                     session_id,
+                    connect_req_id,
                     tab_id,
                     policy,
                     env,
@@ -4196,6 +4542,7 @@ impl AppState {
             return false;
         };
         struct ReadyExplain {
+            connect_req_id: RequestId,
             tab_id: TabId,
             engine: DbEngine,
             sql_mode: SqlSessionMode,
@@ -4204,6 +4551,7 @@ impl AppState {
             statement: String,
         }
         let ReadyExplain {
+            connect_req_id,
             tab_id,
             engine,
             sql_mode,
@@ -4214,6 +4562,7 @@ impl AppState {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return false;
             };
+            let connect_req_id = session.active_connect_req_id;
             let engine = session.profile.engine;
             let policy = session.profile.safety;
             let env = session.profile.env;
@@ -4260,6 +4609,7 @@ impl AppState {
             }
             let first = stmts.into_iter().next().unwrap_or_default();
             ReadyExplain {
+                connect_req_id,
                 tab_id,
                 engine,
                 sql_mode,
@@ -4299,6 +4649,7 @@ impl AppState {
                 } => {
                     self.overlay = OverlayState::SafetyConfirm(Box::new(SafetyConfirmModalState {
                         session_id,
+                        connect_req_id,
                         tab_id,
                         policy,
                         env,
@@ -4337,26 +4688,41 @@ impl AppState {
                 approved_sql_mode.clone()
             }
         };
-        if let Some(session) = self.sessions.get(&modal.session_id) {
-            if session.profile.engine == DbEngine::Mysql
-                && session.mysql_quote_mode() != approved_mode.mysql
-            {
-                self.set_notice(
-                    "MySQL session mode changed before confirmation; re-run to inspect under the current mode",
-                    true,
-                );
-                return;
-            }
-            if session.profile.engine == DbEngine::Postgres
-                && approved_mode.postgres.is_some()
-                && session.postgres_session_mode() != approved_mode.postgres
-            {
-                self.set_notice(
-                    "PostgreSQL string escaping mode changed before confirmation; re-run to inspect under the current mode",
-                    true,
-                );
-                return;
-            }
+        let Some(session) = self.sessions.get(&modal.session_id) else {
+            self.set_notice(
+                "Connection closed before confirmation; re-run to execute",
+                true,
+            );
+            return;
+        };
+        if session.active_connect_req_id != modal.connect_req_id
+            || session.profile.safety != modal.policy
+            || session.profile.env != modal.env
+        {
+            self.set_notice(
+                "Connection or safety policy changed before confirmation; re-run to inspect under the current connection",
+                true,
+            );
+            return;
+        }
+        if session.profile.engine == DbEngine::Mysql
+            && session.mysql_quote_mode() != approved_mode.mysql
+        {
+            self.set_notice(
+                "MySQL session mode changed before confirmation; re-run to inspect under the current mode",
+                true,
+            );
+            return;
+        }
+        if session.profile.engine == DbEngine::Postgres
+            && approved_mode.postgres.is_some()
+            && session.postgres_session_mode() != approved_mode.postgres
+        {
+            self.set_notice(
+                "PostgreSQL string escaping mode changed before confirmation; re-run to inspect under the current mode",
+                true,
+            );
+            return;
         }
         match modal.pending {
             PendingProtectedAction::ExecuteSql {
@@ -4747,10 +5113,44 @@ impl AppState {
         }
     }
 
+    pub fn apply_updated_profile_to_active_session(&mut self, tx: &mut Tx) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(session) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let conn_id = session.profile.id;
+        if let Some(dirty_tab_id) = session.first_dirty_table_tab_id() {
+            self.focus_dirty_table_tab(session_id, dirty_tab_id, tx);
+            self.set_notice(
+                "Commit or discard staged edits before connecting to the updated target.",
+                true,
+            );
+            return;
+        }
+        if !self.connections.iter().any(|c| c.id == conn_id) {
+            return;
+        }
+        self.start_connection_inner(conn_id, None, None, true, tx);
+    }
+
     pub fn reconnect_active(&mut self, tx: &mut Tx) {
         let Screen::Workspace(session_id) = self.screen else {
             return;
         };
+        if let Some(session) = self.sessions.get(&session_id)
+            && self
+                .pending_profile_save
+                .as_ref()
+                .is_some_and(|p| p.profile.id == session.profile.id)
+        {
+            self.set_notice(
+                "Wait for the pending profile save to finish before reconnecting",
+                true,
+            );
+            return;
+        }
         let req_id = self.alloc_req_id();
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return;
@@ -4762,9 +5162,21 @@ impl AppState {
         let preferred_schema = ctx.active_schema;
         let profile = session.profile.clone();
         let pw = session.session_password.clone();
-        if profile.engine != DbEngine::Sqlite && profile.password_mode == PasswordMode::AskEveryTime && pw.is_none() {
+        let prompt_for_out_of_sync_keychain = session.profile_out_of_sync
+            && profile.engine != DbEngine::Sqlite
+            && profile.password_mode == PasswordMode::Keychain
+            && pw.is_none();
+        if prompt_for_out_of_sync_keychain
+            || (profile.engine != DbEngine::Sqlite
+                && profile.password_mode == PasswordMode::AskEveryTime
+                && pw.is_none())
+        {
             let conn_id = profile.id;
             let name = profile.name.clone();
+            let error = prompt_for_out_of_sync_keychain.then(|| {
+                "Profile settings changed; enter password to reconnect to the previous target, or click Apply Profile."
+                    .to_owned()
+            });
             self.overlay = OverlayState::PasswordPrompt(PasswordPromptState {
                 session_id: Some(session_id),
                 connection_id: conn_id,
@@ -4772,7 +5184,7 @@ impl AppState {
                 database_override: active_db,
                 preferred_schema,
                 password: TextEdit::new(""),
-                error: None,
+                error,
             });
             tx.focus_when_shown("password-prompt-input", true);
             return;
@@ -5048,6 +5460,7 @@ impl AppState {
                             if let Some(t) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) {
                                 if let Some(rid) = p_req {
                                     t.page_loading = true;
+                                    t.pending_page = None;
                                     t.page_error = None;
                                     t.reload_on_reconnect = false;
                                     t.latest_page_req = Some(rid);
@@ -5089,19 +5502,21 @@ impl AppState {
                 }
 
                 if let Some(worker) = &self.worker {
-                    for (tab_id, request, req_id) in page_reloads {
+                    for (tab_id, request, page_req) in page_reloads {
                         worker.send(WorkerCmd::FetchTablePage {
                             session_id,
                             tab_id,
-                            req_id,
+                            req_id: page_req,
+                            connect_req_id: req_id,
                             request,
                         });
                     }
-                    for (tab_id, schema, table, req_id) in struct_reloads {
+                    for (tab_id, schema, table, struct_req) in struct_reloads {
                         worker.send(WorkerCmd::DescribeTable {
                             session_id,
                             tab_id,
-                            req_id,
+                            req_id: struct_req,
+                            connect_req_id: req_id,
                             schema,
                             table,
                         });
@@ -5198,7 +5613,9 @@ impl AppState {
                         session.active_connect_req_id = req_id;
                         session.latest_req_id = req_id;
                         clear_password_prompt = true;
-                    } else if session.latest_req_id != req_id {
+                    } else if session.latest_req_id != req_id
+                        || !matches!(session.status, ConnectionState::Connected(_))
+                    {
                         return;
                     }
                     append_logs(&mut session.console_entries, logs);
@@ -5291,7 +5708,7 @@ impl AppState {
 
             WorkerEvent::ColumnsLoaded {
                 session_id,
-                req_id: _,
+                req_id,
                 schema,
                 object,
                 columns,
@@ -5300,11 +5717,12 @@ impl AppState {
                 let Some(session) = self.sessions.get_mut(&session_id) else {
                     return;
                 };
-                append_logs(&mut session.console_entries, logs);
                 if let ConnectionState::Connected(ref mut data) = session.status
                     && let std::collections::hash_map::Entry::Occupied(mut entry) =
                         data.expanded_columns.entry((schema, object))
+                    && matches!(entry.get(), ColumnLoadState::Loading(pending) if *pending == req_id)
                 {
+                    append_logs(&mut session.console_entries, logs);
                     match columns {
                         Ok(cols) => {
                             entry.insert(ColumnLoadState::Loaded(cols));
@@ -5339,31 +5757,22 @@ impl AppState {
                 tab.page_loading = false;
                 match result {
                     Ok(page) => {
-                        let row_count = page.rows.len();
-                        let auto_select = tab.auto_select_first_row;
-                        tab.auto_select_first_row = false;
-                        tab.page = Some(page);
-                        tab.page_error = None;
-                        tab.filter_error = None;
-                        tab.reload_on_reconnect = false;
-                        tab.editing_cell = None;
-                        tab.staged.clear();
-                        tab.rebuild_diff_state();
-                        if auto_select && row_count > 0 {
-                            tab.selected_row = Some(0);
-                            tab.selected_row_key = Some(RowKey::Existing(0));
-                            tab.selected_cell = Some((RowKey::Existing(0), 0));
-                            tab.data_table.select("r-0".to_owned());
-                        } else if let Some(sel) = tab.selected_row
-                            && sel >= row_count
-                        {
-                            tab.selected_row = None;
-                            tab.selected_row_key = None;
-                            tab.selected_cell = None;
-                            tab.data_table.clear_selection();
+                        let preserve_staged = tab.committing || tab.staged.has_changes();
+                        let can_populate_initial_page_around_inserts = tab.page.is_none()
+                            && tab.staged.updates.is_empty()
+                            && tab.staged.deletes.is_empty()
+                            && !tab.committing;
+                        if preserve_staged && !can_populate_initial_page_around_inserts {
+                            tab.pending_page = Some(page);
+                            tab.page_error = None;
+                            tab.filter_error = None;
+                            tab.reload_on_reconnect = false;
+                        } else {
+                            tab.apply_page(page, !preserve_staged);
                         }
                     }
                     Err(err) => {
+                        tab.pending_page = None;
                         if matches!(err, tv_core::DbError::Disconnected) {
                             tab.reload_on_reconnect = true;
                         } else if tab.applied_filter.is_some() && tab.page.is_some() {
@@ -5640,29 +6049,34 @@ impl AppState {
                 result,
                 logs,
             } => {
-                let mut reload_target: Option<(TabId, PageRequest)> = None;
+                let mut reload_target: Option<(TabId, RequestId, PageRequest)> = None;
                 let mut notice: Option<(String, bool)> = None;
 
                 {
                     let Some(session) = self.sessions.get_mut(&session_id) else {
                         return;
                     };
+                    let connect_req_id = session.active_connect_req_id;
                     append_logs(&mut session.console_entries, logs);
 
                     if let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut)
                         && tab.commit_req_id == Some(req_id)
                     {
+                        let commit_gen = tab.commit_staged_gen.take();
                         tab.committing = false;
                         tab.commit_req_id = None;
                         match result {
                             Ok(outcome) => {
                                 let changes = tab.staged.change_count();
-                                tab.staged.clear();
-                                tab.diff_drawer_open = false;
+                                if commit_gen == Some(tab.staged_gen) {
+                                    tab.staged.clear();
+                                    tab.mark_staged_mutated();
+                                    tab.diff_drawer_open = false;
+                                }
                                 tab.commit_error = None;
                                 tab.editing_cell = None;
                                 tab.rebuild_diff_state();
-                                reload_target = Some((tab_id, tab.page_request()));
+                                reload_target = Some((tab_id, connect_req_id, tab.page_request()));
                                 notice = Some((
                                     format!(
                                         "Committed {changes} change(s) ({} rows affected · {} ms)",
@@ -5684,7 +6098,7 @@ impl AppState {
                 if let Some((msg, is_err)) = notice {
                     self.set_notice(msg, is_err);
                 }
-                if let Some((tid, request)) = reload_target {
+                if let Some((tid, connect_req_id, request)) = reload_target {
                     let next_req = self.alloc_req_id();
                     if let Some(t) = self
                         .sessions
@@ -5693,6 +6107,7 @@ impl AppState {
                         .and_then(WorkspaceTab::as_table_mut)
                     {
                         t.page_loading = true;
+                        t.pending_page = None;
                         t.latest_page_req = Some(next_req);
                     }
                     if let Some(worker) = &self.worker {
@@ -5700,6 +6115,7 @@ impl AppState {
                             session_id,
                             tab_id: tid,
                             req_id: next_req,
+                            connect_req_id,
                             request,
                         });
                     }
@@ -5918,12 +6334,21 @@ impl AppState {
                     self.pending_credential_deletes.remove(&pending.profile.id);
                     if pending.cancelled {
                         let name = pending.profile.name.clone();
-                        let merged_recent = self.apply_saved_profile_to_state(
+                        let (merged_recent, any_out_of_sync) = self.apply_saved_profile_to_state(
                             &pending.profile,
                             pending.next_store,
-                            &pending.password_update,
+                            pending.password_mutated,
                         );
-                        self.set_notice(format!("Saved connection \"{name}\""), false);
+                        if any_out_of_sync {
+                            self.set_notice(
+                                format!(
+                                    "Saved connection \"{name}\". Reconnect the active session to apply updated settings."
+                                ),
+                                false,
+                            );
+                        } else {
+                            self.set_notice(format!("Saved connection \"{name}\""), false);
+                        }
                         self.persist_merged_recent_if_needed(merged_recent);
                     } else {
                         self.finish_profile_save(pending, None, tx);
@@ -5951,7 +6376,7 @@ impl AppState {
                             let _ = self.apply_saved_profile_to_state(
                                 &pending.profile,
                                 pending.next_store,
-                                &pending.password_update,
+                                pending.password_mutated,
                             );
                             if form_matches
                                 && let OverlayState::ConnectionForm(ref mut form) = self.overlay
