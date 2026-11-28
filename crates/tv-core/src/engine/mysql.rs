@@ -1557,7 +1557,7 @@ pub fn build_mysql_opts(
             .ip_or_hostname(host)
             .tcp_port(profile.port)
             .prefer_socket(false)
-            .tcp_keepalive(Some(60_000u32));
+            .tcp_keepalive(Some(Duration::from_secs(60)));
     }
 
     builder = builder.user(Some(profile.user.trim()));
@@ -2487,7 +2487,7 @@ mod tests {
     fn builds_mysql_opts_sets_tcp_keepalive_only_for_tcp_hosts() {
         let tcp_profile = ConnectionProfile::new_mysql("greendale_mysql", "db.greendale.edu", "abed");
         let tcp_opts = build_mysql_opts(&tcp_profile, Some("secret"), Some("study_room"), None);
-        assert_eq!(tcp_opts.tcp_keepalive(), Some(60_000));
+        assert_eq!(tcp_opts.tcp_keepalive(), Some(Duration::from_secs(60)));
 
         let mut sock_profile = ConnectionProfile::new_mysql("local_sock", "/tmp/mysql.sock", "abed");
         sock_profile.password_mode = PasswordMode::None;

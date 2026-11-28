@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-scripts:
+    name: Lint scripts and feed verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Lint release scripts
+        run: shellcheck scripts/bundle-macos-app.sh scripts/release-macos.sh
+
+      - name: Verify feed scripts
+        run: |
+          python3 -B -m py_compile scripts/verify-published-feeds.py
+          python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+
+  advisories:
+    name: Check RustSec advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Check advisories with cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@bb119f768ea239e765aeaef5769558d4f21213aa # v2
+        with:
+          command: check advisories
+          arguments: --locked
+
+  test-macos:
+    name: Clippy and test workspace (macOS)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Configure macOS deployment target
+        run: |
+          target="$(plutil -extract LSMinimumSystemVersion raw -o - packaging/macos/Info.plist)"
+          echo "MACOSX_DEPLOYMENT_TARGET=${target}" >>"${GITHUB_ENV}"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-macos-rust
+          env-vars: MACOSX_DEPLOYMENT_TARGET
+
+      - name: Lint and test
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+
+  db-integration:
+    name: Live PostgreSQL and MySQL integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: greendale
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: greendale
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pgreendale"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-linux-db
+
+      - name: Run live PostgreSQL integration tests
+        env:
+          POSTGRES_TEST_URL: postgres://postgres:greendale@127.0.0.1:5432/postgres?sslmode=disable
+        run: cargo test --locked -p tv-core --test postgres_live -- --ignored
+
+      - name: Run live MySQL integration tests
+        env:
+          MYSQL_TEST_URL: mysql://root:greendale@127.0.0.1:3306
+        run: cargo test --locked -p tv-core --test mysql_live -- --ignored

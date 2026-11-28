@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -8,6 +6,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, TrustAnchor, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore, SignatureScheme};
 use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
@@ -1347,16 +1346,18 @@ pub fn synthesize_table_ddl(
     out
 }
 
-async fn connect_raw(
+fn build_pg_config(
     profile: &ConnectionProfile,
     password: Option<&str>,
     database: &str,
-) -> Result<(tokio_postgres::Client, JoinHandle<()>, Arc<AtomicBool>, bool), DbError> {
+) -> (Config, bool) {
     let mut cfg = Config::new();
     let host = profile.host.trim();
     cfg.host(host);
-    if !host.starts_with('/') {
+    if profile.port > 0 {
         cfg.port(profile.port);
+    }
+    if !host.starts_with('/') {
         cfg.keepalives(true);
         cfg.keepalives_idle(Duration::from_secs(60));
         cfg.keepalives_interval(Duration::from_secs(10));
@@ -1373,11 +1374,24 @@ async fn connect_raw(
     cfg.connect_timeout(CONNECT_TIMEOUT);
     cfg.application_name("TableView");
 
-    let use_tls = match profile.ssl.mode {
-        SslMode::Disable => false,
-        SslMode::Prefer => !host.starts_with('/'),
-        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => true,
+    let (pg_ssl_mode, use_tls) = match profile.ssl.mode {
+        SslMode::Disable => (tokio_postgres::config::SslMode::Disable, false),
+        SslMode::Prefer if host.starts_with('/') => (tokio_postgres::config::SslMode::Disable, false),
+        SslMode::Prefer => (tokio_postgres::config::SslMode::Prefer, true),
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+            (tokio_postgres::config::SslMode::Require, true)
+        }
     };
+    cfg.ssl_mode(pg_ssl_mode);
+    (cfg, use_tls)
+}
+
+async fn connect_raw(
+    profile: &ConnectionProfile,
+    password: Option<&str>,
+    database: &str,
+) -> Result<(tokio_postgres::Client, JoinHandle<()>, Arc<AtomicBool>, bool), DbError> {
+    let (mut cfg, use_tls) = build_pg_config(profile, password, database);
 
     if !use_tls {
         let (c, h, d) = connect_no_tls(&cfg).await?;
@@ -1393,6 +1407,7 @@ async fn connect_raw(
         }
         Ok(Err(err)) => {
             if profile.ssl.mode == SslMode::Prefer && err.as_db_error().is_none() {
+                cfg.ssl_mode(tokio_postgres::config::SslMode::Disable);
                 let (c, h, d) = connect_no_tls(&cfg).await?;
                 Ok((c, h, d, false))
             } else {
@@ -1511,19 +1526,24 @@ fn load_roots_and_anchors(ca_path: Option<&Path>) -> Result<(RootCertStore, Vec<
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, DbError> {
-    let file = File::open(path).map_err(|e| DbError::TlsConfig(format!("open {}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| map_pem_error("parse PEM certs", "open", path, e))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| DbError::TlsConfig(format!("parse PEM certs {}: {e}", path.display())))
+        .map_err(|e| map_pem_error("parse PEM certs", "open", path, e))
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, DbError> {
-    let file = File::open(path).map_err(|e| DbError::TlsConfig(format!("open {}: {e}", path.display())))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| DbError::TlsConfig(format!("parse private key {}: {e}", path.display())))?
-        .ok_or_else(|| DbError::TlsConfig(format!("no private key found in {}", path.display())))
+    PrivateKeyDer::from_pem_file(path).map_err(|e| match e {
+        PemError::NoItemsFound => DbError::TlsConfig(format!("no private key found in {}", path.display())),
+        other => map_pem_error("parse private key", "open", path, other),
+    })
+}
+
+fn map_pem_error(parse_ctx: &str, open_ctx: &str, path: &Path, error: PemError) -> DbError {
+    match error {
+        PemError::Io(io_err) => DbError::TlsConfig(format!("{open_ctx} {}: {io_err}", path.display())),
+        other => DbError::TlsConfig(format!("{parse_ctx} {}: {other}", path.display())),
+    }
 }
 
 #[derive(Debug)]
@@ -1671,7 +1691,45 @@ pub fn concise_pg_version(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{concise_pg_version, is_pg_disconnect_sqlstate, should_retire_after_cancel};
+    use crate::connection::{ConnectionProfile, SslMode};
+
+    use super::{build_pg_config, concise_pg_version, is_pg_disconnect_sqlstate, should_retire_after_cancel};
+
+    #[test]
+    fn build_pg_config_sets_expected_ssl_mode_for_every_profile_mode() {
+        let mut profile = ConnectionProfile::new_postgres("greendale_pg", "127.0.0.1", "troy");
+
+        profile.ssl.mode = SslMode::Disable;
+        let (cfg, use_tls) = build_pg_config(&profile, None, "postgres");
+        assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Disable);
+        assert!(!use_tls);
+
+        profile.ssl.mode = SslMode::Prefer;
+        let (cfg, use_tls) = build_pg_config(&profile, None, "postgres");
+        assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Prefer);
+        assert!(use_tls);
+
+        let mut socket_profile = ConnectionProfile::new_postgres("greendale_pg_sock", "/tmp", "troy");
+        socket_profile.ssl.mode = SslMode::Prefer;
+        socket_profile.port = 55432;
+        let (cfg, use_tls) = build_pg_config(&socket_profile, None, "postgres");
+        assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Disable);
+        assert_eq!(cfg.get_ports(), &[55432]);
+        assert!(!use_tls);
+
+        socket_profile.port = 0;
+        let (cfg, use_tls) = build_pg_config(&socket_profile, None, "postgres");
+        assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Disable);
+        assert!(cfg.get_ports().is_empty());
+        assert!(!use_tls);
+
+        for mode in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+            profile.ssl.mode = mode;
+            let (cfg, use_tls) = build_pg_config(&profile, None, "postgres");
+            assert_eq!(cfg.get_ssl_mode(), tokio_postgres::config::SslMode::Require);
+            assert!(use_tls);
+        }
+    }
 
     #[test]
     fn parses_concise_postgresql_version() {
@@ -1698,5 +1756,27 @@ mod tests {
         assert!(!should_retire_after_cancel(true, true));
         assert!(!should_retire_after_cancel(false, false));
         assert!(!should_retire_after_cancel(false, true));
+    }
+
+    #[test]
+    fn pem_loader_reports_missing_file_and_empty_key() {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("create temp dir");
+        };
+        let empty = dir.path().join("empty.pem");
+        if let Err(err) = std::fs::write(&empty, b"not a pem block") {
+            panic!("write empty pem: {err}");
+        }
+
+        let Err(err) = super::load_private_key(&empty) else {
+            panic!("expected missing private key error");
+        };
+        assert!(matches!(err, crate::engine::DbError::TlsConfig(msg) if msg.contains("no private key found")));
+
+        let missing = dir.path().join("missing.pem");
+        let Err(missing_err) = super::load_certs(&missing) else {
+            panic!("expected missing cert file error");
+        };
+        assert!(matches!(missing_err, crate::engine::DbError::TlsConfig(msg) if msg.contains("open ")));
     }
 }

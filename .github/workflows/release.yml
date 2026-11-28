@@ -123,7 +123,7 @@ jobs:
       - name: Lint and test
         run: |
           cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace -- --skip live_postgres
+          cargo test --locked --workspace
 
       - name: Import Developer ID signing certificate
         env:

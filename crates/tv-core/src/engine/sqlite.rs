@@ -775,7 +775,6 @@ fn execute_single_sqlite_stmt(
 
     let mut columns: Vec<ColumnMeta> = prepared
         .column_names()
-        .into_iter()
         .map(|name| ColumnMeta {
             name: name.to_owned(),
             data_type: String::new(),

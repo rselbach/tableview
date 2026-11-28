@@ -1,11 +1,11 @@
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
+use uuid::Uuid;
 use tv_core::engine::mysql::MysqlSession;
 use tv_core::{
     CellValue, ConnectionProfile, DbEngine, DbError, DbObjectKind, DbSession, ForeignKeyRef, PageRequest,
@@ -33,24 +33,27 @@ impl Drop for TempMysqlDatabaseGuard {
     }
 }
 
-fn resolve_test_connection() -> Option<(ConnectionProfile, Option<String>)> {
+fn resolve_test_connection() -> (ConnectionProfile, Option<String>) {
     if let Ok(url) = env::var("MYSQL_TEST_URL")
         && !url.trim().is_empty()
     {
         let (mut profile, secret) = ConnectionProfile::from_mysql_url(&url).expect("valid MYSQL_TEST_URL");
         profile.database = None;
-        return Some((profile, secret));
+        return (profile, secret);
     }
 
-    let addr: SocketAddr = "127.0.0.1:3306".parse().expect("valid socket addr");
-    if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
-        return None;
-    }
-
+    let host = env::var("MYSQL_HOST")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_owned());
+    let port = env::var("MYSQL_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(3306);
     let user = env::var("MYSQL_USER").unwrap_or_else(|_| "root".to_owned());
     let password = env::var("MYSQL_PASSWORD").ok().filter(|s| !s.is_empty());
-    let mut profile = ConnectionProfile::new_mysql("greendale_mysql_local", "127.0.0.1", &user);
-    profile.port = 3306;
+    let mut profile = ConnectionProfile::new_mysql("greendale_mysql_local", host, user);
+    profile.port = port;
     profile.password_mode = if password.is_some() {
         PasswordMode::Keychain
     } else {
@@ -58,18 +61,16 @@ fn resolve_test_connection() -> Option<(ConnectionProfile, Option<String>)> {
     };
     profile.ssl.mode = SslMode::Prefer;
     profile.database = None;
-    Some((profile, password))
+    (profile, password)
 }
 
 #[test]
+#[ignore = "requires live MySQL server (set MYSQL_TEST_URL or MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD)"]
 fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
-    let Some((admin, password)) = resolve_test_connection() else {
-        eprintln!("skipping mysql_live: no MySQL server reachable on 127.0.0.1:3306 and MYSQL_TEST_URL not set");
-        return;
-    };
+    let (admin, password) = resolve_test_connection();
 
     let rt = Runtime::new().expect("create tokio runtime");
-    let db_name = format!("tableview_mysql_test_{}", std::process::id());
+    let db_name = format!("tableview_mysql_test_{}", Uuid::new_v4().simple());
     let fq_students = DbEngine::Mysql.qualify_ident(&db_name, "students");
     let fq_groups = DbEngine::Mysql.qualify_ident(&db_name, "study_groups");
 
@@ -78,10 +79,7 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
             .await
             .expect("connect to MySQL admin session");
 
-        let create_stmts = vec![
-            format!("DROP DATABASE IF EXISTS {}", DbEngine::Mysql.quote_ident(&db_name)),
-            format!("CREATE DATABASE {}", DbEngine::Mysql.quote_ident(&db_name)),
-        ];
+        let create_stmts = vec![format!("CREATE DATABASE {}", DbEngine::Mysql.quote_ident(&db_name))];
         let (init_res, _) = admin_session
             .execute_sql(&create_stmts, None)
             .await
@@ -405,21 +403,46 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
         assert!(bad_batch.results[0].error.is_some());
 
         // Live out-of-band cancellation via KILL QUERY
+        let (observer, _) = MysqlSession::connect(&admin, password.as_deref(), None)
+            .await
+            .expect("connect observer MySQL session");
+        let cancel_tag = format!("tv_mysql_cancel_{}", Uuid::new_v4().simple());
+        let slow_sql = format!("SELECT 1 AS `{cancel_tag}` WHERE SLEEP(5) = 0");
         let shared = Arc::new(session);
         let runner = Arc::clone(&shared);
-        let canceller = Arc::clone(&shared);
-        let cancel_handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            canceller.cancel_running_query().await
-        });
-        let slow_sql = "SELECT BENCHMARK(200000000, SHA2('greendale', 256))";
-        let (slow_batch, _) = runner
-            .execute_sql(&[slow_sql.to_owned()], None)
+        let query_handle = tokio::spawn(async move { runner.execute_sql(&[slow_sql], None).await });
+
+        let poll_sql = format!(
+            "SELECT COUNT(*) FROM information_schema.processlist WHERE ID <> CONNECTION_ID() AND COMMAND = 'Query' AND INFO LIKE '%{cancel_tag}%'"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut active = false;
+        while Instant::now() < deadline {
+            if let Ok((poll_batch, _)) = observer.execute_sql(std::slice::from_ref(&poll_sql), None).await
+                && let Some(CellValue::Int(count)) = poll_batch
+                    .results
+                    .first()
+                    .and_then(|r| r.rows.first())
+                    .and_then(|row| row.first())
+                && *count >= 1
+            {
+                active = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(active, "timed out waiting for tagged MySQL query `{cancel_tag}` to become active");
+        drop(observer);
+
+        let cancel_start = Instant::now();
+        let cancel_res = shared.cancel_running_query().await;
+        let (slow_batch, _) = query_handle
             .await
+            .expect("join query task")
             .expect("cancelled query returns cleanly");
-        let cancel_res = cancel_handle.await.expect("join cancel task");
         assert!(cancel_res.is_ok(), "cancel call failed: {cancel_res:?}");
         assert!(slow_batch.cancelled);
+        assert!(cancel_start.elapsed() < Duration::from_secs(3));
 
         shared.ping().await.expect("ping succeeds");
 

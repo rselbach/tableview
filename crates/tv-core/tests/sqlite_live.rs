@@ -105,6 +105,18 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
             .await
             .expect("test_connection succeeds");
         assert!(info.version.starts_with("SQLite 3"), "got {}", info.version);
+        let ver_str = info.version.strip_prefix("SQLite ").expect("SQLite prefix");
+        let mut ver_parts = ver_str.split('.').map(|s| s.parse::<u32>().unwrap_or(0));
+        let ver_tuple = (
+            ver_parts.next().unwrap_or(0),
+            ver_parts.next().unwrap_or(0),
+            ver_parts.next().unwrap_or(0),
+        );
+        assert!(
+            ver_tuple >= (3, 54, 0),
+            "bundled SQLite must be >= 3.54.0 for RUSTSEC-2026-0459, got {}",
+            info.version
+        );
         assert_eq!(info.current_database, "greendale.sqlite3");
         assert!(info.current_user.is_empty());
 

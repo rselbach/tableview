@@ -1,0 +1,14 @@
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4 unmaintained notice; direct API and JSON storage format depend on chrono::DateTime<Utc>" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant is Linux-only via rune -> accesskit_unix -> zbus and absent from the macOS release graph" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names is Linux-only via rune -> accesskit_unix -> zbus and absent from the macOS release graph" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is Linux-only via rune -> accesskit_unix -> zbus and absent from the macOS release graph" },
+]

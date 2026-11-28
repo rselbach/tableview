@@ -1,22 +1,65 @@
 #![allow(clippy::expect_used)]
 
 use std::env;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection};
 use tokio::runtime::Runtime;
+use uuid::Uuid;
 use tv_core::engine::postgres::PostgresSession;
 use tv_core::{
     CellValue, ConnectionProfile, DbError, DbObjectKind, DbSession, ForeignKeyRef, PageRequest, PasswordMode,
     SortSpec, SslMode, StagedCellValue, StagedChanges,
 };
 
-fn local_pg_user() -> String {
-    env::var("PGUSER")
+fn resolve_test_connection() -> (ConnectionProfile, Option<String>) {
+    if let Ok(url) = env::var("POSTGRES_TEST_URL")
+        && !url.trim().is_empty()
+    {
+        let (mut profile, secret) = ConnectionProfile::from_postgres_url(&url).expect("valid POSTGRES_TEST_URL");
+        if profile.database.as_deref().is_none_or(|d| d.trim().is_empty()) {
+            profile.database = Some("postgres".to_owned());
+        }
+        return (profile, secret);
+    }
+
+    let host = env::var("PGHOST")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_owned());
+    let port = env::var("PGPORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(5432);
+    let user = env::var("PGUSER")
         .or_else(|_| env::var("USER"))
-        .unwrap_or_else(|_| "postgres".to_owned())
+        .unwrap_or_else(|_| "postgres".to_owned());
+    let password = env::var("PGPASSWORD").ok().filter(|s| !s.is_empty());
+
+    let mut admin = ConnectionProfile::new_postgres("greendale_local", host, user);
+    admin.port = port;
+    admin.password_mode = if password.is_some() {
+        PasswordMode::Keychain
+    } else {
+        PasswordMode::None
+    };
+    admin.ssl.mode = SslMode::Disable;
+    admin.database = Some("postgres".to_owned());
+    (admin, password)
 }
 
 struct TempDatabaseGuard {
     admin_profile: ConnectionProfile,
+    password: Option<String>,
+    admin_db: String,
     db_name: String,
     rt: Runtime,
 }
@@ -24,132 +67,91 @@ struct TempDatabaseGuard {
 impl Drop for TempDatabaseGuard {
     fn drop(&mut self) {
         let admin_profile = self.admin_profile.clone();
+        let password = self.password.clone();
+        let admin_db = self.admin_db.clone();
         let db_name = self.db_name.clone();
         self.rt.block_on(async move {
-            let mut cfg = tokio_postgres::Config::new();
-            cfg.host(&admin_profile.host)
-                .port(admin_profile.port)
-                .user(&admin_profile.user)
-                .dbname("postgres");
-            if let Ok((client, connection)) = cfg.connect(tokio_postgres::NoTls).await {
-                tokio::spawn(async move {
-                    drop(connection.await);
-                });
-                let terminate = format!(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}' AND pid <> pg_backend_pid()",
-                    db_name
-                );
-                drop(client.batch_execute(&terminate).await);
-                let drop_sql = format!("DROP DATABASE IF EXISTS \"{db_name}\"");
-                drop(client.batch_execute(&drop_sql).await);
+            if let Ok((admin_session, _)) =
+                PostgresSession::connect(&admin_profile, password.as_deref(), Some(&admin_db)).await
+            {
+                let cleanup_stmts = vec![
+                    format!(
+                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}' AND pid <> pg_backend_pid()"
+                    ),
+                    format!("DROP DATABASE IF EXISTS \"{db_name}\""),
+                ];
+                drop(admin_session.execute_sql(&cleanup_stmts, None).await);
             }
         });
     }
 }
 
 #[test]
+#[ignore = "requires live PostgreSQL server (set POSTGRES_TEST_URL or PGHOST/PGPORT/PGUSER/PGPASSWORD)"]
 fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
     let rt = Runtime::new().expect("create tokio runtime");
-    let user = local_pg_user();
-    let mut admin = ConnectionProfile::new_postgres("greendale_local", "127.0.0.1", &user);
-    admin.port = 5432;
-    admin.password_mode = PasswordMode::None;
-    admin.ssl.mode = SslMode::Disable;
-    admin.database = Some("postgres".to_owned());
-
-    let db_name = format!("tableview_m2_test_{}", std::process::id());
+    let (admin, password) = resolve_test_connection();
+    let admin_db = admin.database.clone().unwrap_or_else(|| "postgres".to_owned());
+    let db_name = format!("tableview_pg_test_{}", Uuid::new_v4().simple());
 
     rt.block_on(async {
-        let mut cfg = tokio_postgres::Config::new();
-        cfg.host("127.0.0.1")
-            .port(5432)
-            .user(&user)
-            .dbname("postgres");
-        let (client, connection) = cfg
-            .connect(tokio_postgres::NoTls)
+        let (admin_session, _) =
+            PostgresSession::connect(&admin, password.as_deref(), Some(&admin_db))
+                .await
+                .expect("connect to PostgreSQL admin database");
+        let setup_stmts = vec![format!("CREATE DATABASE \"{db_name}\"")];
+        let (batch, _) = admin_session
+            .execute_sql(&setup_stmts, None)
             .await
-            .expect("connect to local postgres on 127.0.0.1:5432");
-        tokio::spawn(async move {
-            drop(connection.await);
-        });
-
-        client
-            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
-            .await
-            .expect("cleanup stale test db");
-        client
-            .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
-            .await
-            .expect("create temporary test db");
+            .expect("setup temporary test db");
+        assert_eq!(batch.results.len(), setup_stmts.len());
+        for res in &batch.results {
+            assert!(res.error.is_none(), "admin setup statement failed: {:?}", res.error);
+        }
     });
 
     let _guard = TempDatabaseGuard {
         admin_profile: admin.clone(),
+        password: password.clone(),
+        admin_db: admin_db.clone(),
         db_name: db_name.clone(),
         rt: Runtime::new().expect("cleanup runtime"),
     };
 
     rt.block_on(async {
-        let mut target_cfg = tokio_postgres::Config::new();
-        target_cfg
-            .host("127.0.0.1")
-            .port(5432)
-            .user(&user)
-            .dbname(&db_name);
-        let (client, connection) = target_cfg
-            .connect(tokio_postgres::NoTls)
-            .await
-            .expect("connect to temp db");
-        tokio::spawn(async move {
-            drop(connection.await);
-        });
-        client
-            .batch_execute(
-                "CREATE SCHEMA study_room;
-                 CREATE TYPE public.greendale_major AS ENUM ('Spanish', 'Film', 'Law', 'AirConditioning');
-                 CREATE TABLE public.study_groups (
-                     group_id INTEGER PRIMARY KEY,
-                     room_name TEXT NOT NULL
-                 );
-                 INSERT INTO public.study_groups VALUES (1, 'Study Room F');
-                 CREATE TABLE public.students (
-                     student_id INTEGER PRIMARY KEY,
-                     id UUID NOT NULL,
-                     full_name TEXT NOT NULL,
-                     email TEXT,
-                     enrolled BOOLEAN NOT NULL DEFAULT true,
-                     gpa NUMERIC(4,2),
-                     major public.greendale_major NOT NULL,
-                     tags TEXT[] NOT NULL DEFAULT '{}',
-                     profile JSONB,
-                     badge BYTEA,
-                     group_id INTEGER REFERENCES public.study_groups(group_id),
-                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                 );
-                 CREATE UNIQUE INDEX students_id_uidx ON public.students (id);
-                 CREATE INDEX students_profile_gin ON public.students USING gin (profile);
-                 COMMENT ON TABLE public.students IS 'Greendale Community College active roster';
-                 COMMENT ON COLUMN public.students.full_name IS 'Preferred display name';
-                 INSERT INTO public.students
-                     (student_id, id, full_name, email, enrolled, gpa, major, tags, profile, badge, group_id, created_at)
-                 VALUES
-                     (1, '210b3d6b-da52-4259-ac05-b58d3d0a6d5b', 'Troy Barnes', 'troy@greendale.edu', true, 3.45, 'AirConditioning', ARRAY['football','plumbing'], '{\"best_friend\":\"Abed\",\"handshake\":true}'::jsonb, '\\xdeadbeef'::bytea, 1, '2026-11-19T18:09:11.432Z'),
-                     (2, '8c5b8676-0203-44ba-9198-90125b690e81', 'Abed Nadir', NULL, true, 3.92, 'Film', ARRAY['meta','inspector'], '{\"bedtime\":\"strict\"}'::jsonb, '\\x00ff'::bytea, 1, '2026-11-19T18:24:56.558Z'),
-                     (3, '11111111-2222-3333-4444-555555555555', 'Annie Edison', '', true, 4.00, 'Law', ARRAY['notes'], '{\"pens\":12}'::jsonb, NULL, 1, '2026-11-19T19:00:00.000Z'),
-                     (4, '99999999-8888-7777-6666-555555555555', 'Jeff Winger', 'jeff@greendale.edu', false, 2.75, 'Law', ARRAY['speech'], NULL, '\\x'::bytea, 1, '2026-11-20T09:15:00.000Z');
-                 CREATE VIEW public.active_students_view AS
-                     SELECT student_id, full_name FROM public.students WHERE enrolled = true;",
-            )
+        let (seed_session, _) =
+            PostgresSession::connect(&admin, password.as_deref(), Some(&db_name))
+                .await
+                .expect("connect to temp db");
+        let seed_stmts = vec![
+            "CREATE SCHEMA study_room".to_owned(),
+            "CREATE TYPE public.greendale_major AS ENUM ('Spanish', 'Film', 'Law', 'AirConditioning')".to_owned(),
+            "CREATE TABLE public.study_groups (\n    group_id INTEGER PRIMARY KEY,\n    room_name TEXT NOT NULL\n)".to_owned(),
+            "INSERT INTO public.study_groups VALUES (1, 'Study Room F')".to_owned(),
+            "CREATE TABLE public.students (\n    student_id INTEGER PRIMARY KEY,\n    id UUID NOT NULL,\n    full_name TEXT NOT NULL,\n    email TEXT,\n    enrolled BOOLEAN NOT NULL DEFAULT true,\n    gpa NUMERIC(4,2),\n    major public.greendale_major NOT NULL,\n    tags TEXT[] NOT NULL DEFAULT '{}',\n    profile JSONB,\n    badge BYTEA,\n    group_id INTEGER REFERENCES public.study_groups(group_id),\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n)".to_owned(),
+            "CREATE UNIQUE INDEX students_id_uidx ON public.students (id)".to_owned(),
+            "CREATE INDEX students_profile_gin ON public.students USING gin (profile)".to_owned(),
+            "COMMENT ON TABLE public.students IS 'Greendale Community College active roster'".to_owned(),
+            "COMMENT ON COLUMN public.students.full_name IS 'Preferred display name'".to_owned(),
+            "INSERT INTO public.students\n    (student_id, id, full_name, email, enrolled, gpa, major, tags, profile, badge, group_id, created_at)\nVALUES\n    (1, '210b3d6b-da52-4259-ac05-b58d3d0a6d5b', 'Troy Barnes', 'troy@greendale.edu', true, 3.45, 'AirConditioning', ARRAY['football','plumbing'], '{\"best_friend\":\"Abed\",\"handshake\":true}'::jsonb, '\\xdeadbeef'::bytea, 1, '2026-11-19T18:09:11.432Z'),\n    (2, '8c5b8676-0203-44ba-9198-90125b690e81', 'Abed Nadir', NULL, true, 3.92, 'Film', ARRAY['meta','inspector'], '{\"bedtime\":\"strict\"}'::jsonb, '\\x00ff'::bytea, 1, '2026-11-19T18:24:56.558Z'),\n    (3, '11111111-2222-3333-4444-555555555555', 'Annie Edison', '', true, 4.00, 'Law', ARRAY['notes'], '{\"pens\":12}'::jsonb, NULL, 1, '2026-11-19T19:00:00.000Z'),\n    (4, '99999999-8888-7777-6666-555555555555', 'Jeff Winger', 'jeff@greendale.edu', false, 2.75, 'Law', ARRAY['speech'], NULL, '\\x'::bytea, 1, '2026-11-20T09:15:00.000Z')".to_owned(),
+            "CREATE VIEW public.active_students_view AS\n    SELECT student_id, full_name FROM public.students WHERE enrolled = true".to_owned(),
+        ];
+        let (batch, _) = seed_session
+            .execute_sql(&seed_stmts, None)
             .await
             .expect("seed Community test schema");
-        drop(client);
+        assert_eq!(batch.results.len(), seed_stmts.len());
+        for res in &batch.results {
+            assert!(res.error.is_none(), "seed statement failed: {:?}", res.error);
+        }
+        drop(seed_session);
 
-        let tested = PostgresSession::test_connection(&admin, None)
+        let tested = PostgresSession::test_connection(&admin, password.as_deref())
             .await
             .expect("test_connection succeeds");
         assert!(tested.version.starts_with("PostgreSQL "), "got {}", tested.version);
 
-        let (session, init_logs) = PostgresSession::connect(&admin, None, Some(&db_name))
+        let (session, init_logs) = PostgresSession::connect(&admin, password.as_deref(), Some(&db_name))
             .await
             .expect("connect to temporary database");
         assert_eq!(session.server_info().current_database, db_name);
@@ -511,4 +513,536 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
             .expect("refetch after rollback");
         assert_eq!(after_rollback.rows[0][2], CellValue::Text("Troy 'T-Bone' Barnes".to_owned()));
     });
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL server (set POSTGRES_TEST_URL or PGHOST/PGPORT/PGUSER/PGPASSWORD)"]
+fn live_postgres_tls_enforcement_and_prefer_cancel() {
+    let rt = Runtime::new().expect("create tokio runtime");
+    let (base, password) = resolve_test_connection();
+    let target_db = base.database.clone().unwrap_or_else(|| "postgres".to_owned());
+
+    rt.block_on(async {
+        let (session, _) = PostgresSession::connect(&base, password.as_deref(), Some(&target_db))
+            .await
+            .expect("connect using resolve_test_connection");
+        let (ssl_batch, _) = session
+            .execute_sql(&["SHOW ssl".to_owned()], None)
+            .await
+            .expect("query server ssl setting");
+        assert_eq!(ssl_batch.results.len(), 1);
+        assert!(
+            ssl_batch.results[0].error.is_none(),
+            "SHOW ssl failed: {:?}",
+            ssl_batch.results[0].error
+        );
+        let ssl_enabled = matches!(
+            ssl_batch.results[0]
+                .rows
+                .first()
+                .and_then(|row| row.first()),
+            Some(CellValue::Text(val)) if val.eq_ignore_ascii_case("on")
+        );
+        let is_unix_socket = base.host.trim().starts_with('/');
+        let tls_expected = ssl_enabled && !is_unix_socket;
+
+        if tls_expected {
+            let mut strict = base.clone();
+            strict.ssl.mode = SslMode::Require;
+            strict.ssl.ca_cert_path = None;
+            let _ = PostgresSession::connect(&strict, password.as_deref(), Some(&target_db))
+                .await
+                .expect("SslMode::Require connects when server has TLS enabled");
+        } else {
+            for mode in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+                let mut strict = base.clone();
+                strict.ssl.mode = mode;
+                strict.ssl.ca_cert_path = None;
+                let res = PostgresSession::connect(&strict, password.as_deref(), Some(&target_db)).await;
+                assert!(res.is_err(), "{mode:?} must reject plaintext server");
+            }
+        }
+
+        let mut prefer = base.clone();
+        prefer.ssl.mode = SslMode::Prefer;
+        prefer.ssl.ca_cert_path = None;
+        let (prefer_session, _) = PostgresSession::connect(&prefer, password.as_deref(), Some(&target_db))
+            .await
+            .expect("SslMode::Prefer connects cleanly");
+        let shared = Arc::new(prefer_session);
+        let runner = Arc::clone(&shared);
+        let canceller = Arc::clone(&shared);
+        let cancel_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            canceller.cancel_running_query().await
+        });
+        let cancel_start = Instant::now();
+        let (sleep_batch, _) = runner
+            .execute_sql(&["SELECT pg_sleep(5)".to_owned()], None)
+            .await
+            .expect("cancelled prefer query returns cleanly");
+        let cancel_res = cancel_handle.await.expect("join cancel task");
+        assert!(cancel_res.is_ok(), "cancel call failed: {cancel_res:?}");
+        assert!(sleep_batch.cancelled);
+        assert!(cancel_start.elapsed() < Duration::from_secs(3));
+    });
+}
+
+const PROXY_TLS_ACCEPT: u8 = 0;
+const PROXY_TLS_REJECT_N: u8 = 1;
+const PROXY_TLS_ABORT_HANDSHAKE: u8 = 2;
+const PG_SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+
+struct PgTlsProxyState {
+    mode: AtomicU8,
+    stop: AtomicBool,
+    tls_accepted: AtomicUsize,
+    tls_rejected: AtomicUsize,
+    tls_aborted: AtomicUsize,
+    direct_plaintext: AtomicUsize,
+}
+
+struct PgTlsProxy {
+    port: u16,
+    state: Arc<PgTlsProxyState>,
+    accept_thread: Option<JoinHandle<()>>,
+}
+
+impl PgTlsProxy {
+    fn start(upstream_host: String, upstream_port: u16, server_cfg: Arc<ServerConfig>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local TLS proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("set proxy listener nonblocking");
+        let port = listener.local_addr().expect("proxy local_addr").port();
+        let state = Arc::new(PgTlsProxyState {
+            mode: AtomicU8::new(PROXY_TLS_ACCEPT),
+            stop: AtomicBool::new(false),
+            tls_accepted: AtomicUsize::new(0),
+            tls_rejected: AtomicUsize::new(0),
+            tls_aborted: AtomicUsize::new(0),
+            direct_plaintext: AtomicUsize::new(0),
+        });
+        let accept_state = Arc::clone(&state);
+        let accept_thread = thread::spawn(move || {
+            let mut workers: Vec<JoinHandle<()>> = Vec::new();
+            while !accept_state.stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((client, _)) => {
+                        let host = upstream_host.clone();
+                        let cfg = Arc::clone(&server_cfg);
+                        let st = Arc::clone(&accept_state);
+                        workers.push(thread::spawn(move || handle_proxy_client(client, &host, upstream_port, cfg, st)));
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for worker in workers {
+                drop(worker.join());
+            }
+        });
+        Self {
+            port,
+            state,
+            accept_thread: Some(accept_thread),
+        }
+    }
+}
+
+impl Drop for PgTlsProxy {
+    fn drop(&mut self) {
+        self.state.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.accept_thread.take() {
+            drop(handle.join());
+        }
+    }
+}
+
+fn handle_proxy_client(
+    mut client: TcpStream,
+    upstream_host: &str,
+    upstream_port: u16,
+    server_cfg: Arc<ServerConfig>,
+    state: Arc<PgTlsProxyState>,
+) {
+    if client.set_nonblocking(false).is_err() {
+        return;
+    }
+    drop(client.set_read_timeout(Some(Duration::from_secs(5))));
+    drop(client.set_write_timeout(Some(Duration::from_secs(5))));
+
+    let mut header = [0u8; 8];
+    if client.read_exact(&mut header).is_err() {
+        return;
+    }
+    let Ok(mut upstream) = TcpStream::connect((upstream_host, upstream_port)) else {
+        return;
+    };
+
+    if header == PG_SSL_REQUEST {
+        match state.mode.load(Ordering::Acquire) {
+            PROXY_TLS_ACCEPT => {
+                if client.write_all(b"S").is_err() {
+                    return;
+                }
+                state.tls_accepted.fetch_add(1, Ordering::AcqRel);
+                pump_tls_session(client, upstream, server_cfg, state);
+            }
+            PROXY_TLS_REJECT_N => {
+                if client.write_all(b"N").is_err() {
+                    return;
+                }
+                state.tls_rejected.fetch_add(1, Ordering::AcqRel);
+                splice_raw(client, upstream, state);
+            }
+            _ => {
+                if client.write_all(b"S").is_err() {
+                    return;
+                }
+                let mut hello = [0u8; 1];
+                drop(client.read(&mut hello));
+                state.tls_aborted.fetch_add(1, Ordering::AcqRel);
+                drop(client.shutdown(Shutdown::Both));
+                drop(upstream.shutdown(Shutdown::Both));
+            }
+        }
+    } else {
+        state.direct_plaintext.fetch_add(1, Ordering::AcqRel);
+        if upstream.write_all(&header).is_err() {
+            return;
+        }
+        splice_raw(client, upstream, state);
+    }
+}
+
+fn splice_one_way(mut src: TcpStream, mut dst: TcpStream, state: Arc<PgTlsProxyState>) {
+    drop(src.set_read_timeout(Some(Duration::from_millis(150))));
+    drop(dst.set_write_timeout(Some(Duration::from_secs(5))));
+    let mut buf = [0u8; 8192];
+    while !state.stop.load(Ordering::Acquire) {
+        match src.read(&mut buf) {
+            Ok(0) => {
+                drop(dst.shutdown(Shutdown::Write));
+                break;
+            }
+            Ok(n) => {
+                if dst.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn splice_raw(client: TcpStream, upstream: TcpStream, state: Arc<PgTlsProxyState>) {
+    let Ok(client_read) = client.try_clone() else {
+        return;
+    };
+    let Ok(upstream_write) = upstream.try_clone() else {
+        return;
+    };
+    let st_c2u = Arc::clone(&state);
+    let t_c2u = thread::spawn(move || splice_one_way(client_read, upstream_write, st_c2u));
+    splice_one_way(upstream, client, state);
+    drop(t_c2u.join());
+}
+
+fn pump_tls_session(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    server_cfg: Arc<ServerConfig>,
+    state: Arc<PgTlsProxyState>,
+) {
+    let Ok(mut tls) = ServerConnection::new(server_cfg) else {
+        return;
+    };
+    while tls.is_handshaking() {
+        if tls.complete_io(&mut client).is_err() {
+            return;
+        }
+    }
+    if client.set_nonblocking(true).is_err() || upstream.set_nonblocking(true).is_err() {
+        return;
+    }
+
+    let mut to_upstream: Vec<u8> = Vec::new();
+    let mut client_eof = false;
+    let mut upstream_eof = false;
+    let mut tmp = [0u8; 8192];
+
+    while !state.stop.load(Ordering::Acquire) {
+        let mut progressed = false;
+
+        while tls.wants_write() {
+            match tls.write_tls(&mut client) {
+                Ok(0) => break,
+                Ok(_) => progressed = true,
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => break,
+                Err(_) => return,
+            }
+        }
+
+        if !client_eof {
+            match tls.read_tls(&mut client) {
+                Ok(0) => {
+                    client_eof = true;
+                    progressed = true;
+                }
+                Ok(_) => {
+                    progressed = true;
+                    if tls.process_new_packets().is_err() {
+                        return;
+                    }
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(_) => return,
+            }
+        }
+
+        loop {
+            match tls.reader().read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    to_upstream.extend_from_slice(&tmp[..n]);
+                    progressed = true;
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => break,
+                Err(_) => break,
+            }
+        }
+
+        while !to_upstream.is_empty() {
+            match upstream.write(&to_upstream) {
+                Ok(0) => return,
+                Ok(n) => {
+                    to_upstream.drain(..n);
+                    progressed = true;
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => break,
+                Err(_) => return,
+            }
+        }
+
+        if !upstream_eof {
+            match upstream.read(&mut tmp) {
+                Ok(0) => {
+                    upstream_eof = true;
+                    tls.send_close_notify();
+                    progressed = true;
+                }
+                Ok(n) => {
+                    if tls.writer().write_all(&tmp[..n]).is_err() {
+                        return;
+                    }
+                    progressed = true;
+                }
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+                Err(_) => return,
+            }
+        }
+
+        if (client_eof && to_upstream.is_empty()) || (upstream_eof && !tls.wants_write()) {
+            break;
+        }
+        if !progressed {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    drop(client.shutdown(Shutdown::Both));
+    drop(upstream.shutdown(Shutdown::Both));
+}
+
+async fn wait_for_active_query(observer: &PostgresSession, tag: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let query = format!(
+        "SELECT COUNT(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%{tag}%'"
+    );
+    while Instant::now() < deadline {
+        if let Ok((batch, _)) = observer.execute_sql(std::slice::from_ref(&query), None).await
+            && let Some(CellValue::Int(count)) = batch
+                .results
+                .first()
+                .and_then(|r| r.rows.first())
+                .and_then(|row| row.first())
+            && *count >= 1
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for tagged query `{tag}` to become active in pg_stat_activity");
+}
+
+#[test]
+#[ignore = "requires live PostgreSQL server (set POSTGRES_TEST_URL or PGHOST/PGPORT/PGUSER/PGPASSWORD)"]
+fn live_postgres_prefer_cancel_falls_back_when_tls_disabled_mid_session() {
+    let rt = Runtime::new().expect("create tokio runtime");
+    let (base, password) = resolve_test_connection();
+    if base.host.trim().starts_with('/') {
+        return;
+    }
+    let target_db = base.database.clone().unwrap_or_else(|| "postgres".to_owned());
+
+    let ssl_enabled = rt.block_on(async {
+        let (observer, _) = PostgresSession::connect(&base, password.as_deref(), Some(&target_db))
+            .await
+            .expect("connect observer session directly");
+        let (ssl_batch, _) = observer
+            .execute_sql(&["SHOW ssl".to_owned()], None)
+            .await
+            .expect("query server ssl setting");
+        assert_eq!(ssl_batch.results.len(), 1);
+        assert!(
+            ssl_batch.results[0].error.is_none(),
+            "SHOW ssl failed: {:?}",
+            ssl_batch.results[0].error
+        );
+        matches!(
+            ssl_batch.results[0]
+                .rows
+                .first()
+                .and_then(|row| row.first()),
+            Some(CellValue::Text(val)) if val.eq_ignore_ascii_case("on")
+        )
+    });
+    if ssl_enabled {
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("create temp dir for TLS proxy cert");
+    let key_path = dir.path().join("proxy.key");
+    let cert_path = dir.path().join("proxy.crt");
+    let cfg_path = dir.path().join("openssl.cnf");
+    std::fs::write(
+        &cfg_path,
+        "[req]\ndistinguished_name = dn\nx509_extensions = v3_ext\nprompt = no\n\n[dn]\nCN = 127.0.0.1\n\n[v3_ext]\nbasicConstraints = CA:FALSE\nkeyUsage = digitalSignature, keyEncipherment\nextendedKeyUsage = serverAuth\nsubjectAltName = IP:127.0.0.1\n",
+    )
+    .expect("write openssl v3 config");
+    let openssl_out = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            key_path.to_str().expect("utf8 key path"),
+            "-out",
+            cert_path.to_str().expect("utf8 cert path"),
+            "-days",
+            "1",
+            "-config",
+            cfg_path.to_str().expect("utf8 config path"),
+        ])
+        .output()
+        .expect("invoke openssl to generate test certificate");
+    assert!(
+        openssl_out.status.success(),
+        "openssl cert generation failed: {}",
+        String::from_utf8_lossy(&openssl_out.stderr)
+    );
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&cert_path)
+        .expect("open proxy cert PEM")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse proxy cert PEM");
+    let key = PrivateKeyDer::from_pem_file(&key_path).expect("parse proxy key PEM");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server_cfg = Arc::new(
+        ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("safe TLS versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("build proxy rustls ServerConfig"),
+    );
+
+    let proxy = PgTlsProxy::start(base.host.trim().to_owned(), base.port, server_cfg);
+    let mut proxy_profile = base.clone();
+    proxy_profile.host = "127.0.0.1".to_owned();
+    proxy_profile.port = proxy.port;
+    proxy_profile.ssl.ca_cert_path = None;
+    proxy_profile.ssl.client_cert_path = None;
+    proxy_profile.ssl.client_key_path = None;
+
+    rt.block_on(async {
+        let (observer, _) = PostgresSession::connect(&base, password.as_deref(), Some(&target_db))
+            .await
+            .expect("connect observer session directly");
+
+        let mut require_profile = proxy_profile.clone();
+        require_profile.ssl.mode = SslMode::Require;
+        let (require_session, _) =
+            PostgresSession::connect(&require_profile, password.as_deref(), Some(&target_db))
+                .await
+                .expect("SslMode::Require connects through TLS proxy");
+        drop(require_session);
+        assert!(proxy.state.tls_accepted.load(Ordering::Acquire) >= 1);
+
+        let mut prefer_profile = proxy_profile.clone();
+        prefer_profile.ssl.mode = SslMode::Prefer;
+        let (prefer_session, _) =
+            PostgresSession::connect(&prefer_profile, password.as_deref(), Some(&target_db))
+                .await
+                .expect("SslMode::Prefer connects cleanly over TLS through proxy");
+        assert!(proxy.state.tls_accepted.load(Ordering::Acquire) >= 2);
+
+        let shared = Arc::new(prefer_session);
+
+        // Scenario A: server disables TLS ('N' to SSLRequest) while TLS query is active.
+        let tag_a = format!("tv_prefer_cancel_n_{}", Uuid::new_v4().simple());
+        let sql_a = vec![format!("SELECT pg_sleep(5) /* {tag_a} */")];
+        let runner_a = Arc::clone(&shared);
+        let handle_a = tokio::spawn(async move { runner_a.execute_sql(&sql_a, None).await });
+        wait_for_active_query(&observer, &tag_a).await;
+
+        proxy.state.mode.store(PROXY_TLS_REJECT_N, Ordering::Release);
+        let cancel_start_a = Instant::now();
+        let cancel_res_a = shared.cancel_running_query().await;
+        let (batch_a, _) = handle_a
+            .await
+            .expect("join query A task")
+            .expect("cancelled query A returns cleanly");
+        assert!(cancel_res_a.is_ok(), "cancel A failed: {cancel_res_a:?}");
+        assert!(batch_a.cancelled, "query A must be marked cancelled");
+        assert!(cancel_start_a.elapsed() < Duration::from_secs(3));
+        assert!(proxy.state.tls_rejected.load(Ordering::Acquire) >= 1);
+
+        // Scenario B: TLS handshake aborts on cancel, triggering explicit NoTls retry on Prefer session.
+        let tag_b = format!("tv_prefer_cancel_abort_{}", Uuid::new_v4().simple());
+        let sql_b = vec![format!("SELECT pg_sleep(5) /* {tag_b} */")];
+        let runner_b = Arc::clone(&shared);
+        let handle_b = tokio::spawn(async move { runner_b.execute_sql(&sql_b, None).await });
+        wait_for_active_query(&observer, &tag_b).await;
+
+        proxy
+            .state
+            .mode
+            .store(PROXY_TLS_ABORT_HANDSHAKE, Ordering::Release);
+        let cancel_start_b = Instant::now();
+        let cancel_res_b = shared.cancel_running_query().await;
+        let (batch_b, _) = handle_b
+            .await
+            .expect("join query B task")
+            .expect("cancelled query B returns cleanly");
+        assert!(cancel_res_b.is_ok(), "cancel B failed: {cancel_res_b:?}");
+        assert!(batch_b.cancelled, "query B must be marked cancelled");
+        assert!(cancel_start_b.elapsed() < Duration::from_secs(3));
+        assert!(proxy.state.tls_aborted.load(Ordering::Acquire) >= 1);
+        assert!(proxy.state.direct_plaintext.load(Ordering::Acquire) >= 1);
+
+        shared
+            .ping()
+            .await
+            .expect("established Prefer TLS session remains healthy after cancels");
+        drop(shared);
+        drop(observer);
+    });
+    drop(proxy);
 }
