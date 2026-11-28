@@ -6,11 +6,10 @@ use rune::Waker;
 use rune::credentials::Credentials;
 use tv_core::engine::{connect_session, test_connection};
 use tv_core::{
-    AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine,
-    DbError, DbObject, DbSession, EnvTag, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode,
-    NewHistoryEntry, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult, QueryHistoryEntry,
-    QueryStore, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo,
-    SessionId, SqlSessionMode, TabId, TablePage, TableStructure, TransactionOutcome, StagedCommitBatch,
+    AccentColor, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine, DbError, DbObject, DbSession,
+    EnvTag, ExecutedSql, ExplainPlan, FkLookupComponent, FkPeekRow, ForeignKeyRef, MysqlQuoteMode, NewHistoryEntry, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult,
+    QueryHistoryEntry, QueryStore, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SchemaInfo,
+    ServerInfo, SessionId, SqlSessionMode, TabId, TablePage, TableStructure, TransactionOutcome, StagedCommitBatch,
     batch_sets_credentials_with_session_mode, build_explain_sql_for_engine,
     evaluate_sql_safety_for_engine_with_session_mode, trim_sql_whitespace_for_engine,
 };
@@ -181,8 +180,7 @@ pub enum WorkerCmd {
         req_id: RequestId,
         connect_req_id: RequestId,
         fk: ForeignKeyRef,
-        value: CellValue,
-        source_col: ColumnMeta,
+        components: Vec<FkLookupComponent>,
     },
 }
 
@@ -2688,8 +2686,7 @@ async fn handle_cmd(
             req_id,
             connect_req_id,
             fk,
-            value,
-            source_col,
+            components,
         } => {
             let outcome = run_with_reconnect(
                 worker_ctx,
@@ -2699,9 +2696,8 @@ async fn handle_cmd(
                 Some(connect_req_id),
                 |session| {
                     let fk = fk.clone();
-                    let value = value.clone();
-                    let source_col = source_col.clone();
-                    async move { session.fetch_fk_row(&fk, &value, &source_col).await }
+                    let components = components.clone();
+                    async move { session.fetch_fk_row(&fk, &components).await }
                 },
             )
             .await;

@@ -20,16 +20,18 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::connection::{ConnectionProfile, DbEngine, EnvTag, PasswordMode, SafetyPolicy, SslConfig, SslMode};
 use crate::engine::{
-    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, PostgresRawValue, QueryBatchResult, QueryStatementResult,
-    RawCellValue, SchemaInfo, ServerInfo, TablePage, TableStats, TableStructure, TableTransactionSupport,
-    TransactionOutcome, encode_hex,
+    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, DecodedPageBatch,
+    ExecutedSql, FkLookupComponent, FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, PostgresRawValue, QueryBatchResult,
+    QueryStatementResult, RawCellValue, SchemaInfo, ServerInfo, StableOrderKey, TablePage, TableStats,
+    TableStructure, TableTransactionSupport, TransactionOutcome, attach_foreign_keys_to_columns, encode_hex,
+    last_page_offset,
 };
 use crate::explain::{ExplainPlan, build_explain_sql};
 use crate::staging::{
-    StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation, build_fk_where_clause, strip_hex_prefix,
+    StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation, build_fk_where_clause,
+    format_fk_lookup_display, strip_hex_prefix,
 };
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -705,7 +707,11 @@ impl PostgresSession {
         map_pg_err(err)
     }
 
-    async fn fetch_column_metas(&self, schema: &str, table: &str) -> Result<(Vec<ColumnMeta>, ExecutedSql), DbError> {
+    async fn fetch_column_metas(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Vec<ColumnMeta>, Vec<ForeignKeyRef>, ExecutedSql), DbError> {
         let col_sql = "SELECT \
                        a.attname, \
                        pg_catalog.format_type(a.atttypid, a.atttypmod), \
@@ -731,33 +737,50 @@ impl PostgresSession {
             .await
             .map_err(|e| self.map_aux_query_err(e))?;
 
-        let fk_sql = "SELECT a_src.attname, con.conname, nf.nspname, cf.relname, a_dst.attname \
+        let fk_sql = "SELECT \
+                      con.oid::bigint, \
+                      con.conname, \
+                      nf.nspname, \
+                      cf.relname, \
+                      a_src.attname, \
+                      a_dst.attname, \
+                      COALESCE(pg_catalog.array_length(con.conkey, 1), 0)::int4, \
+                      COALESCE(pg_catalog.array_length(con.confkey, 1), 0)::int4 \
                       FROM pg_catalog.pg_constraint con \
                       JOIN pg_catalog.pg_class cs ON cs.oid = con.conrelid \
                       JOIN pg_catalog.pg_namespace ns ON ns.oid = cs.relnamespace \
                       JOIN pg_catalog.pg_class cf ON cf.oid = con.confrelid \
                       JOIN pg_catalog.pg_namespace nf ON nf.oid = cf.relnamespace \
                       JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS u(src_att, dst_att, ord) ON true \
-                      JOIN pg_catalog.pg_attribute a_src ON a_src.attrelid = con.conrelid AND a_src.attnum = u.src_att \
-                      JOIN pg_catalog.pg_attribute a_dst ON a_dst.attrelid = con.confrelid AND a_dst.attnum = u.dst_att \
+                      LEFT JOIN pg_catalog.pg_attribute a_src \
+                          ON a_src.attrelid = con.conrelid AND a_src.attnum = u.src_att AND NOT a_src.attisdropped \
+                      LEFT JOIN pg_catalog.pg_attribute a_dst \
+                          ON a_dst.attrelid = con.confrelid AND a_dst.attnum = u.dst_att AND NOT a_dst.attisdropped \
                       WHERE con.contype = 'f' AND ns.nspname = $1 AND cs.relname = $2 \
-                      ORDER BY con.conname ASC, u.ord ASC";
+                      ORDER BY con.conname ASC, con.oid ASC, u.ord ASC";
         let fk_rows = self
             .client
             .query(fk_sql, &[&schema, &table])
             .await
             .map_err(|e| self.map_aux_query_err(e))?;
 
-        let mut fks: HashMap<String, ForeignKeyRef> = HashMap::new();
-        for row in fk_rows {
-            let col_name: String = row.get(0);
-            fks.entry(col_name).or_insert_with(|| ForeignKeyRef {
-                constraint_name: row.get(1),
-                target_schema: row.get(2),
-                target_table: row.get(3),
-                target_column: row.get(4),
-            });
-        }
+        let raw_fk_rows: Vec<PgFkRowTuple> = fk_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                    row.get(6),
+                    row.get(7),
+                )
+            })
+            .collect();
+        let foreign_keys = assemble_pg_foreign_keys(raw_fk_rows);
+        let mut fks = attach_foreign_keys_to_columns(foreign_keys.clone());
 
         let columns = col_rows
             .into_iter()
@@ -787,7 +810,139 @@ impl PostgresSession {
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         };
-        Ok((columns, log))
+        Ok((columns, foreign_keys, log))
+    }
+
+    async fn fetch_stable_order_keys(&self, schema: &str, table: &str) -> Result<Vec<StableOrderKey>, DbError> {
+        let order_sql = "SELECT \
+                         c.relkind::text, \
+                         EXISTS(SELECT 1 FROM pg_catalog.pg_inherits inh WHERE inh.inhparent = c.oid), \
+                         CASE WHEN c.relkind IN ('r', 'p', 'm') THEN pg_catalog.has_column_privilege(c.oid, 'ctid', 'SELECT') ELSE false END, \
+                         CASE WHEN c.relkind IN ('r', 'p') THEN pg_catalog.has_column_privilege(c.oid, 'tableoid', 'SELECT') ELSE false END, \
+                         i.indisprimary, \
+                         ic.relname, \
+                         i.indnkeyatts::int4, \
+                         CASE \
+                             WHEN i.indrelid IS NULL THEN NULL::text[] \
+                             ELSE ARRAY( \
+                                 SELECT CASE \
+                                     WHEN k.attnum > 0 AND a.attnotnull AND (k.coll_oid = 0::oid OR k.coll_oid = a.attcollation) THEN a.attname::text \
+                                     ELSE NULL \
+                                 END \
+                                 FROM unnest(i.indkey, i.indcollation) WITH ORDINALITY AS k(attnum, coll_oid, ord) \
+                                 LEFT JOIN pg_catalog.pg_attribute a \
+                                     ON a.attrelid = c.oid AND a.attnum = k.attnum AND NOT a.attisdropped \
+                                 WHERE k.ord <= i.indnkeyatts \
+                                 ORDER BY k.ord \
+                             ) \
+                         END \
+                         FROM pg_catalog.pg_class c \
+                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                         LEFT JOIN pg_catalog.pg_index i \
+                             ON i.indrelid = c.oid \
+                             AND i.indisunique \
+                             AND i.indisvalid \
+                             AND i.indisready \
+                             AND i.indpred IS NULL \
+                             AND NOT i.indisexclusion \
+                             AND i.indnkeyatts > 0 \
+                         LEFT JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
+                         WHERE n.nspname = $1 AND c.relname = $2 \
+                         ORDER BY i.indisprimary DESC NULLS LAST, i.indnkeyatts ASC NULLS LAST, ic.relname ASC NULLS LAST";
+        let rows = self
+            .client
+            .query(order_sql, &[&schema, &table])
+            .await
+            .map_err(|e| self.map_aux_query_err(e))?;
+        let Some(first) = rows.first() else {
+            return Ok(Vec::new());
+        };
+        let relkind: String = first.get(0);
+        let has_children: bool = first.get(1);
+        let can_read_ctid: bool = first.get(2);
+        let can_read_tableoid: bool = first.get(3);
+        let mut candidates = Vec::new();
+        for row in &rows {
+            let Some(is_primary) = row.get::<usize, Option<bool>>(4) else {
+                continue;
+            };
+            let Some(idx_name) = row.get::<usize, Option<String>>(5) else {
+                continue;
+            };
+            let Some(nkeyatts) = row.get::<usize, Option<i32>>(6) else {
+                continue;
+            };
+            let Some(key_cols) = row.get::<usize, Option<Vec<Option<String>>>>(7) else {
+                continue;
+            };
+            if let Ok(nkeyatts) = usize::try_from(nkeyatts) {
+                candidates.push((is_primary, idx_name, nkeyatts, key_cols));
+            }
+        }
+        Ok(select_pg_stable_order_keys(
+            &relkind,
+            has_children,
+            can_read_ctid,
+            can_read_tableoid,
+            &candidates,
+        ))
+    }
+
+    async fn execute_pg_page_query(
+        &self,
+        columns: &[ColumnMeta],
+        req: &PageRequest,
+        stable_order: &[StableOrderKey],
+        limit: i64,
+        offset: i64,
+    ) -> Result<DecodedPageBatch, DbError> {
+        let sql = build_table_page_sql(&req.schema, &req.table, columns, req, stable_order, limit, offset);
+        let start = Instant::now();
+        let pg_rows = self
+            .client
+            .query(&sql, &[])
+            .await
+            .map_err(|e| self.map_aux_query_err(e))?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let has_more = pg_rows.len() > limit as usize;
+        let row_count = pg_rows.len().min(limit as usize);
+        let mut decoded_rows = Vec::with_capacity(row_count);
+        let mut raw_rows = Vec::with_capacity(row_count);
+        for row in pg_rows.into_iter().take(limit as usize) {
+            let mut cells = Vec::with_capacity(columns.len());
+            let mut raw_cells = Vec::with_capacity(columns.len());
+            for (idx, col) in columns.iter().enumerate() {
+                let raw = row
+                    .try_get::<usize, Option<String>>(idx)
+                    .map_err(|e| self.map_session_err(e))?;
+                let cell = CellValue::parse_from_pg_text(&col.udt_name, raw.clone());
+                let raw_cell = match raw {
+                    None => PostgresRawValue::Null,
+                    Some(s) if col.udt_name == "bytea" => match &cell {
+                        CellValue::Bytes(bytes) => PostgresRawValue::Bytes(bytes.clone()),
+                        _ => PostgresRawValue::Text(s),
+                    },
+                    Some(s) => PostgresRawValue::Text(s),
+                };
+                cells.push(cell);
+                raw_cells.push(RawCellValue::Postgres(raw_cell));
+            }
+            decoded_rows.push(cells);
+            raw_rows.push(raw_cells);
+        }
+
+        let log = ExecutedSql {
+            sql,
+            duration_ms: elapsed_ms,
+            error: None,
+        };
+        Ok(DecodedPageBatch {
+            rows: decoded_rows,
+            raw_rows,
+            has_more,
+            log,
+        })
     }
 }
 
@@ -1017,16 +1172,17 @@ impl DbSession for PostgresSession {
         }
         let limit = req.limit.clamp(1, 5000);
         let offset = req.offset.max(0);
-        let (columns, _) = self.fetch_column_metas(&req.schema, &req.table).await?;
+        let (columns, foreign_keys, _) = self.fetch_column_metas(&req.schema, &req.table).await?;
 
         if columns.is_empty() {
             return Ok((
                 TablePage {
                     columns,
+                    foreign_keys: Vec::new(),
                     rows: Vec::new(),
                     raw_rows: Vec::new(),
                     transaction_support: TableTransactionSupport::Supported,
-                    offset,
+                    offset: 0,
                     limit,
                     total_rows_estimate: Some(0),
                     total_is_exact: true,
@@ -1046,13 +1202,72 @@ impl DbSession for PostgresSession {
             )));
         }
 
-        let sql = build_table_page_sql(&req.schema, &req.table, &columns, req, limit, offset);
-        let start = Instant::now();
-        let pg_rows = self
-            .client
-            .query(&sql, &[])
-            .await
-            .map_err(|e| self.map_aux_query_err(e))?;
+        let stable_order = self.fetch_stable_order_keys(&req.schema, &req.table).await?;
+        let mut effective_offset = offset;
+        let first_batch = self
+            .execute_pg_page_query(&columns, req, &stable_order, limit, effective_offset)
+            .await?;
+        let elapsed_ms = first_batch.log.duration_ms;
+        let mut logs = vec![first_batch.log];
+        let mut decoded_rows = first_batch.rows;
+        let mut raw_rows = first_batch.raw_rows;
+        let mut has_more = first_batch.has_more;
+
+        let filter_trimmed = req
+            .filter_where
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty());
+        let filter_active = filter_trimmed.is_some();
+
+        if decoded_rows.is_empty() && effective_offset > 0 {
+            let mut count_sql = format!(
+                "SELECT COUNT(*)::bigint FROM {}.{}",
+                quote_ident(&req.schema),
+                quote_ident(&req.table)
+            );
+            if let Some(trimmed) = filter_trimmed {
+                count_sql.push_str(&format!(" WHERE ({trimmed})"));
+            }
+            let count_start = Instant::now();
+            let count_row = self
+                .client
+                .query_one(&count_sql, &[])
+                .await
+                .map_err(|e| self.map_aux_query_err(e))?;
+            logs.push(ExecutedSql {
+                sql: count_sql,
+                duration_ms: count_start.elapsed().as_millis() as u64,
+                error: None,
+            });
+            let actual_total: i64 = count_row.get(0);
+            if actual_total <= 0 {
+                effective_offset = 0;
+                has_more = false;
+            } else {
+                let recovered_offset = last_page_offset(actual_total, limit);
+                let rec_batch = self
+                    .execute_pg_page_query(&columns, req, &stable_order, limit, recovered_offset)
+                    .await?;
+                logs.push(rec_batch.log);
+                effective_offset = recovered_offset;
+                decoded_rows = rec_batch.rows;
+                raw_rows = rec_batch.raw_rows;
+                has_more = rec_batch.has_more;
+
+                if decoded_rows.is_empty() && effective_offset > 0 {
+                    let zero_batch = self
+                        .execute_pg_page_query(&columns, req, &stable_order, limit, 0)
+                        .await?;
+                    logs.push(zero_batch.log);
+                    effective_offset = 0;
+                    decoded_rows = zero_batch.rows;
+                    raw_rows = zero_batch.raw_rows;
+                    has_more = zero_batch.has_more;
+                }
+            }
+        }
+
         let after_scs = self.sync_standard_conforming_strings().await;
         if after_scs != before_scs
             && let Ok(mut guard) = self.live_state.lock()
@@ -1064,48 +1279,10 @@ impl DbSession for PostgresSession {
                 guard.session_scs = None;
             }
         }
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-
-        let mut logs = vec![ExecutedSql {
-            sql,
-            duration_ms: elapsed_ms,
-            error: None,
-        }];
-
-        let has_more = pg_rows.len() > limit as usize;
-        let row_count = pg_rows.len().min(limit as usize);
-        let mut decoded_rows = Vec::with_capacity(row_count);
-        let mut raw_rows = Vec::with_capacity(row_count);
-        for row in pg_rows.into_iter().take(limit as usize) {
-            let mut cells = Vec::with_capacity(columns.len());
-            let mut raw_cells = Vec::with_capacity(columns.len());
-            for (idx, col) in columns.iter().enumerate() {
-                let raw = row
-                    .try_get::<usize, Option<String>>(idx)
-                    .map_err(|e| self.map_session_err(e))?;
-                let cell = CellValue::parse_from_pg_text(&col.udt_name, raw.clone());
-                let raw_cell = match raw {
-                    None => PostgresRawValue::Null,
-                    Some(s) if col.udt_name == "bytea" => match &cell {
-                        CellValue::Bytes(bytes) => PostgresRawValue::Bytes(bytes.clone()),
-                        _ => PostgresRawValue::Text(s),
-                    },
-                    Some(s) => PostgresRawValue::Text(s),
-                };
-                cells.push(cell);
-                raw_cells.push(RawCellValue::Postgres(raw_cell));
-            }
-            decoded_rows.push(cells);
-            raw_rows.push(raw_cells);
-        }
-
-        let filter_active = req
-            .filter_where
-            .as_deref()
-            .is_some_and(|w| !w.trim().is_empty());
 
         let (total_rows_estimate, total_is_exact) = if !has_more {
-            (Some(offset + decoded_rows.len() as i64), true)
+            debug_assert!(!decoded_rows.is_empty() || effective_offset == 0);
+            (Some(effective_offset + decoded_rows.len() as i64), true)
         } else if !filter_active {
             let est_sql = "SELECT CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint ELSE NULL END \
                            FROM pg_catalog.pg_class c \
@@ -1137,10 +1314,11 @@ impl DbSession for PostgresSession {
         Ok((
             TablePage {
                 columns,
+                foreign_keys,
                 rows: decoded_rows,
                 raw_rows,
                 transaction_support: TableTransactionSupport::Supported,
-                offset,
+                offset: effective_offset,
                 limit,
                 total_rows_estimate,
                 total_is_exact,
@@ -1155,7 +1333,7 @@ impl DbSession for PostgresSession {
         let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
         let mut logs = Vec::new();
-        let (columns, col_log) = self.fetch_column_metas(schema, table).await?;
+        let (columns, foreign_keys, col_log) = self.fetch_column_metas(schema, table).await?;
         logs.push(col_log);
 
         let idx_sql = "SELECT \
@@ -1257,7 +1435,7 @@ impl DbSession for PostgresSession {
                     quote_ident(table),
                     view_def.as_deref().unwrap_or("").trim()
                 ),
-                _ => synthesize_table_ddl(schema, table, &columns, &indexes),
+                _ => synthesize_table_ddl(schema, table, &columns, &foreign_keys, &indexes),
             };
             TableStats {
                 total_bytes,
@@ -1275,7 +1453,7 @@ impl DbSession for PostgresSession {
                 index_bytes: None,
                 estimated_rows: None,
                 comment: None,
-                ddl: synthesize_table_ddl(schema, table, &columns, &indexes),
+                ddl: synthesize_table_ddl(schema, table, &columns, &foreign_keys, &indexes),
                 transaction_support: TableTransactionSupport::Supported,
             }
         };
@@ -1283,6 +1461,7 @@ impl DbSession for PostgresSession {
         Ok((
             TableStructure {
                 columns,
+                foreign_keys,
                 indexes,
                 stats,
             },
@@ -1588,16 +1767,17 @@ impl DbSession for PostgresSession {
     async fn fetch_fk_row(
         &self,
         fk: &ForeignKeyRef,
-        value: &CellValue,
-        source_col: &ColumnMeta,
+        components: &[FkLookupComponent],
     ) -> Result<(FkPeekRow, ExecutedSql), DbError> {
         let _guard = self.client_lock.lock().await;
         self.ensure_alive()?;
-        let Some(where_clause) = build_fk_where_clause(&fk.target_column, value, source_col) else {
-            return Err(DbError::InvalidInput("cannot peek NULL foreign-key value".to_owned()));
+        let Some(where_clause) = build_fk_where_clause(fk, components) else {
+            return Err(DbError::InvalidInput(
+                "cannot peek unresolved or NULL foreign-key value".to_owned(),
+            ));
         };
 
-        let (target_columns, _) = self
+        let (target_columns, _, _) = self
             .fetch_column_metas(&fk.target_schema, &fk.target_table)
             .await?;
         if target_columns.is_empty() {
@@ -1606,16 +1786,27 @@ impl DbSession for PostgresSession {
                 fk.target_schema, fk.target_table
             )));
         }
+        for target_col in &fk.target_columns {
+            if !target_columns.iter().any(|c| c.name == *target_col) {
+                return Err(DbError::InvalidInput(format!(
+                    "target table {}.{} is missing referenced column {target_col}",
+                    fk.target_schema, fk.target_table
+                )));
+            }
+        }
 
+        let stable_order = self
+            .fetch_stable_order_keys(&fk.target_schema, &fk.target_table)
+            .await?;
         let req = PageRequest {
             schema: fk.target_schema.clone(),
             table: fk.target_table.clone(),
-            filter_where: Some(where_clause.clone()),
+            filter_where: Some(where_clause),
             sort: None,
             limit: 1,
             offset: 0,
         };
-        let sql = build_table_page_sql(&fk.target_schema, &fk.target_table, &target_columns, &req, 1, 0);
+        let sql = build_table_page_sql(&fk.target_schema, &fk.target_table, &target_columns, &req, &stable_order, 1, 0);
         let start = Instant::now();
         let pg_rows = self
             .client
@@ -1640,7 +1831,7 @@ impl DbSession for PostgresSession {
         Ok((
             FkPeekRow {
                 fk: fk.clone(),
-                lookup_display: format!("{} = {}", fk.target_column, value.display_compact()),
+                lookup_display: format_fk_lookup_display(components),
                 columns: target_columns,
                 row,
                 elapsed_ms,
@@ -2444,12 +2635,160 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// Builds the paginated `SELECT` query with safe identifier quoting and text/hex projection.
+type PgFkRowTuple = (i64, String, String, String, Option<String>, Option<String>, i32, i32);
+
+struct PgFkGroup {
+    constraint_name: String,
+    target_schema: String,
+    target_table: String,
+    expected_src_len: usize,
+    expected_dst_len: usize,
+    pairs: Vec<(Option<String>, Option<String>)>,
+}
+
+fn assemble_pg_foreign_keys(rows: Vec<PgFkRowTuple>) -> Vec<ForeignKeyRef> {
+    let mut groups: BTreeMap<(String, i64), PgFkGroup> = BTreeMap::new();
+    for (oid, conname, target_schema, target_table, src_att, dst_att, expected_src_len, expected_dst_len) in rows {
+        let entry = groups.entry((conname.clone(), oid)).or_insert_with(|| PgFkGroup {
+            constraint_name: conname,
+            target_schema,
+            target_table,
+            expected_src_len: usize::try_from(expected_src_len).unwrap_or(0),
+            expected_dst_len: usize::try_from(expected_dst_len).unwrap_or(0),
+            pairs: Vec::new(),
+        });
+        entry.pairs.push((src_att, dst_att));
+    }
+
+    groups
+        .into_values()
+        .filter_map(|group| {
+            let source_columns: Vec<String> = group
+                .pairs
+                .iter()
+                .filter_map(|(src, _)| src.as_deref().filter(|s| !s.is_empty()).map(str::to_owned))
+                .collect();
+            if source_columns.is_empty() {
+                return None;
+            }
+            let all_resolved = group.expected_src_len > 0
+                && group.expected_src_len == group.expected_dst_len
+                && group.pairs.len() == group.expected_src_len
+                && group
+                    .pairs
+                    .iter()
+                    .all(|(src, dst)| src.as_deref().is_some_and(|s| !s.is_empty()) && dst.as_deref().is_some_and(|d| !d.is_empty()));
+            let target_columns = if all_resolved {
+                group.pairs.into_iter().filter_map(|(_, dst)| dst).collect()
+            } else {
+                Vec::new()
+            };
+            Some(ForeignKeyRef {
+                constraint_name: group.constraint_name,
+                target_schema: group.target_schema,
+                target_table: group.target_table,
+                source_columns,
+                target_columns,
+            })
+        })
+        .collect()
+}
+
+fn select_pg_stable_order_keys(
+    relkind: &str,
+    has_children: bool,
+    can_read_ctid: bool,
+    can_read_tableoid: bool,
+    candidates: &[(bool, String, usize, Vec<Option<String>>)],
+) -> Vec<StableOrderKey> {
+    let mut ordered: Vec<&(bool, String, usize, Vec<Option<String>>)> = candidates.iter().collect();
+    ordered.sort_by(|a, b| (!a.0).cmp(&(!b.0)).then_with(|| a.2.cmp(&b.2)).then_with(|| a.1.cmp(&b.1)));
+
+    for (_, _, nkeyatts, key_cols) in ordered {
+        if *nkeyatts > 0
+            && key_cols.len() == *nkeyatts
+            && key_cols
+                .iter()
+                .all(|col| col.as_deref().is_some_and(|name| !name.trim().is_empty()))
+        {
+            let mut keys: Vec<StableOrderKey> = key_cols
+                .iter()
+                .filter_map(|col| col.clone())
+                .map(|name| StableOrderKey::Column {
+                    name,
+                    nullable: false,
+                    collation: None,
+                })
+                .collect();
+            if relkind == "r" && has_children {
+                if can_read_tableoid {
+                    keys.push(StableOrderKey::System("tableoid"));
+                }
+                if can_read_ctid {
+                    keys.push(StableOrderKey::System("ctid"));
+                }
+            }
+            return keys;
+        }
+    }
+
+    match relkind {
+        "p" => {
+            if can_read_tableoid && can_read_ctid {
+                vec![StableOrderKey::System("tableoid"), StableOrderKey::System("ctid")]
+            } else {
+                Vec::new()
+            }
+        }
+        "r" if has_children => {
+            if can_read_tableoid && can_read_ctid {
+                vec![StableOrderKey::System("tableoid"), StableOrderKey::System("ctid")]
+            } else {
+                Vec::new()
+            }
+        }
+        "r" | "m" => {
+            if can_read_ctid {
+                vec![StableOrderKey::System("ctid")]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn pg_type_lacks_btree_order(udt_name: &str) -> bool {
+    matches!(
+        udt_name,
+        "json"
+            | "_json"
+            | "xml"
+            | "_xml"
+            | "point"
+            | "_point"
+            | "line"
+            | "_line"
+            | "lseg"
+            | "_lseg"
+            | "path"
+            | "_path"
+            | "box"
+            | "_box"
+            | "polygon"
+            | "_polygon"
+            | "circle"
+            | "_circle"
+    )
+}
+
+/// Builds the paginated `SELECT` query with safe identifier quoting, deterministic ordering, and text/hex projection.
 pub fn build_table_page_sql(
     schema: &str,
     table: &str,
     columns: &[ColumnMeta],
     req: &PageRequest,
+    stable_order: &[StableOrderKey],
     limit: i64,
     offset: i64,
 ) -> String {
@@ -2466,20 +2805,48 @@ pub fn build_table_page_sql(
         }
     }
 
-    let mut sql = format!(
-        "SELECT {projections} FROM {}.{}",
-        quote_ident(schema),
-        quote_ident(table)
-    );
+    let fq_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    let mut sql = format!("SELECT {projections} FROM {fq_table}");
     if let Some(where_clause) = &req.filter_where {
         let trimmed = where_clause.trim();
         if !trimmed.is_empty() {
             sql.push_str(&format!(" WHERE ({trimmed})"));
         }
     }
+    let sort_uses_text_cast = req.sort.as_ref().is_some_and(|sort| {
+        columns
+            .iter()
+            .find(|c| c.name == sort.column)
+            .is_some_and(|c| pg_type_lacks_btree_order(&c.udt_name))
+    });
+    let mut order_terms = Vec::new();
     if let Some(sort) = &req.sort {
         let dir = if sort.ascending { "ASC" } else { "DESC" };
-        sql.push_str(&format!(" ORDER BY {} {dir} NULLS LAST", quote_ident(&sort.column)));
+        if sort_uses_text_cast {
+            order_terms.push(format!("{fq_table}.{}::text {dir} NULLS LAST", quote_ident(&sort.column)));
+        } else {
+            order_terms.push(format!("{fq_table}.{} {dir} NULLS LAST", quote_ident(&sort.column)));
+        }
+    }
+    for key in stable_order {
+        match key {
+            StableOrderKey::Column { name, nullable, .. } => {
+                if !sort_uses_text_cast && req.sort.as_ref().is_some_and(|s| s.column == *name) {
+                    continue;
+                }
+                if *nullable {
+                    order_terms.push(format!("{fq_table}.{} ASC NULLS LAST", quote_ident(name)));
+                } else {
+                    order_terms.push(format!("{fq_table}.{} ASC", quote_ident(name)));
+                }
+            }
+            StableOrderKey::System(ident) => {
+                order_terms.push(format!("{fq_table}.{ident} ASC"));
+            }
+        }
+    }
+    if !order_terms.is_empty() {
+        sql.push_str(&format!(" ORDER BY {}", order_terms.join(", ")));
     }
     sql.push_str(&format!(" LIMIT {} OFFSET {}", limit + 1, offset));
     sql
@@ -2490,6 +2857,7 @@ pub fn synthesize_table_ddl(
     schema: &str,
     table: &str,
     columns: &[ColumnMeta],
+    foreign_keys: &[ForeignKeyRef],
     indexes: &[IndexInfo],
 ) -> String {
     let mut out = format!("CREATE TABLE {}.{} (\n", quote_ident(schema), quote_ident(table));
@@ -2515,16 +2883,32 @@ pub fn synthesize_table_ddl(
         clauses.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
 
-    for col in columns {
-        if let Some(fk) = &col.foreign_key {
-            clauses.push(format!(
-                "    CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}.{} ({})",
-                quote_ident(&fk.constraint_name),
-                quote_ident(&col.name),
-                quote_ident(&fk.target_schema),
-                quote_ident(&fk.target_table),
-                quote_ident(&fk.target_column),
-            ));
+    for fk in crate::engine::collect_foreign_keys(foreign_keys, columns) {
+        if !fk.source_columns.is_empty() {
+            let src_list = fk
+                .source_columns
+                .iter()
+                .map(|c| quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let target_ref = format!("{}.{}", quote_ident(&fk.target_schema), quote_ident(&fk.target_table));
+            if fk.is_resolvable() {
+                let dst_list = fk
+                    .target_columns
+                    .iter()
+                    .map(|c| quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                clauses.push(format!(
+                    "    CONSTRAINT {} FOREIGN KEY ({src_list}) REFERENCES {target_ref} ({dst_list})",
+                    quote_ident(&fk.constraint_name),
+                ));
+            } else {
+                clauses.push(format!(
+                    "    CONSTRAINT {} FOREIGN KEY ({src_list}) REFERENCES {target_ref}",
+                    quote_ident(&fk.constraint_name),
+                ));
+            }
         }
     }
 
@@ -2999,12 +3383,12 @@ pub fn concise_pg_version(raw: &str) -> String {
 #[allow(clippy::expect_used)]
 mod tests {
     use crate::connection::{ConnectionProfile, DbEngine, SslMode};
-    use crate::engine::{CellValue, ColumnMeta, PostgresRawValue, RawCellValue};
+    use crate::engine::{CellValue, ColumnMeta, PageRequest, PostgresRawValue, RawCellValue, StableOrderKey};
     use crate::staging::StagedCellValue;
 
     use super::{
-        PgLiveSessionState, PgSqlstateError, build_pg_config, build_pg_staged_mutation_sql, concise_pg_version,
-        evaluate_mid_batch_pg_mode, is_pg_disconnect_sqlstate, should_retire_after_cancel,
+        PgLiveSessionState, PgSqlstateError, build_pg_config, build_pg_staged_mutation_sql, build_table_page_sql,
+        concise_pg_version, evaluate_mid_batch_pg_mode, is_pg_disconnect_sqlstate, should_retire_after_cancel,
     };
 
     #[test]
@@ -3794,5 +4178,287 @@ mod tests {
             matches!(mapped, crate::engine::DbError::QueryFailed { .. }),
             "expected QueryFailed for isolated grid failure, got {mapped:?}"
         );
+    }
+
+    #[test]
+    fn assemble_pg_foreign_keys_and_attach_handle_composite_and_dropped_cols() {
+        let fks = super::assemble_pg_foreign_keys(vec![
+            (
+                10,
+                "fk_sections".to_owned(),
+                "public".to_owned(),
+                "course_sections".to_owned(),
+                Some("term".to_owned()),
+                Some("semester".to_owned()),
+                2,
+                2,
+            ),
+            (
+                10,
+                "fk_sections".to_owned(),
+                "public".to_owned(),
+                "course_sections".to_owned(),
+                Some("course_code".to_owned()),
+                Some("code".to_owned()),
+                2,
+                2,
+            ),
+            (
+                11,
+                "fk_broken".to_owned(),
+                "public".to_owned(),
+                "old_parent".to_owned(),
+                Some("orphan".to_owned()),
+                None,
+                1,
+                1,
+            ),
+            (
+                12,
+                "fk_term".to_owned(),
+                "public".to_owned(),
+                "terms".to_owned(),
+                Some("term".to_owned()),
+                Some("term_id".to_owned()),
+                1,
+                1,
+            ),
+        ]);
+        assert_eq!(fks.len(), 3);
+        assert_eq!(fks[0].constraint_name, "fk_broken");
+        assert!(!fks[0].is_resolvable());
+        assert_eq!(fks[1].constraint_name, "fk_sections");
+        assert_eq!(fks[1].source_columns, vec!["term", "course_code"]);
+        assert_eq!(fks[1].target_columns, vec!["semester", "code"]);
+        assert!(fks[1].is_resolvable());
+
+        // Resolvable single-column FK on `term` wins in the column map over composite FK sharing `term`,
+        // while `course_code` receives the full composite FK and table-level DDL retains all constraints.
+        let attached = crate::engine::attach_foreign_keys_to_columns(fks.clone());
+        assert_eq!(attached["term"].constraint_name, "fk_term");
+        assert_eq!(attached["course_code"].constraint_name, "fk_sections");
+        assert!(!attached["orphan"].is_resolvable());
+
+        let overlap_cols = vec![
+            ColumnMeta {
+                name: "term".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: attached.get("term").cloned(),
+            },
+            ColumnMeta {
+                name: "course_code".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: attached.get("course_code").cloned(),
+            },
+        ];
+        let mut overlap_fks = fks.clone();
+        overlap_fks.push(crate::engine::ForeignKeyRef::single(
+            "fk_course_code",
+            "course_code",
+            "public",
+            "courses",
+            "code",
+        ));
+        let overlap_ddl = super::synthesize_table_ddl("public", "enrollments", &overlap_cols, &overlap_fks, &[]);
+        assert!(overlap_ddl.contains("CONSTRAINT \"fk_sections\" FOREIGN KEY (\"term\", \"course_code\")"));
+        assert!(overlap_ddl.contains("CONSTRAINT \"fk_term\" FOREIGN KEY (\"term\")"));
+        assert!(overlap_ddl.contains("CONSTRAINT \"fk_course_code\" FOREIGN KEY (\"course_code\")"));
+    }
+
+    #[test]
+    fn pg_stable_order_keys_and_page_sql_enforce_determinism() {
+        assert_eq!(crate::engine::last_page_offset(0, 50), 0);
+        assert_eq!(crate::engine::last_page_offset(1, 50), 0);
+        assert_eq!(crate::engine::last_page_offset(50, 50), 0);
+        assert_eq!(crate::engine::last_page_offset(51, 50), 50);
+        assert_eq!(crate::engine::last_page_offset(120, 50), 100);
+
+        // Unique non-null preferred when no PK, ignoring nullable unique and expression unique.
+        let unique_fallback = super::select_pg_stable_order_keys(
+            "r",
+            false,
+            true,
+            true,
+            &[
+                (false, "nullable_idx".to_owned(), 1, vec![None]),
+                (false, "expr_idx".to_owned(), 1, vec![None]),
+                (
+                    false,
+                    "u_pair".to_owned(),
+                    2,
+                    vec![Some("code".to_owned()), Some("term".to_owned())],
+                ),
+            ],
+        );
+        assert_eq!(
+            unique_fallback,
+            vec![
+                StableOrderKey::Column {
+                    name: "code".to_owned(),
+                    nullable: false,
+                    collation: None,
+                },
+                StableOrderKey::Column {
+                    name: "term".to_owned(),
+                    nullable: false,
+                    collation: None,
+                },
+            ]
+        );
+
+        // Traditional inheritance parent with a PK retains (tableoid, ctid) tie-breakers when readable;
+        // declarative partitioned keeps PK only; roles lacking system column SELECT omit unreadable ties.
+        let parent_pk_candidate = [(true, "parent_pkey".to_owned(), 1, vec![Some("id".to_owned())])];
+        assert_eq!(
+            super::select_pg_stable_order_keys("r", true, true, true, &parent_pk_candidate),
+            vec![
+                StableOrderKey::Column {
+                    name: "id".to_owned(),
+                    nullable: false,
+                    collation: None,
+                },
+                StableOrderKey::System("tableoid"),
+                StableOrderKey::System("ctid"),
+            ]
+        );
+        assert_eq!(
+            super::select_pg_stable_order_keys("r", true, false, false, &parent_pk_candidate),
+            vec![StableOrderKey::Column {
+                name: "id".to_owned(),
+                nullable: false,
+                collation: None,
+            }]
+        );
+        assert_eq!(
+            super::select_pg_stable_order_keys("p", true, true, true, &parent_pk_candidate),
+            vec![StableOrderKey::Column {
+                name: "id".to_owned(),
+                nullable: false,
+                collation: None,
+            }]
+        );
+
+        // Partitioned table and inherited parent fall back to (tableoid, ctid) when privileged; regular/matview to ctid.
+        assert_eq!(
+            super::select_pg_stable_order_keys("p", false, true, true, &[]),
+            vec![StableOrderKey::System("tableoid"), StableOrderKey::System("ctid")]
+        );
+        assert_eq!(
+            super::select_pg_stable_order_keys("r", true, true, true, &[]),
+            vec![StableOrderKey::System("tableoid"), StableOrderKey::System("ctid")]
+        );
+        assert_eq!(
+            super::select_pg_stable_order_keys("r", false, true, true, &[]),
+            vec![StableOrderKey::System("ctid")]
+        );
+        assert_eq!(
+            super::select_pg_stable_order_keys("m", false, true, false, &[]),
+            vec![StableOrderKey::System("ctid")]
+        );
+        assert!(super::select_pg_stable_order_keys("r", false, false, false, &[]).is_empty());
+        assert!(super::select_pg_stable_order_keys("p", false, false, false, &[]).is_empty());
+        assert!(super::select_pg_stable_order_keys("m", false, false, false, &[]).is_empty());
+        assert!(super::select_pg_stable_order_keys("v", false, true, true, &[]).is_empty());
+
+        let cols = vec![
+            ColumnMeta {
+                name: "student_id".to_owned(),
+                data_type: "integer".to_owned(),
+                udt_name: "int4".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "full_name".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "payload".to_owned(),
+                data_type: "json".to_owned(),
+                udt_name: "json".to_owned(),
+                nullable: true,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ];
+        let pk_order = vec![StableOrderKey::Column {
+            name: "student_id".to_owned(),
+            nullable: false,
+            collation: None,
+        }];
+        let default_req = PageRequest {
+            schema: "public".to_owned(),
+            table: "students".to_owned(),
+            filter_where: None,
+            sort: None,
+            limit: 50,
+            offset: 0,
+        };
+        let default_sql = build_table_page_sql("public", "students", &cols, &default_req, &pk_order, 50, 0);
+        assert!(default_sql.ends_with(" ORDER BY \"public\".\"students\".\"student_id\" ASC LIMIT 51 OFFSET 0"));
+
+        let tie_req = PageRequest {
+            sort: Some(crate::engine::SortSpec {
+                column: "full_name".to_owned(),
+                ascending: false,
+            }),
+            ..default_req.clone()
+        };
+        let tie_sql = build_table_page_sql("public", "students", &cols, &tie_req, &pk_order, 50, 50);
+        assert!(tie_sql.ends_with(
+            " ORDER BY \"public\".\"students\".\"full_name\" DESC NULLS LAST, \"public\".\"students\".\"student_id\" ASC LIMIT 51 OFFSET 50"
+        ));
+
+        let json_sort_req = PageRequest {
+            sort: Some(crate::engine::SortSpec {
+                column: "payload".to_owned(),
+                ascending: true,
+            }),
+            ..default_req.clone()
+        };
+        let json_sort_sql = build_table_page_sql("public", "students", &cols, &json_sort_req, &pk_order, 50, 0);
+        assert!(json_sort_sql.ends_with(
+            " ORDER BY \"public\".\"students\".\"payload\"::text ASC NULLS LAST, \"public\".\"students\".\"student_id\" ASC LIMIT 51 OFFSET 0"
+        ));
+
+        let pk_sort_req = PageRequest {
+            sort: Some(crate::engine::SortSpec {
+                column: "student_id".to_owned(),
+                ascending: false,
+            }),
+            ..default_req.clone()
+        };
+        let pk_sort_sql = build_table_page_sql("public", "students", &cols, &pk_sort_req, &pk_order, 50, 0);
+        assert!(pk_sort_sql.ends_with(" ORDER BY \"public\".\"students\".\"student_id\" DESC NULLS LAST LIMIT 51 OFFSET 0"));
+
+        let sys_order = vec![StableOrderKey::System("tableoid"), StableOrderKey::System("ctid")];
+        let sys_sql = build_table_page_sql("public", "students", &cols, &default_req, &sys_order, 50, 0);
+        assert!(sys_sql.ends_with(" ORDER BY \"public\".\"students\".tableoid ASC, \"public\".\"students\".ctid ASC LIMIT 51 OFFSET 0"));
     }
 }

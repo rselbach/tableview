@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::connection::DbEngine;
-use crate::engine::{CellValue, ColumnMeta, RawCellValue, SqliteRawValue};
+use crate::engine::{
+    CellValue, ColumnMeta, ForeignKeyRef, MysqlRawValue, PostgresRawValue, RawCellValue, SqliteRawValue,
+};
 
 /// Identifier for a newly inserted unsaved row inside a table tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1365,30 +1367,241 @@ fn is_plain_decimal(s: &str) -> bool {
     seen_digit
 }
 
-/// Builds a `WHERE` filter snippet targeting the referenced foreign-key row, returning `None` for `NULL`.
-pub fn build_fk_where_clause(
-    target_column: &str,
-    value: &CellValue,
-    source_col: &ColumnMeta,
-) -> Option<String> {
-    build_fk_where_clause_for_engine(DbEngine::Postgres, target_column, value, source_col)
+/// Resolves the full ordered foreign-key lookup components for `fk` from `row`,
+/// returning `None` when the constraint is unresolvable or any key component is `NULL` or missing.
+pub fn resolve_fk_lookup_components(
+    fk: &ForeignKeyRef,
+    columns: &[crate::engine::ColumnMeta],
+    row: &[CellValue],
+) -> Option<Vec<crate::engine::FkLookupComponent>> {
+    resolve_fk_lookup_components_with_raw(fk, columns, row, None)
 }
 
-/// Builds a dialect-aware `WHERE` filter snippet targeting the referenced foreign-key row, returning `None` for `NULL`.
-pub fn build_fk_where_clause_for_engine(
-    engine: DbEngine,
-    target_column: &str,
-    value: &CellValue,
-    source_col: &ColumnMeta,
-) -> Option<String> {
-    if value.is_null() {
+/// Resolves the full ordered foreign-key lookup components for `fk` from `row` and optional
+/// unedited per-cell raw values, returning `None` when unresolvable or any key component is `NULL`.
+pub fn resolve_fk_lookup_components_with_raw(
+    fk: &ForeignKeyRef,
+    columns: &[crate::engine::ColumnMeta],
+    row: &[CellValue],
+    raw_row: Option<&[Option<RawCellValue>]>,
+) -> Option<Vec<crate::engine::FkLookupComponent>> {
+    if !fk.is_resolvable() {
         return None;
     }
-    Some(format!(
-        "{} = {}",
-        engine.quote_ident(target_column),
-        format_cell_literal(engine, source_col, value)
-    ))
+    let mut components = Vec::with_capacity(fk.source_columns.len());
+    for (src_col, dst_col) in fk.source_columns.iter().zip(fk.target_columns.iter()) {
+        let col_idx = columns.iter().position(|c| c.name == *src_col)?;
+        let val = row.get(col_idx)?;
+        if val.is_null() {
+            return None;
+        }
+        let raw_value = raw_row
+            .and_then(|r| r.get(col_idx))
+            .and_then(Clone::clone);
+        if raw_value.as_ref().is_some_and(RawCellValue::is_null) {
+            return None;
+        }
+        components.push(crate::engine::FkLookupComponent {
+            target_column: dst_col.clone(),
+            source_col: columns[col_idx].clone(),
+            value: val.clone(),
+            raw_value,
+        });
+    }
+    Some(components)
+}
+
+/// Formats ordered foreign-key lookup predicates for display in badges and peek headers.
+pub fn format_fk_lookup_display(components: &[crate::engine::FkLookupComponent]) -> String {
+    components
+        .iter()
+        .map(|c| {
+            let val_str = match &c.raw_value {
+                Some(RawCellValue::Sqlite(SqliteRawValue::Text(s))) => s.clone(),
+                _ => c.value.display_compact(),
+            };
+            format!("{} = {val_str}", c.target_column)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_raw_fk_literal(engine: DbEngine, col: &ColumnMeta, raw: &RawCellValue) -> Option<String> {
+    match (engine, raw) {
+        (DbEngine::Sqlite, RawCellValue::Sqlite(v)) => match v {
+            SqliteRawValue::Null => None,
+            SqliteRawValue::Integer(i) => Some(i.to_string()),
+            SqliteRawValue::Real(f) => {
+                if f.is_finite() {
+                    let mut s = f.to_string();
+                    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                        s.push_str(".0");
+                    }
+                    Some(s)
+                } else if f.is_infinite() {
+                    Some(if f.is_sign_positive() {
+                        "1e999".to_owned()
+                    } else {
+                        "-1e999".to_owned()
+                    })
+                } else {
+                    None
+                }
+            }
+            SqliteRawValue::Text(s) => Some(format_sqlite_string_literal(s)),
+            SqliteRawValue::NonUtf8Text(bytes) => {
+                Some(format!("CAST(X'{}' AS TEXT)", crate::engine::encode_hex(bytes)))
+            }
+            SqliteRawValue::Blob(bytes) => Some(format!("X'{}'", crate::engine::encode_hex(bytes))),
+        },
+        (DbEngine::Postgres, RawCellValue::Postgres(v)) => match v {
+            PostgresRawValue::Null => None,
+            PostgresRawValue::Bytes(bytes) => Some(format!("'\\x{}'::bytea", crate::engine::encode_hex(bytes))),
+            PostgresRawValue::Text(s) => {
+                if col.udt_name == "money" {
+                    Some(format!("'{}'::money", escape_sql_string(s.trim())))
+                } else {
+                    Some(format_raw_pg_literal(col, s))
+                }
+            }
+        },
+        (DbEngine::Mysql, RawCellValue::Mysql(v)) => match v {
+            MysqlRawValue::Null => None,
+            MysqlRawValue::Int(i) => Some(i.to_string()),
+            MysqlRawValue::UInt(u) => Some(u.to_string()),
+            MysqlRawValue::Float(f) => f.is_finite().then(|| f.to_string()),
+            MysqlRawValue::Double(d) => d.is_finite().then(|| d.to_string()),
+            MysqlRawValue::Bytes(bytes) => {
+                if classify_column_type(col) == LogicalColType::Bytes {
+                    return Some(format!("X'{}'", crate::engine::encode_hex(bytes)));
+                }
+                let Ok(s) = std::str::from_utf8(bytes) else {
+                    return Some(format!("X'{}'", crate::engine::encode_hex(bytes)));
+                };
+                let trimmed = s.trim();
+                Some(match classify_column_type(col) {
+                    LogicalColType::Bool => {
+                        if trimmed.parse::<i64>().is_ok() {
+                            trimmed.to_owned()
+                        } else {
+                            format_mysql_string_literal(s)
+                        }
+                    }
+                    LogicalColType::Int => {
+                        if trimmed.parse::<i64>().is_ok() || trimmed.parse::<u64>().is_ok() {
+                            trimmed.to_owned()
+                        } else {
+                            format_mysql_string_literal(s)
+                        }
+                    }
+                    LogicalColType::Float => {
+                        if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
+                            trimmed.to_owned()
+                        } else {
+                            format_mysql_string_literal(s)
+                        }
+                    }
+                    LogicalColType::Numeric => {
+                        if is_plain_decimal(trimmed) {
+                            trimmed.to_owned()
+                        } else {
+                            format_mysql_string_literal(s)
+                        }
+                    }
+                    LogicalColType::Text
+                    | LogicalColType::Json
+                    | LogicalColType::Date
+                    | LogicalColType::Time
+                    | LogicalColType::Timestamp
+                    | LogicalColType::TimestampTz
+                    | LogicalColType::Uuid
+                    | LogicalColType::Array => format_mysql_string_literal(s),
+                    LogicalColType::Bytes => format!("X'{}'", crate::engine::encode_hex(bytes)),
+                })
+            }
+            MysqlRawValue::Date {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                micros,
+            } => {
+                if classify_column_type(col) == LogicalColType::Date
+                    && *hour == 0
+                    && *minute == 0
+                    && *second == 0
+                    && *micros == 0
+                {
+                    Some(format!("'{year:04}-{month:02}-{day:02}'"))
+                } else if *micros > 0 {
+                    Some(format!(
+                        "'{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}'"
+                    ))
+                } else {
+                    Some(format!(
+                        "'{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}'"
+                    ))
+                }
+            }
+            MysqlRawValue::Time {
+                neg,
+                days,
+                hour,
+                minute,
+                second,
+                micros,
+            } => {
+                let total_hours = days.saturating_mul(24).saturating_add(u32::from(*hour));
+                let sign = if *neg { "-" } else { "" };
+                if *micros > 0 {
+                    Some(format!("'{sign}{total_hours:02}:{minute:02}:{second:02}.{micros:06}'"))
+                } else {
+                    Some(format!("'{sign}{total_hours:02}:{minute:02}:{second:02}'"))
+                }
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Builds a `WHERE` filter snippet targeting the referenced foreign-key row, returning `None`
+/// if `fk` is unresolvable or any component is `NULL` or mismatched.
+pub fn build_fk_where_clause(
+    fk: &ForeignKeyRef,
+    components: &[crate::engine::FkLookupComponent],
+) -> Option<String> {
+    build_fk_where_clause_for_engine(DbEngine::Postgres, fk, components)
+}
+
+/// Builds a dialect-aware `WHERE` filter snippet targeting the referenced foreign-key row, returning
+/// `None` if `fk` is unresolvable or any component is `NULL` or mismatched.
+pub fn build_fk_where_clause_for_engine(
+    engine: DbEngine,
+    fk: &ForeignKeyRef,
+    components: &[crate::engine::FkLookupComponent],
+) -> Option<String> {
+    if !fk.is_resolvable() || components.len() != fk.target_columns.len() {
+        return None;
+    }
+    let mut clauses = Vec::with_capacity(components.len());
+    for (comp, expected_target) in components.iter().zip(fk.target_columns.iter()) {
+        if comp.target_column != *expected_target || comp.value.is_null() {
+            return None;
+        }
+        let literal = match &comp.raw_value {
+            Some(raw) => match (engine, raw) {
+                (DbEngine::Sqlite, RawCellValue::Sqlite(_))
+                | (DbEngine::Postgres, RawCellValue::Postgres(_))
+                | (DbEngine::Mysql, RawCellValue::Mysql(_)) => format_raw_fk_literal(engine, &comp.source_col, raw)?,
+                _ => format_cell_literal(engine, &comp.source_col, &comp.value),
+            },
+            None => format_cell_literal(engine, &comp.source_col, &comp.value),
+        };
+        clauses.push(format!("{} = {literal}", engine.quote_ident(&comp.target_column)));
+    }
+    Some(clauses.join(" AND "))
 }
 
 #[cfg(test)]

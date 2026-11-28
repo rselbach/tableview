@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -15,15 +15,17 @@ use uuid::Uuid;
 
 use crate::connection::{ConnectionProfile, DbEngine, EnvTag, PasswordMode, SafetyPolicy, SslConfig, SslMode};
 use crate::engine::{
-    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, MysqlRawValue, PageRequest, QueryBatchResult, QueryStatementResult,
-    RawCellValue, SchemaInfo, ServerInfo, TablePage, TableStats, TableStructure, TableTransactionSupport,
-    TransactionOutcome, decode_hex,
+    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, DecodedPageBatch,
+    ExecutedSql, FkLookupComponent, FkPeekRow, ForeignKeyRef, IndexInfo, MysqlRawValue, PageRequest, QueryBatchResult,
+    QueryStatementResult, RawCellValue, SchemaInfo, ServerInfo, StableOrderKey, TableMetaWithOrder, TablePage, TableStats,
+    TableStructure, TableTransactionSupport, TransactionOutcome, attach_foreign_keys_to_columns, decode_hex,
+    last_page_offset,
 };
 use crate::explain::{ExplainPlan, build_explain_sql_for_engine};
 use crate::staging::{
     LogicalColType, StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation,
-    build_fk_where_clause_for_engine, classify_column_type, is_mysql_text_col, strip_hex_prefix,
+    build_fk_where_clause_for_engine, classify_column_type, format_fk_lookup_display, is_mysql_text_col,
+    strip_hex_prefix,
 };
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
@@ -744,7 +746,20 @@ impl MysqlSession {
         Err(wrap_err(DbError::Disconnected))
     }
 
-    async fn fetch_column_metas(&self, schema: &str, table: &str) -> Result<(Vec<ColumnMeta>, ExecutedSql), DbError> {
+    async fn fetch_column_metas(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Vec<ColumnMeta>, Vec<ForeignKeyRef>, ExecutedSql), DbError> {
+        let meta = self.fetch_column_metas_and_order(schema, table).await?;
+        Ok((meta.columns, meta.foreign_keys, meta.log))
+    }
+
+    async fn fetch_column_metas_and_order(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Result<TableMetaWithOrder, DbError> {
         let mut lease = self.get_conn().await?;
         let conn = lease.conn_mut()?;
         let col_sql = "SELECT COLUMN_NAME, COLUMN_TYPE, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, \
@@ -756,56 +771,74 @@ impl MysqlSession {
         let col_rows: Vec<Row> = conn.exec(col_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
 
         let fk_sql = "SELECT COLUMN_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, \
-                      REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+                      REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, ORDINAL_POSITION \
                       FROM information_schema.KEY_COLUMN_USAGE \
                       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
                       ORDER BY CONSTRAINT_NAME ASC, ORDINAL_POSITION ASC";
         let fk_rows: Vec<Row> = conn.exec(fk_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
 
-        let stats_sql = "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX \
+        let stats_sql = "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX, SUB_PART \
                          FROM information_schema.STATISTICS \
                          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                          ORDER BY INDEX_NAME ASC, SEQ_IN_INDEX ASC";
         let stat_rows: Vec<Row> = conn.exec(stats_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
         drop(lease);
 
-        let mut fks: HashMap<String, ForeignKeyRef> = HashMap::new();
-        for row in fk_rows {
-            let col_name = value_to_string(row.as_ref(0).unwrap_or(&Value::NULL));
-            fks.entry(col_name).or_insert_with(|| ForeignKeyRef {
-                constraint_name: value_to_string(row.as_ref(1).unwrap_or(&Value::NULL)),
-                target_schema: value_to_string(row.as_ref(2).unwrap_or(&Value::NULL)),
-                target_table: value_to_string(row.as_ref(3).unwrap_or(&Value::NULL)),
-                target_column: value_to_string(row.as_ref(4).unwrap_or(&Value::NULL)),
-            });
-        }
+        let raw_fk_rows: Vec<MysqlFkRowTuple> = fk_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    value_to_opt_string(row.as_ref(0).unwrap_or(&Value::NULL)),
+                    value_to_string(row.as_ref(1).unwrap_or(&Value::NULL)),
+                    value_to_opt_string(row.as_ref(2).unwrap_or(&Value::NULL)),
+                    value_to_opt_string(row.as_ref(3).unwrap_or(&Value::NULL)),
+                    value_to_opt_string(row.as_ref(4).unwrap_or(&Value::NULL)),
+                    value_to_opt_i64(row.as_ref(5).unwrap_or(&Value::NULL)),
+                )
+            })
+            .collect();
+        let foreign_keys = assemble_mysql_foreign_keys(schema, raw_fk_rows);
+        let mut fks = attach_foreign_keys_to_columns(foreign_keys.clone());
 
-        let mut index_cols: HashMap<String, (bool, Vec<String>)> = HashMap::new();
+        let mut index_cols: HashMap<String, MysqlIndexMeta> = HashMap::new();
         for row in stat_rows {
             let index_name = value_to_string(row.as_ref(0).unwrap_or(&Value::NULL));
             let non_unique = value_to_opt_i64(row.as_ref(1).unwrap_or(&Value::NULL)).unwrap_or(1);
-            let col_name = value_to_string(row.as_ref(2).unwrap_or(&Value::NULL));
+            let col_name = value_to_opt_string(row.as_ref(2).unwrap_or(&Value::NULL)).filter(|s| !s.is_empty());
+            let is_prefix = value_to_opt_i64(row.as_ref(4).unwrap_or(&Value::NULL)).is_some();
             let entry = index_cols
                 .entry(index_name)
-                .or_insert_with(|| (non_unique == 0, Vec::new()));
-            entry.1.push(col_name);
+                .or_insert_with(|| MysqlIndexMeta {
+                    is_unique: non_unique == 0,
+                    cols: Vec::new(),
+                });
+            entry.cols.push(MysqlIndexCol {
+                name: col_name,
+                is_prefix,
+            });
         }
 
-        let mut pk_cols = std::collections::HashSet::new();
-        let mut unique_cols = std::collections::HashSet::new();
-        for (idx_name, (is_unique, cols)) in index_cols {
+        let mut pk_cols = HashSet::new();
+        let mut unique_cols = HashSet::new();
+        for (idx_name, idx_meta) in &index_cols {
             if idx_name == "PRIMARY" {
-                for c in cols {
-                    pk_cols.insert(c);
+                for col in &idx_meta.cols {
+                    if let Some(c) = &col.name {
+                        pk_cols.insert(c.clone());
+                    }
                 }
-            } else if is_unique && cols.len() == 1
-                && let Some(only_col) = cols.into_iter().next()
+            } else if idx_meta.is_unique
+                && idx_meta.cols.len() == 1
+                && let Some(MysqlIndexCol {
+                    name: Some(only_col),
+                    is_prefix: false,
+                }) = idx_meta.cols.first()
             {
-                unique_cols.insert(only_col);
+                unique_cols.insert(only_col.clone());
             }
         }
 
-        let columns = col_rows
+        let columns: Vec<ColumnMeta> = col_rows
             .into_iter()
             .map(|row| {
                 let name = value_to_string(row.as_ref(0).unwrap_or(&Value::NULL));
@@ -845,6 +878,7 @@ impl MysqlSession {
             })
             .collect();
 
+        let stable_order = select_mysql_stable_order_keys(&columns, &index_cols);
         let log = ExecutedSql {
             sql: format!(
                 "{col_sql} -- ? = '{}', ? = '{}'",
@@ -854,7 +888,57 @@ impl MysqlSession {
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         };
-        Ok((columns, log))
+        Ok(TableMetaWithOrder {
+            columns,
+            foreign_keys,
+            stable_order,
+            log,
+        })
+    }
+
+    async fn execute_mysql_page_query(
+        &self,
+        conn: &mut mysql_async::Conn,
+        columns: &[ColumnMeta],
+        req: &PageRequest,
+        stable_order: &[StableOrderKey],
+        limit: i64,
+        offset: i64,
+    ) -> Result<DecodedPageBatch, DbError> {
+        let sql = build_mysql_page_sql(&req.schema, &req.table, columns, req, stable_order, limit + 1, offset);
+        let start = Instant::now();
+        let mysql_rows: Vec<Row> = conn.query(&sql).await.map_err(|e| self.map_session_err(e))?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let has_more = mysql_rows.len() > limit as usize;
+        let row_count = mysql_rows.len().min(limit as usize);
+        let mut decoded_rows = Vec::with_capacity(row_count);
+        let mut raw_rows = Vec::with_capacity(row_count);
+        for row in mysql_rows.into_iter().take(limit as usize) {
+            let wire_cols = row.columns_ref();
+            let mut cells = Vec::with_capacity(columns.len());
+            let mut raw_cells = Vec::with_capacity(columns.len());
+            for (idx, col) in columns.iter().enumerate() {
+                let val = row.as_ref(idx).unwrap_or(&Value::NULL);
+                let wire_col = wire_cols.get(idx);
+                raw_cells.push(RawCellValue::Mysql(mysql_val_to_raw(val)));
+                cells.push(decode_mysql_cell(val, wire_col, Some(col)));
+            }
+            decoded_rows.push(cells);
+            raw_rows.push(raw_cells);
+        }
+
+        let log = ExecutedSql {
+            sql,
+            duration_ms: elapsed_ms,
+            error: None,
+        };
+        Ok(DecodedPageBatch {
+            rows: decoded_rows,
+            raw_rows,
+            has_more,
+            log,
+        })
     }
 }
 
@@ -1047,7 +1131,10 @@ impl DbSession for MysqlSession {
     async fn fetch_table_page(&self, req: &PageRequest) -> Result<(TablePage, Vec<ExecutedSql>), DbError> {
         let limit = req.limit.clamp(1, 5000);
         let offset = req.offset.max(0);
-        let (columns, _) = self.fetch_column_metas(&req.schema, &req.table).await?;
+        let meta = self.fetch_column_metas_and_order(&req.schema, &req.table).await?;
+        let columns = meta.columns;
+        let foreign_keys = meta.foreign_keys;
+        let stable_order = meta.stable_order;
 
         let mut lease = self.get_conn().await?;
         let conn = lease.conn_mut()?;
@@ -1109,10 +1196,11 @@ impl DbSession for MysqlSession {
             return Ok((
                 TablePage {
                     columns,
+                    foreign_keys: Vec::new(),
                     rows: Vec::new(),
                     raw_rows: Vec::new(),
                     transaction_support: TableTransactionSupport::Supported,
-                    offset,
+                    offset: 0,
                     limit,
                     total_rows_estimate: Some(0),
                     total_is_exact: true,
@@ -1132,39 +1220,68 @@ impl DbSession for MysqlSession {
             )));
         }
 
-        let sql = build_mysql_page_sql(&req.schema, &req.table, &columns, req, limit + 1, offset);
-        let start = Instant::now();
-        let mysql_rows: Vec<Row> = conn.query(&sql).await.map_err(|e| self.map_session_err(e))?;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut effective_offset = offset;
+        let first_batch = self
+            .execute_mysql_page_query(conn, &columns, req, &stable_order, limit, effective_offset)
+            .await?;
+        let elapsed_ms = first_batch.log.duration_ms;
+        let mut logs = vec![first_batch.log];
+        let mut decoded_rows = first_batch.rows;
+        let mut raw_rows = first_batch.raw_rows;
+        let mut has_more = first_batch.has_more;
 
-        let mut logs = vec![ExecutedSql {
-            sql,
-            duration_ms: elapsed_ms,
-            error: None,
-        }];
-
-        let has_more = mysql_rows.len() > limit as usize;
-        let row_count = mysql_rows.len().min(limit as usize);
-        let mut decoded_rows = Vec::with_capacity(row_count);
-        let mut raw_rows = Vec::with_capacity(row_count);
-        for row in mysql_rows.into_iter().take(limit as usize) {
-            let wire_cols = row.columns_ref();
-            let mut cells = Vec::with_capacity(columns.len());
-            let mut raw_cells = Vec::with_capacity(columns.len());
-            for (idx, col) in columns.iter().enumerate() {
-                let val = row.as_ref(idx).unwrap_or(&Value::NULL);
-                let wire_col = wire_cols.get(idx);
-                raw_cells.push(RawCellValue::Mysql(mysql_val_to_raw(val)));
-                cells.push(decode_mysql_cell(val, wire_col, Some(col)));
-            }
-            decoded_rows.push(cells);
-            raw_rows.push(raw_cells);
-        }
-
-        let filter_active = req
+        let filter_trimmed = req
             .filter_where
             .as_deref()
-            .is_some_and(|w| !w.trim().is_empty());
+            .map(str::trim)
+            .filter(|w| !w.is_empty());
+        let filter_active = filter_trimmed.is_some();
+
+        if decoded_rows.is_empty() && effective_offset > 0 {
+            let mut count_sql = format!(
+                "SELECT COUNT(*) FROM {}",
+                DbEngine::Mysql.qualify_ident(&req.schema, &req.table)
+            );
+            if let Some(trimmed) = filter_trimmed {
+                count_sql.push_str(&format!(" WHERE ({trimmed})"));
+            }
+            let count_start = Instant::now();
+            let count_row: Option<Row> = conn.query_first(&count_sql).await.map_err(|e| self.map_session_err(e))?;
+            logs.push(ExecutedSql {
+                sql: count_sql,
+                duration_ms: count_start.elapsed().as_millis() as u64,
+                error: None,
+            });
+            let actual_total = count_row
+                .as_ref()
+                .and_then(|r| value_to_opt_i64(r.as_ref(0).unwrap_or(&Value::NULL)))
+                .unwrap_or(0);
+            if actual_total <= 0 {
+                effective_offset = 0;
+                has_more = false;
+            } else {
+                let recovered_offset = last_page_offset(actual_total, limit);
+                let rec_batch = self
+                    .execute_mysql_page_query(conn, &columns, req, &stable_order, limit, recovered_offset)
+                    .await?;
+                logs.push(rec_batch.log);
+                effective_offset = recovered_offset;
+                decoded_rows = rec_batch.rows;
+                raw_rows = rec_batch.raw_rows;
+                has_more = rec_batch.has_more;
+
+                if decoded_rows.is_empty() && effective_offset > 0 {
+                    let zero_batch = self
+                        .execute_mysql_page_query(conn, &columns, req, &stable_order, limit, 0)
+                        .await?;
+                    logs.push(zero_batch.log);
+                    effective_offset = 0;
+                    decoded_rows = zero_batch.rows;
+                    raw_rows = zero_batch.raw_rows;
+                    has_more = zero_batch.has_more;
+                }
+            }
+        }
 
         let (transaction_support, table_rows_est, meta_log) =
             self.fetch_mysql_table_meta(conn, &req.schema, &req.table).await?;
@@ -1176,7 +1293,8 @@ impl DbSession for MysqlSession {
         }
 
         let (total_rows_estimate, total_is_exact) = if !has_more {
-            (Some(offset + decoded_rows.len() as i64), true)
+            debug_assert!(!decoded_rows.is_empty() || effective_offset == 0);
+            (Some(effective_offset + decoded_rows.len() as i64), true)
         } else if !filter_active {
             (table_rows_est, false)
         } else {
@@ -1186,10 +1304,11 @@ impl DbSession for MysqlSession {
         Ok((
             TablePage {
                 columns,
+                foreign_keys,
                 rows: decoded_rows,
                 raw_rows,
                 transaction_support,
-                offset,
+                offset: effective_offset,
                 limit,
                 total_rows_estimate,
                 total_is_exact,
@@ -1202,7 +1321,7 @@ impl DbSession for MysqlSession {
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<(TableStructure, Vec<ExecutedSql>), DbError> {
         let mut logs = Vec::new();
-        let (columns, col_log) = self.fetch_column_metas(schema, table).await?;
+        let (columns, foreign_keys, col_log) = self.fetch_column_metas(schema, table).await?;
         logs.push(col_log);
 
         let mut lease = self.get_conn().await?;
@@ -1357,7 +1476,7 @@ impl DbSession for MysqlSession {
                         }
                         d
                     }
-                    None => synthesize_mysql_table_ddl(schema, table, &columns, &indexes),
+                    None => synthesize_mysql_table_ddl(schema, table, &columns, &foreign_keys, &indexes),
                 }
             }
             Ok(None) => {
@@ -1366,7 +1485,7 @@ impl DbSession for MysqlSession {
                     duration_ms: show_start.elapsed().as_millis() as u64,
                     error: None,
                 });
-                synthesize_mysql_table_ddl(schema, table, &columns, &indexes)
+                synthesize_mysql_table_ddl(schema, table, &columns, &foreign_keys, &indexes)
             }
             Err(err) => {
                 logs.push(ExecutedSql {
@@ -1374,13 +1493,14 @@ impl DbSession for MysqlSession {
                     duration_ms: show_start.elapsed().as_millis() as u64,
                     error: Some(err.to_string()),
                 });
-                synthesize_mysql_table_ddl(schema, table, &columns, &indexes)
+                synthesize_mysql_table_ddl(schema, table, &columns, &foreign_keys, &indexes)
             }
         };
 
         Ok((
             TableStructure {
                 columns,
+                foreign_keys,
                 indexes,
                 stats: TableStats {
                     total_bytes,
@@ -1728,12 +1848,12 @@ impl DbSession for MysqlSession {
     async fn fetch_fk_row(
         &self,
         fk: &ForeignKeyRef,
-        value: &CellValue,
-        source_col: &ColumnMeta,
+        components: &[FkLookupComponent],
     ) -> Result<(FkPeekRow, ExecutedSql), DbError> {
-        let Some(where_clause) = build_fk_where_clause_for_engine(DbEngine::Mysql, &fk.target_column, value, source_col)
-        else {
-            return Err(DbError::InvalidInput("cannot peek NULL foreign-key value".to_owned()));
+        let Some(where_clause) = build_fk_where_clause_for_engine(DbEngine::Mysql, fk, components) else {
+            return Err(DbError::InvalidInput(
+                "cannot peek unresolved or NULL foreign-key value".to_owned(),
+            ));
         };
 
         let target_schema = if fk.target_schema.trim().is_empty() {
@@ -1742,14 +1862,24 @@ impl DbSession for MysqlSession {
             fk.target_schema.as_str()
         };
 
-        let (target_columns, _) = self
-            .fetch_column_metas(target_schema, &fk.target_table)
+        let meta = self
+            .fetch_column_metas_and_order(target_schema, &fk.target_table)
             .await?;
+        let target_columns = meta.columns;
+        let stable_order = meta.stable_order;
         if target_columns.is_empty() {
             return Err(DbError::InvalidInput(format!(
-                "target table {}.{} has no columns",
-                target_schema, fk.target_table
+                "target table {target_schema}.{} has no columns",
+                fk.target_table
             )));
+        }
+        for target_col in &fk.target_columns {
+            if !target_columns.iter().any(|c| c.name == *target_col) {
+                return Err(DbError::InvalidInput(format!(
+                    "target table {target_schema}.{} is missing referenced column {target_col}",
+                    fk.target_table
+                )));
+            }
         }
 
         let req = PageRequest {
@@ -1760,7 +1890,15 @@ impl DbSession for MysqlSession {
             limit: 1,
             offset: 0,
         };
-        let sql = build_mysql_page_sql(target_schema, &fk.target_table, &target_columns, &req, 1, 0);
+        let sql = build_mysql_page_sql(
+            target_schema,
+            &fk.target_table,
+            &target_columns,
+            &req,
+            &stable_order,
+            1,
+            0,
+        );
 
         let mut lease = self.get_conn().await?;
         let conn = lease.conn_mut()?;
@@ -1783,7 +1921,7 @@ impl DbSession for MysqlSession {
         Ok((
             FkPeekRow {
                 fk: fk.clone(),
-                lookup_display: format!("{} = {}", fk.target_column, value.display_compact()),
+                lookup_display: format_fk_lookup_display(components),
                 columns: target_columns,
                 row,
                 elapsed_ms,
@@ -2915,12 +3053,157 @@ pub fn concise_mysql_version(raw: &str) -> String {
     }
 }
 
-/// Builds a paginated MySQL `SELECT` statement with backtick quoting and `NULLS LAST` emulation.
+type MysqlFkRowTuple = (
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+struct MysqlFkGroup {
+    target_schema: String,
+    target_table: Option<String>,
+    table_consistent: bool,
+    entries: Vec<(Option<i64>, Option<String>, Option<String>)>,
+}
+
+fn assemble_mysql_foreign_keys(default_schema: &str, rows: Vec<MysqlFkRowTuple>) -> Vec<ForeignKeyRef> {
+    let mut groups: BTreeMap<String, MysqlFkGroup> = BTreeMap::new();
+    for (src_col, constraint_name, target_schema, target_table, dst_col, ordinal_pos) in rows {
+        let resolved_schema = target_schema
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| default_schema.to_owned());
+        let entry = groups.entry(constraint_name).or_insert_with(|| MysqlFkGroup {
+            target_schema: resolved_schema,
+            target_table: target_table.clone(),
+            table_consistent: true,
+            entries: Vec::new(),
+        });
+        if entry.target_table != target_table {
+            entry.table_consistent = false;
+        }
+        entry.entries.push((ordinal_pos, src_col, dst_col));
+    }
+
+    groups
+        .into_iter()
+        .filter_map(|(constraint_name, mut group)| {
+            group.entries.sort_by_key(|(ord, _, _)| ord.unwrap_or(i64::MAX));
+            let source_columns: Vec<String> = group
+                .entries
+                .iter()
+                .filter_map(|(_, src, _)| src.as_deref().filter(|s| !s.is_empty()).map(str::to_owned))
+                .collect();
+            if source_columns.is_empty() {
+                return None;
+            }
+            let target_table = group.target_table.unwrap_or_default();
+            let contiguous_ordinals = !group.entries.is_empty()
+                && group
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, (ord, _, _))| *ord == Some(idx as i64 + 1));
+            let all_resolved = group.table_consistent
+                && !target_table.trim().is_empty()
+                && contiguous_ordinals
+                && group.entries.iter().all(|(_, src, dst)| {
+                    src.as_deref().is_some_and(|s| !s.is_empty()) && dst.as_deref().is_some_and(|d| !d.is_empty())
+                });
+            let target_columns = if all_resolved {
+                group.entries.into_iter().filter_map(|(_, _, dst)| dst).collect()
+            } else {
+                Vec::new()
+            };
+            Some(ForeignKeyRef {
+                constraint_name,
+                target_schema: group.target_schema,
+                target_table,
+                source_columns,
+                target_columns,
+            })
+        })
+        .collect()
+}
+
+struct MysqlIndexCol {
+    name: Option<String>,
+    is_prefix: bool,
+}
+
+struct MysqlIndexMeta {
+    is_unique: bool,
+    cols: Vec<MysqlIndexCol>,
+}
+
+fn select_mysql_stable_order_keys(
+    columns: &[ColumnMeta],
+    index_cols: &HashMap<String, MysqlIndexMeta>,
+) -> Vec<StableOrderKey> {
+    if let Some(pk_meta) = index_cols.get("PRIMARY")
+        && !pk_meta.cols.is_empty()
+        && pk_meta.cols.iter().all(|col| {
+            !col.is_prefix
+                && col
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| columns.iter().any(|c| c.name == name))
+        })
+    {
+        return pk_meta
+            .cols
+            .iter()
+            .filter_map(|col| col.name.clone())
+            .map(|name| StableOrderKey::Column {
+                name,
+                nullable: false,
+                collation: None,
+            })
+            .collect();
+    }
+
+    let mut unique_candidates: Vec<(&str, &[MysqlIndexCol])> = index_cols
+        .iter()
+        .filter_map(|(name, meta)| {
+            if name == "PRIMARY" || !meta.is_unique || meta.cols.is_empty() {
+                return None;
+            }
+            let all_non_null_full = meta.cols.iter().all(|col| {
+                !col.is_prefix
+                    && col
+                        .name
+                        .as_deref()
+                        .is_some_and(|col_name| columns.iter().any(|c| c.name == col_name && !c.nullable))
+            });
+            all_non_null_full.then_some((name.as_str(), meta.cols.as_slice()))
+        })
+        .collect();
+    unique_candidates.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(b.0)));
+
+    if let Some((_, cols)) = unique_candidates.first() {
+        return cols
+            .iter()
+            .filter_map(|col| col.name.clone())
+            .map(|name| StableOrderKey::Column {
+                name,
+                nullable: false,
+                collation: None,
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+/// Builds a paginated MySQL `SELECT` statement with backtick quoting, deterministic ordering, and `NULLS LAST` emulation.
 pub fn build_mysql_page_sql(
     schema: &str,
     table: &str,
     columns: &[ColumnMeta],
     req: &PageRequest,
+    stable_order: &[StableOrderKey],
     fetch_limit: i64,
     offset: i64,
 ) -> String {
@@ -2944,10 +3227,32 @@ pub fn build_mysql_page_sql(
         }
     }
 
+    let mut order_terms = Vec::new();
     if let Some(sort) = &req.sort {
         let quoted_col = DbEngine::Mysql.quote_ident(&sort.column);
         let dir = if sort.ascending { "ASC" } else { "DESC" };
-        sql.push_str(&format!(" ORDER BY ({quoted_col} IS NULL) ASC, {quoted_col} {dir}"));
+        order_terms.push(format!("({quoted_col} IS NULL) ASC, {quoted_col} {dir}"));
+    }
+    for key in stable_order {
+        match key {
+            StableOrderKey::Column { name, nullable, .. } => {
+                if req.sort.as_ref().is_some_and(|s| s.column == *name) {
+                    continue;
+                }
+                let quoted_col = DbEngine::Mysql.quote_ident(name);
+                if *nullable {
+                    order_terms.push(format!("({quoted_col} IS NULL) ASC, {quoted_col} ASC"));
+                } else {
+                    order_terms.push(format!("{quoted_col} ASC"));
+                }
+            }
+            StableOrderKey::System(ident) => {
+                order_terms.push(format!("{ident} ASC"));
+            }
+        }
+    }
+    if !order_terms.is_empty() {
+        sql.push_str(&format!(" ORDER BY {}", order_terms.join(", ")));
     }
 
     sql.push_str(&format!(" LIMIT {} OFFSET {}", fetch_limit.max(1), offset.max(0)));
@@ -2959,6 +3264,7 @@ pub fn synthesize_mysql_table_ddl(
     schema: &str,
     table: &str,
     columns: &[ColumnMeta],
+    foreign_keys: &[ForeignKeyRef],
     indexes: &[IndexInfo],
 ) -> String {
     let fq_table = DbEngine::Mysql.qualify_ident(schema, table);
@@ -2989,15 +3295,32 @@ pub fn synthesize_mysql_table_ddl(
         clauses.push(format!("    PRIMARY KEY ({})", pk_cols.join(", ")));
     }
 
-    for col in columns {
-        if let Some(fk) = &col.foreign_key {
+    for fk in crate::engine::collect_foreign_keys(foreign_keys, columns) {
+        if !fk.source_columns.is_empty() {
             let target_ref = DbEngine::Mysql.qualify_ident(&fk.target_schema, &fk.target_table);
-            clauses.push(format!(
-                "    CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {target_ref} ({})",
-                DbEngine::Mysql.quote_ident(&fk.constraint_name),
-                DbEngine::Mysql.quote_ident(&col.name),
-                DbEngine::Mysql.quote_ident(&fk.target_column),
-            ));
+            let src_list = fk
+                .source_columns
+                .iter()
+                .map(|c| DbEngine::Mysql.quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if fk.is_resolvable() {
+                let dst_list = fk
+                    .target_columns
+                    .iter()
+                    .map(|c| DbEngine::Mysql.quote_ident(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                clauses.push(format!(
+                    "    CONSTRAINT {} FOREIGN KEY ({src_list}) REFERENCES {target_ref} ({dst_list})",
+                    DbEngine::Mysql.quote_ident(&fk.constraint_name),
+                ));
+            } else {
+                clauses.push(format!(
+                    "    CONSTRAINT {} FOREIGN KEY ({src_list}) REFERENCES {target_ref}",
+                    DbEngine::Mysql.quote_ident(&fk.constraint_name),
+                ));
+            }
         }
     }
 
@@ -4055,11 +4378,23 @@ mod tests {
             limit: 50,
             offset: 100,
         };
-        let sql = build_mysql_page_sql("greendale", "students", &cols, &req, 51, 100);
+        let sql = build_mysql_page_sql(
+            "greendale",
+            "students",
+            &cols,
+            &req,
+            &[StableOrderKey::Column {
+                name: "student_id".to_owned(),
+                nullable: false,
+                collation: None,
+            }],
+            51,
+            100,
+        );
         assert_eq!(
             sql,
             "SELECT `student_id`, `full``name` FROM `greendale`.`students` \
-             WHERE (enrolled = 1) ORDER BY (`full``name` IS NULL) ASC, `full``name` DESC LIMIT 51 OFFSET 100"
+             WHERE (enrolled = 1) ORDER BY (`full``name` IS NULL) ASC, `full``name` DESC, `student_id` ASC LIMIT 51 OFFSET 100"
         );
     }
 
@@ -4165,12 +4500,13 @@ mod tests {
                 is_primary_key: false,
                 is_unique: false,
                 comment: None,
-                foreign_key: Some(ForeignKeyRef {
-                    constraint_name: "students_group_fk".to_owned(),
-                    target_schema: "greendale".to_owned(),
-                    target_table: "study_groups".to_owned(),
-                    target_column: "group_id".to_owned(),
-                }),
+                foreign_key: Some(ForeignKeyRef::single(
+                    "students_group_fk",
+                    "group_id",
+                    "greendale",
+                    "study_groups",
+                    "group_id",
+                )),
             },
         ];
         let indexes = vec![IndexInfo {
@@ -4183,7 +4519,7 @@ mod tests {
             definition: "CREATE INDEX `students_group_idx` ON `greendale`.`students` (`group_id`)".to_owned(),
         }];
 
-        let ddl = synthesize_mysql_table_ddl("greendale", "students", &cols, &indexes);
+        let ddl = synthesize_mysql_table_ddl("greendale", "students", &cols, &[], &indexes);
         assert!(ddl.contains("CREATE TABLE `greendale`.`students`"));
         assert!(ddl.contains("`student_id` int NOT NULL AUTO_INCREMENT"));
         assert!(!ddl.contains("DEFAULT auto_increment"));
@@ -4648,5 +4984,130 @@ mod tests {
         rw_profile.safety = SafetyPolicy::Unrestricted;
         let rw_opts = build_mysql_opts(&rw_profile, None, Some("greendale"), None);
         assert!(rw_opts.setup().is_empty());
+    }
+
+    #[test]
+    fn mysql_composite_fks_and_stable_order_handle_nulls_and_ordinals() {
+        let fks = super::assemble_mysql_foreign_keys(
+            "greendale",
+            vec![
+                (
+                    Some("term".to_owned()),
+                    "fk_sections".to_owned(),
+                    Some(String::new()),
+                    Some("course_sections".to_owned()),
+                    Some("semester".to_owned()),
+                    Some(2),
+                ),
+                (
+                    Some("course_code".to_owned()),
+                    "fk_sections".to_owned(),
+                    Some(String::new()),
+                    Some("course_sections".to_owned()),
+                    Some("code".to_owned()),
+                    Some(1),
+                ),
+                (
+                    Some("orphan".to_owned()),
+                    "fk_gap".to_owned(),
+                    None,
+                    Some("course_sections".to_owned()),
+                    None,
+                    Some(1),
+                ),
+            ],
+        );
+        assert_eq!(fks.len(), 2);
+        let broken = fks.iter().find(|f| f.constraint_name == "fk_gap").expect("fk_gap");
+        assert!(!broken.is_resolvable());
+        let valid = fks
+            .iter()
+            .find(|f| f.constraint_name == "fk_sections")
+            .expect("fk_sections");
+        assert_eq!(valid.target_schema, "greendale");
+        assert_eq!(valid.source_columns, vec!["course_code", "term"]);
+        assert_eq!(valid.target_columns, vec!["code", "semester"]);
+
+        let mut code_col = test_col("code", "varchar(16)", "varchar");
+        code_col.nullable = false;
+        let mut nullable_col = test_col("nick", "varchar(32)", "varchar");
+        nullable_col.nullable = true;
+        let mut term_col = test_col("term", "varchar(16)", "varchar");
+        term_col.nullable = false;
+        let cols = vec![code_col, nullable_col, term_col];
+
+        let idx_col = |name: Option<&str>, is_prefix: bool| super::MysqlIndexCol {
+            name: name.map(str::to_owned),
+            is_prefix,
+        };
+        let mut idx_map = HashMap::new();
+        idx_map.insert(
+            "u_nullable".to_owned(),
+            super::MysqlIndexMeta {
+                is_unique: true,
+                cols: vec![idx_col(Some("nick"), false)],
+            },
+        );
+        idx_map.insert(
+            "u_expr".to_owned(),
+            super::MysqlIndexMeta {
+                is_unique: true,
+                cols: vec![idx_col(None, false)],
+            },
+        );
+        idx_map.insert(
+            "u_prefix".to_owned(),
+            super::MysqlIndexMeta {
+                is_unique: true,
+                cols: vec![idx_col(Some("code"), true)],
+            },
+        );
+        idx_map.insert(
+            "u_nonnull".to_owned(),
+            super::MysqlIndexMeta {
+                is_unique: true,
+                cols: vec![idx_col(Some("code"), false), idx_col(Some("term"), false)],
+            },
+        );
+        let order = super::select_mysql_stable_order_keys(&cols, &idx_map);
+        assert_eq!(
+            order,
+            vec![
+                StableOrderKey::Column {
+                    name: "code".to_owned(),
+                    nullable: false,
+                    collation: None,
+                },
+                StableOrderKey::Column {
+                    name: "term".to_owned(),
+                    nullable: false,
+                    collation: None,
+                },
+            ]
+        );
+
+        let mut prefix_only = HashMap::new();
+        prefix_only.insert(
+            "u_prefix".to_owned(),
+            super::MysqlIndexMeta {
+                is_unique: true,
+                cols: vec![idx_col(Some("code"), true)],
+            },
+        );
+        assert!(super::select_mysql_stable_order_keys(&cols, &prefix_only).is_empty());
+
+        let req = PageRequest {
+            schema: "greendale".to_owned(),
+            table: "sections".to_owned(),
+            filter_where: None,
+            sort: Some(crate::engine::SortSpec {
+                column: "code".to_owned(),
+                ascending: true,
+            }),
+            limit: 50,
+            offset: 0,
+        };
+        let sql = build_mysql_page_sql("greendale", "sections", &cols, &req, &order, 51, 0);
+        assert!(sql.ends_with("ORDER BY (`code` IS NULL) ASC, `code` ASC, `term` ASC LIMIT 51 OFFSET 0"));
     }
 }

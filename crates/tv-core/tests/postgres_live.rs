@@ -16,8 +16,8 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 use tv_core::engine::postgres::PostgresSession;
 use tv_core::{
-    CellValue, ConnectionProfile, DbError, DbObjectKind, DbSession, ForeignKeyRef, PageRequest, PasswordMode,
-    SortSpec, SslMode, StagedCellValue, StagedChanges,
+    CellValue, ConnectionProfile, DbError, DbObjectKind, DbSession, FkLookupComponent, ForeignKeyRef, PageRequest,
+    PasswordMode, SortSpec, SslMode, StagedCellValue, StagedChanges,
 };
 
 fn resolve_test_connection() -> (ConnectionProfile, Option<String>) {
@@ -220,7 +220,7 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
         assert_eq!(page1.rows[1][3], CellValue::Null);
 
         // Fetch page 2 (limit 2, offset 2) -> exact total 4
-        let (page2, _) = session
+        let (page2, page2_logs) = session
             .fetch_table_page(&PageRequest {
                 schema: "public".to_owned(),
                 table: "students".to_owned(),
@@ -234,10 +234,48 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
             })
             .await
             .expect("fetch page 2");
+        assert!(
+            page2_logs[0]
+                .sql
+                .contains("ORDER BY \"public\".\"students\".\"student_id\" ASC NULLS LAST")
+        );
         assert_eq!(page2.rows.len(), 2);
         assert!(!page2.has_more);
         assert!(page2.total_is_exact);
         assert_eq!(page2.total_rows_estimate, Some(4));
+
+        // #22: Out-of-range offset recovers to last valid page and reports accurate exact total.
+        let (oob_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 2,
+                offset: 20,
+            })
+            .await
+            .expect("recover pg out-of-range page");
+        assert_eq!(oob_page.offset, 2);
+        assert_eq!(oob_page.rows.len(), 2);
+        assert_eq!(oob_page.total_rows_estimate, Some(4));
+        assert!(oob_page.total_is_exact);
+
+        let (empty_oob, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "public".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("student_id < 0".to_owned()),
+                sort: None,
+                limit: 2,
+                offset: 10,
+            })
+            .await
+            .expect("recover empty filtered pg page");
+        assert_eq!(empty_oob.offset, 0);
+        assert!(empty_oob.rows.is_empty());
+        assert_eq!(empty_oob.total_rows_estimate, Some(0));
+        assert!(empty_oob.total_is_exact);
         // Annie has empty string "" email vs Abed's SQL NULL
         assert_eq!(page2.rows[0][3], CellValue::Text(String::new()));
         // Jeff has NULL profile and empty bytea
@@ -302,7 +340,7 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
         assert_eq!(structure.columns[2].comment.as_deref(), Some("Preferred display name"));
         let fk = structure.columns[10].foreign_key.as_ref().expect("group_id FK");
         assert_eq!(fk.target_table, "study_groups");
-        assert_eq!(fk.target_column, "group_id");
+        assert_eq!(fk.target_column(), Some("group_id"));
 
         assert_eq!(structure.indexes.len(), 3);
         assert!(structure.indexes.iter().any(|i| i.is_primary && i.columns == ["student_id"]));
@@ -401,14 +439,19 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
         // 1. Live FK Peek lookup
         let (peek, peek_log) = shared
             .fetch_fk_row(
-                &ForeignKeyRef {
-                    constraint_name: "students_group_id_fkey".to_owned(),
-                    target_schema: "public".to_owned(),
-                    target_table: "study_groups".to_owned(),
+                &ForeignKeyRef::single(
+                    "students_group_id_fkey",
+                    "group_id",
+                    "public",
+                    "study_groups",
+                    "group_id",
+                ),
+                &[FkLookupComponent {
                     target_column: "group_id".to_owned(),
-                },
-                &CellValue::Int(1),
-                &structure.columns[10],
+                    source_col: structure.columns[10].clone(),
+                    value: CellValue::Int(1),
+                    raw_value: None,
+                }],
             )
             .await
             .expect("fetch_fk_row succeeds");
@@ -418,7 +461,15 @@ fn live_postgres_introspection_data_grid_and_structure_roundtrip() {
         assert_eq!(peek_row[1], CellValue::Text("Study Room F".to_owned()));
 
         let null_peek = shared
-            .fetch_fk_row(&structure.columns[10].foreign_key.clone().expect("fk"), &CellValue::Null, &structure.columns[10])
+            .fetch_fk_row(
+                &structure.columns[10].foreign_key.clone().expect("fk"),
+                &[FkLookupComponent {
+                    target_column: "group_id".to_owned(),
+                    source_col: structure.columns[10].clone(),
+                    value: CellValue::Null,
+                    raw_value: None,
+                }],
+            )
             .await;
         assert!(matches!(null_peek, Err(DbError::InvalidInput(_))));
 

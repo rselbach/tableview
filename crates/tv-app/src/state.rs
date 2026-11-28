@@ -11,13 +11,13 @@ use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
     AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionId,
     ConnectionProfile, ConnectionStore, DatabaseInfo, DbEngine, DbError, DbObject, DbObjectKind, DraftRowId, EnvTag,
-    ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult,
-    QueryHistoryEntry, QueryStatementResult, RawCellValue, RequestId, SafetyDecision, SafetyPolicy, SavedQuery,
-    SavedQueryId, SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue, StagedChanges,
-    StatementInspection, StorageError, StoreData, TabId, TablePage, TableStructure, TableTransactionSupport,
-    atomic_write_bytes, build_explain_sql_for_engine, build_fk_where_clause_for_engine, default_export_filename,
-    evaluate_sql_safety_for_engine_with_session_mode, evaluate_staged_commit_safety, export_rows_for_engine,
-    validate_row_editable, validate_table_filter_where,
+    ExecutedSql, ExplainPlan, ExportFormat, FkLookupComponent, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode,
+    QueryBatchResult, QueryHistoryEntry, QueryStatementResult, RawCellValue, RequestId, SafetyDecision, SafetyPolicy,
+    SavedQuery, SavedQueryId, SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue,
+    StagedChanges, StatementInspection, StorageError, StoreData, TabId, TablePage, TableStructure,
+    TableTransactionSupport, atomic_write_bytes, build_explain_sql_for_engine, build_fk_where_clause_for_engine,
+    default_export_filename, evaluate_sql_safety_for_engine_with_session_mode, evaluate_staged_commit_safety,
+    export_rows_for_engine, validate_row_editable, validate_table_filter_where,
 };
 use tv_core::sql::{
     MysqlQuoteMode, PostgresSessionMode, SqlSessionMode, batch_sets_credentials_with_session_mode, cursor_line_col,
@@ -579,8 +579,8 @@ pub struct ActiveCellEdit {
 pub struct FkPeekState {
     pub anchor_key: String,
     pub fk: ForeignKeyRef,
-    pub value: CellValue,
-    pub source_col: ColumnMeta,
+    pub components: Vec<FkLookupComponent>,
+    pub choices: Vec<(ForeignKeyRef, Vec<FkLookupComponent>)>,
     pub req_id: Option<RequestId>,
     pub loading: bool,
     pub result: Option<FkPeekRow>,
@@ -721,6 +721,7 @@ impl TableTabState {
         let row_count = page.rows.len();
         let auto_select = self.auto_select_first_row;
         self.auto_select_first_row = false;
+        self.offset = page.offset.max(0);
         self.page = Some(page);
         self.pending_page = None;
         self.page_error = None;
@@ -765,6 +766,58 @@ impl TableTabState {
             .as_ref()
             .map(|p| p.columns.as_slice())
             .or_else(|| self.structure.as_ref().map(|s| s.columns.as_slice()))
+    }
+
+    pub fn all_foreign_keys(&self) -> Vec<ForeignKeyRef> {
+        if let Some(page) = &self.page {
+            return page.all_foreign_keys().into_iter().cloned().collect();
+        }
+        if let Some(structure) = &self.structure {
+            return structure.all_foreign_keys().into_iter().cloned().collect();
+        }
+        Vec::new()
+    }
+
+    pub fn effective_raw_cell(&self, row_key: RowKey, col_idx: usize) -> Option<RawCellValue> {
+        match row_key {
+            RowKey::Draft(_) => None,
+            RowKey::Existing(idx) => {
+                if self.staged.effective_existing_cell(idx, col_idx).is_some() {
+                    return None;
+                }
+                self.page
+                    .as_ref()
+                    .and_then(|p| p.raw_row(idx))
+                    .and_then(|r| r.get(col_idx))
+                    .cloned()
+            }
+        }
+    }
+
+    pub fn resolve_fk_for_row(&self, fk: &ForeignKeyRef, row_key: RowKey) -> Option<Vec<FkLookupComponent>> {
+        if !fk.is_resolvable() {
+            return None;
+        }
+        let columns = self.columns()?;
+        let mut components = Vec::with_capacity(fk.source_columns.len());
+        for (src_col, dst_col) in fk.source_columns.iter().zip(fk.target_columns.iter()) {
+            let col_idx = columns.iter().position(|c| c.name == *src_col)?;
+            let val = self.effective_cell(row_key, col_idx);
+            if val.is_null() {
+                return None;
+            }
+            let raw_value = self.effective_raw_cell(row_key, col_idx);
+            if raw_value.as_ref().is_some_and(RawCellValue::is_null) {
+                return None;
+            }
+            components.push(FkLookupComponent {
+                target_column: dst_col.clone(),
+                source_col: columns[col_idx].clone(),
+                value: val,
+                raw_value,
+            });
+        }
+        Some(components)
     }
 
     pub fn transaction_support(&self) -> TableTransactionSupport {
@@ -4227,13 +4280,28 @@ impl AppState {
         &mut self,
         anchor_key: String,
         fk: ForeignKeyRef,
-        value: CellValue,
-        source_col: ColumnMeta,
+        components: Vec<FkLookupComponent>,
     ) {
-        if value.is_null() {
-            return;
-        }
+        self.open_fk_peek_choices(anchor_key, vec![(fk, components)]);
+    }
+
+    pub fn open_fk_peek_choices(
+        &mut self,
+        anchor_key: String,
+        choices: Vec<(ForeignKeyRef, Vec<FkLookupComponent>)>,
+    ) {
         let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(engine) = self.sessions.get(&session_id).map(|s| s.profile.engine) else {
+            return;
+        };
+        let valid_choices: Vec<(ForeignKeyRef, Vec<FkLookupComponent>)> = choices
+            .into_iter()
+            .filter(|(fk, comps)| build_fk_where_clause_for_engine(engine, fk, comps).is_some())
+            .collect();
+        let Some((fk, components)) = valid_choices.first().cloned() else {
+            self.set_notice("Cannot peek unresolved or NULL foreign key", false);
             return;
         };
         let has_worker = self.worker.is_some();
@@ -4251,8 +4319,8 @@ impl AppState {
         tab.fk_peek = Some(FkPeekState {
             anchor_key,
             fk: fk.clone(),
-            value: value.clone(),
-            source_col: source_col.clone(),
+            components: components.clone(),
+            choices: valid_choices,
             req_id,
             loading: has_worker,
             result: None,
@@ -4265,8 +4333,59 @@ impl AppState {
                 req_id: rid,
                 connect_req_id,
                 fk,
-                value,
-                source_col,
+                components,
+            });
+        }
+    }
+
+    pub fn select_fk_peek_choice(&mut self, choice_idx: usize) {
+        let Screen::Workspace(session_id) = self.screen else {
+            return;
+        };
+        let Some(engine) = self.sessions.get(&session_id).map(|s| s.profile.engine) else {
+            return;
+        };
+        let selected = self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionState::active_table_tab)
+            .and_then(|t| t.fk_peek.as_ref())
+            .and_then(|p| p.choices.get(choice_idx).cloned());
+        let Some((fk, components)) = selected else {
+            return;
+        };
+        if build_fk_where_clause_for_engine(engine, &fk, &components).is_none() {
+            self.set_notice("Cannot peek unresolved or NULL foreign key", false);
+            return;
+        }
+        let has_worker = self.worker.is_some();
+        let req_id = has_worker.then(|| self.alloc_req_id());
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let connect_req_id = session.active_connect_req_id;
+        let Some(tab_id) = session.active_tab else {
+            return;
+        };
+        let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_table_mut) else {
+            return;
+        };
+        if let Some(ref mut peek) = tab.fk_peek {
+            peek.fk = fk.clone();
+            peek.components = components.clone();
+            peek.req_id = req_id;
+            peek.loading = has_worker;
+            peek.result = None;
+            peek.error = (!has_worker).then(|| "Connect to a live database to load referenced rows.".to_owned());
+        }
+        if let (Some(worker), Some(rid)) = (&self.worker, req_id) {
+            worker.send(WorkerCmd::FetchFkPeek {
+                session_id,
+                tab_id,
+                req_id: rid,
+                connect_req_id,
+                fk,
+                components,
             });
         }
     }
@@ -4280,8 +4399,7 @@ impl AppState {
     pub fn jump_to_foreign_key(
         &mut self,
         fk: ForeignKeyRef,
-        value: CellValue,
-        source_col: ColumnMeta,
+        components: Vec<FkLookupComponent>,
         tx: &mut Tx,
     ) {
         let Screen::Workspace(session_id) = self.screen else {
@@ -4290,8 +4408,8 @@ impl AppState {
         let Some(engine) = self.sessions.get(&session_id).map(|s| s.profile.engine) else {
             return;
         };
-        let Some(where_clause) = build_fk_where_clause_for_engine(engine, &fk.target_column, &value, &source_col) else {
-            self.set_notice("Cannot follow a NULL foreign key", false);
+        let Some(where_clause) = build_fk_where_clause_for_engine(engine, &fk, &components) else {
+            self.set_notice("Cannot follow unresolved or NULL foreign key", false);
             return;
         };
         self.close_fk_peek();

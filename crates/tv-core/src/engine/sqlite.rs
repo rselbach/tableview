@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,15 +10,16 @@ use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags, params_from_it
 
 use crate::connection::{ConnectionProfile, DbEngine, SafetyPolicy};
 use crate::engine::{
-    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, RawCellValue, SchemaInfo,
-    ServerInfo, SqliteRawValue, TablePage, TableStats, TableStructure, TableTransactionSupport, TransactionOutcome,
-    decode_hex,
+    CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, DecodedPageBatch,
+    ExecutedSql, FkLookupComponent, FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult,
+    QueryStatementResult, RawCellValue, SchemaInfo, ServerInfo, SqliteRawValue, StableOrderKey, TableMetaWithOrder,
+    TablePage, TableStats, TableStructure, TableTransactionSupport, TransactionOutcome,
+    attach_foreign_keys_to_columns, decode_hex, last_page_offset,
 };
 use crate::explain::{ExplainPlan, build_explain_sql_for_engine};
 use crate::staging::{
-    LogicalColType, StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation, build_fk_where_clause_for_engine,
-    classify_column_type, strip_hex_prefix,
+    LogicalColType, StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation,
+    build_fk_where_clause_for_engine, classify_column_type, format_fk_lookup_display, strip_hex_prefix,
 };
 
 #[derive(Default)]
@@ -534,16 +535,20 @@ impl DbSession for SqliteSession {
             let schema = normalize_schema(&req.schema);
             let limit = req.limit.clamp(1, 5000);
             let offset = req.offset.max(0);
-            let (columns, _) = fetch_column_metas_sync(conn, schema, &req.table)?;
+            let meta = fetch_column_metas_and_order_sync(conn, schema, &req.table)?;
+            let columns = meta.columns;
+            let foreign_keys = meta.foreign_keys;
+            let stable_order = meta.stable_order;
 
             if columns.is_empty() {
                 return Ok((
                     TablePage {
                         columns,
+                        foreign_keys: Vec::new(),
                         rows: Vec::new(),
                         raw_rows: Vec::new(),
                         transaction_support: TableTransactionSupport::Supported,
-                        offset,
+                        offset: 0,
                         limit,
                         total_rows_estimate: Some(0),
                         total_is_exact: true,
@@ -563,42 +568,75 @@ impl DbSession for SqliteSession {
                 )));
             }
 
-            let sql = build_table_page_sql(schema, &req.table, &columns, &req, limit, offset);
-            let start = Instant::now();
-            let mut stmt = conn.prepare(&sql).map_err(map_sqlite_err)?;
-            let mut raw_rows = stmt.query([]).map_err(map_sqlite_err)?;
-            let mut decoded_rows = Vec::new();
-            let mut raw_rows_out = Vec::new();
-            while let Some(row) = raw_rows.next().map_err(map_sqlite_err)? {
-                let mut cells = Vec::with_capacity(columns.len());
-                let mut raw_cells = Vec::with_capacity(columns.len());
-                for (idx, col) in columns.iter().enumerate() {
-                    let val_ref = row.get_ref(idx).map_err(map_sqlite_err)?;
-                    raw_cells.push(RawCellValue::Sqlite(sqlite_value_ref_to_raw(val_ref)));
-                    cells.push(decode_sqlite_cell(val_ref, &col.data_type));
-                }
-                decoded_rows.push(cells);
-                raw_rows_out.push(raw_cells);
-            }
-            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let mut effective_offset = offset;
+            let first_batch =
+                execute_sqlite_page_query(conn, schema, &columns, &req, &stable_order, limit, effective_offset)?;
+            let elapsed_ms = first_batch.log.duration_ms;
+            let mut logs = vec![first_batch.log];
+            let mut decoded_rows = first_batch.rows;
+            let mut raw_rows_out = first_batch.raw_rows;
+            let mut has_more = first_batch.has_more;
 
-            let mut logs = vec![ExecutedSql {
-                sql,
-                duration_ms: elapsed_ms,
-                error: None,
-            }];
-
-            let has_more = decoded_rows.len() > limit as usize;
-            decoded_rows.truncate(limit as usize);
-            raw_rows_out.truncate(limit as usize);
-
-            let filter_active = req
+            let filter_trimmed = req
                 .filter_where
                 .as_deref()
-                .is_some_and(|w| !w.trim().is_empty());
+                .map(str::trim)
+                .filter(|w| !w.is_empty());
+            let filter_active = filter_trimmed.is_some();
+
+            if decoded_rows.is_empty() && effective_offset > 0 {
+                let mut count_sql = format!(
+                    "SELECT COUNT(*) FROM {}.{}",
+                    quote_ident(schema),
+                    quote_ident(&req.table)
+                );
+                if let Some(trimmed) = filter_trimmed {
+                    count_sql.push_str(&format!(" WHERE ({trimmed})"));
+                }
+                let count_start = Instant::now();
+                let actual_total: i64 = conn
+                    .query_row(&count_sql, [], |r| r.get(0))
+                    .map_err(map_sqlite_err)?;
+                logs.push(ExecutedSql {
+                    sql: count_sql,
+                    duration_ms: count_start.elapsed().as_millis() as u64,
+                    error: None,
+                });
+                if actual_total <= 0 {
+                    effective_offset = 0;
+                    has_more = false;
+                } else {
+                    let recovered_offset = last_page_offset(actual_total, limit);
+                    let rec_batch = execute_sqlite_page_query(
+                        conn,
+                        schema,
+                        &columns,
+                        &req,
+                        &stable_order,
+                        limit,
+                        recovered_offset,
+                    )?;
+                    logs.push(rec_batch.log);
+                    effective_offset = recovered_offset;
+                    decoded_rows = rec_batch.rows;
+                    raw_rows_out = rec_batch.raw_rows;
+                    has_more = rec_batch.has_more;
+
+                    if decoded_rows.is_empty() && effective_offset > 0 {
+                        let zero_batch =
+                            execute_sqlite_page_query(conn, schema, &columns, &req, &stable_order, limit, 0)?;
+                        logs.push(zero_batch.log);
+                        effective_offset = 0;
+                        decoded_rows = zero_batch.rows;
+                        raw_rows_out = zero_batch.raw_rows;
+                        has_more = zero_batch.has_more;
+                    }
+                }
+            }
 
             let (total_rows_estimate, total_is_exact) = if !has_more {
-                (Some(offset + decoded_rows.len() as i64), true)
+                debug_assert!(!decoded_rows.is_empty() || effective_offset == 0);
+                (Some(effective_offset + decoded_rows.len() as i64), true)
             } else if !filter_active {
                 let count_sql = format!(
                     "SELECT COUNT(*) FROM {}.{}",
@@ -622,10 +660,11 @@ impl DbSession for SqliteSession {
             Ok((
                 TablePage {
                     columns,
+                    foreign_keys,
                     rows: decoded_rows,
                     raw_rows: raw_rows_out,
                     transaction_support: TableTransactionSupport::Supported,
-                    offset,
+                    offset: effective_offset,
                     limit,
                     total_rows_estimate,
                     total_is_exact,
@@ -643,7 +682,7 @@ impl DbSession for SqliteSession {
         let table_owned = table.to_owned();
         self.with_conn(move |conn| {
             let mut logs = Vec::new();
-            let (columns, col_log) = fetch_column_metas_sync(conn, &schema_owned, &table_owned)?;
+            let (columns, foreign_keys, col_log) = fetch_column_metas_sync(conn, &schema_owned, &table_owned)?;
             logs.push(col_log);
 
             let (indexes, idx_log) = fetch_indexes_sync(conn, &schema_owned, &table_owned)?;
@@ -710,6 +749,7 @@ impl DbSession for SqliteSession {
             Ok((
                 TableStructure {
                     columns,
+                    foreign_keys,
                     indexes,
                     stats,
                 },
@@ -983,23 +1023,45 @@ impl DbSession for SqliteSession {
     async fn fetch_fk_row(
         &self,
         fk: &ForeignKeyRef,
-        value: &CellValue,
-        source_col: &ColumnMeta,
+        components: &[FkLookupComponent],
     ) -> Result<(FkPeekRow, ExecutedSql), DbError> {
-        let Some(where_clause) =
-            build_fk_where_clause_for_engine(DbEngine::Sqlite, &fk.target_column, value, source_col)
-        else {
-            return Err(DbError::InvalidInput("cannot peek NULL foreign-key value".to_owned()));
+        let Some(where_clause) = build_fk_where_clause_for_engine(DbEngine::Sqlite, fk, components) else {
+            return Err(DbError::InvalidInput(
+                "cannot peek unresolved or NULL foreign-key value".to_owned(),
+            ));
         };
 
         let fk = fk.clone();
-        let lookup_display = format!("{} = {}", fk.target_column, value.display_compact());
+        let lookup_display = format_fk_lookup_display(components);
         self.with_conn(move |conn| {
             let target_schema = normalize_schema(&fk.target_schema);
-            let (target_columns, _) = fetch_column_metas_sync(conn, target_schema, &fk.target_table)?;
+            let meta = fetch_column_metas_and_order_sync(conn, target_schema, &fk.target_table)?;
+            let target_columns = meta.columns;
+            let stable_order = meta.stable_order;
             if target_columns.is_empty() {
                 return Err(DbError::InvalidInput(format!(
                     "target table {target_schema}.{} has no columns",
+                    fk.target_table
+                )));
+            }
+            let Some(parent_info) = lookup_sqlite_parent_table_info(conn, target_schema, &fk.target_table)? else {
+                return Err(DbError::InvalidInput(format!(
+                    "target table {target_schema}.{} was not found",
+                    fk.target_table
+                )));
+            };
+            for target_col in &fk.target_columns {
+                if !parent_info.all_columns.iter().any(|c| c == target_col) {
+                    return Err(DbError::InvalidInput(format!(
+                        "target table {target_schema}.{} is missing referenced column {target_col}",
+                        fk.target_table
+                    )));
+                }
+            }
+            if !parent_info.is_valid_parent_key(&fk.target_columns) {
+                return Err(DbError::InvalidInput(format!(
+                    "target columns ({}) on {target_schema}.{} do not form a unique parent key",
+                    fk.target_columns.join(", "),
                     fk.target_table
                 )));
             }
@@ -1012,7 +1074,7 @@ impl DbSession for SqliteSession {
                 limit: 1,
                 offset: 0,
             };
-            let sql = build_table_page_sql(target_schema, &fk.target_table, &target_columns, &req, 1, 0);
+            let sql = build_table_page_sql(target_schema, &fk.target_table, &target_columns, &req, &stable_order, 1, 0);
             let start = Instant::now();
             let mut stmt = conn.prepare(&sql).map_err(map_sqlite_err)?;
             let mut raw_rows = stmt.query([]).map_err(map_sqlite_err)?;
@@ -1189,11 +1251,105 @@ where
     })
 }
 
+#[derive(Clone)]
+struct SqliteParentTableInfo {
+    canonical_name: String,
+    all_columns: Vec<String>,
+    pk_columns: Vec<String>,
+    unique_key_sets: Vec<Vec<String>>,
+}
+
+impl SqliteParentTableInfo {
+    fn is_valid_parent_key(&self, target_columns: &[String]) -> bool {
+        if target_columns.is_empty() {
+            return false;
+        }
+        let mut seen = HashSet::with_capacity(target_columns.len());
+        for col in target_columns {
+            if !seen.insert(col.to_ascii_lowercase()) {
+                return false;
+            }
+        }
+        self.unique_key_sets.iter().any(|key_set| {
+            key_set.len() == target_columns.len()
+                && key_set
+                    .iter()
+                    .all(|k| target_columns.iter().any(|t| t.eq_ignore_ascii_case(k)))
+        })
+    }
+}
+
+struct SqliteIndexMetadata {
+    has_origin_pk_index: bool,
+    pk_index_collations: HashMap<String, String>,
+    unique_cols: HashSet<String>,
+    stable_unique_candidates: Vec<(String, Vec<(String, String)>)>,
+}
+
+fn execute_sqlite_page_query(
+    conn: &Connection,
+    schema: &str,
+    columns: &[ColumnMeta],
+    req: &PageRequest,
+    stable_order: &[StableOrderKey],
+    limit: i64,
+    offset: i64,
+) -> Result<DecodedPageBatch, DbError> {
+    let sql = build_table_page_sql(schema, &req.table, columns, req, stable_order, limit, offset);
+    let start = Instant::now();
+    let mut stmt = conn.prepare(&sql).map_err(map_sqlite_err)?;
+    let mut raw_rows = stmt.query([]).map_err(map_sqlite_err)?;
+    let mut decoded_rows = Vec::new();
+    let mut raw_rows_out = Vec::new();
+    while let Some(row) = raw_rows.next().map_err(map_sqlite_err)? {
+        let mut cells = Vec::with_capacity(columns.len());
+        let mut raw_cells = Vec::with_capacity(columns.len());
+        for (idx, col) in columns.iter().enumerate() {
+            let val_ref = row.get_ref(idx).map_err(map_sqlite_err)?;
+            raw_cells.push(RawCellValue::Sqlite(sqlite_value_ref_to_raw(val_ref)));
+            cells.push(decode_sqlite_cell(val_ref, &col.data_type));
+        }
+        decoded_rows.push(cells);
+        raw_rows_out.push(raw_cells);
+    }
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let has_more = decoded_rows.len() > limit as usize;
+    decoded_rows.truncate(limit as usize);
+    raw_rows_out.truncate(limit as usize);
+    let log = ExecutedSql {
+        sql,
+        duration_ms: elapsed_ms,
+        error: None,
+    };
+    Ok(DecodedPageBatch {
+        rows: decoded_rows,
+        raw_rows: raw_rows_out,
+        has_more,
+        log,
+    })
+}
+
 fn fetch_column_metas_sync(
     conn: &Connection,
     schema: &str,
     table: &str,
-) -> Result<(Vec<ColumnMeta>, ExecutedSql), DbError> {
+) -> Result<(Vec<ColumnMeta>, Vec<ForeignKeyRef>, ExecutedSql), DbError> {
+    let meta = fetch_column_metas_and_order_sync(conn, schema, table)?;
+    Ok((meta.columns, meta.foreign_keys, meta.log))
+}
+
+fn resolve_sqlite_col_name(cols: &[String], candidate: &str) -> Option<String> {
+    cols.iter()
+        .find(|c| c.as_str() == candidate)
+        .or_else(|| cols.iter().find(|c| c.eq_ignore_ascii_case(candidate)))
+        .cloned()
+}
+
+fn fetch_column_metas_and_order_sync(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+) -> Result<TableMetaWithOrder, DbError> {
     let info_sql = format!("PRAGMA {}.table_info({})", quote_ident(schema), quote_ident(table));
     let start = Instant::now();
     let mut info_stmt = conn.prepare(&info_sql).map_err(map_sqlite_err)?;
@@ -1206,21 +1362,25 @@ fn fetch_column_metas_sync(
         let notnull: i64 = row.get(3).map_err(map_sqlite_err)?;
         let default_expr: Option<String> = row.get(4).map_err(map_sqlite_err)?;
         let pk: i64 = row.get(5).map_err(map_sqlite_err)?;
-        raw_cols.push((name, data_type, notnull == 0, default_expr, pk > 0));
+        raw_cols.push((name, data_type, notnull == 0, default_expr, pk));
     }
 
     if raw_cols.is_empty() {
-        return Ok((
-            Vec::new(),
-            ExecutedSql {
+        return Ok(TableMetaWithOrder {
+            columns: Vec::new(),
+            foreign_keys: Vec::new(),
+            stable_order: Vec::new(),
+            log: ExecutedSql {
                 sql: info_sql,
                 duration_ms: start.elapsed().as_millis() as u64,
                 error: None,
             },
-        ));
+        });
     }
 
-    // Foreign keys
+    let child_col_names: Vec<String> = raw_cols.iter().map(|(name, _, _, _, _)| name.clone()).collect();
+
+    // Foreign keys grouped by constraint ID and ordered by `seq`.
     let fk_sql = format!(
         "PRAGMA {}.foreign_key_list({})",
         quote_ident(schema),
@@ -1228,30 +1388,197 @@ fn fetch_column_metas_sync(
     );
     let mut fk_stmt = conn.prepare(&fk_sql).map_err(map_sqlite_err)?;
     let mut fk_rows = fk_stmt.query([]).map_err(map_sqlite_err)?;
-    let mut fks: HashMap<String, ForeignKeyRef> = HashMap::new();
+    type SqliteFkEntry = (i64, String, String, Option<String>);
+    let mut fk_groups: BTreeMap<i64, Vec<SqliteFkEntry>> = BTreeMap::new();
     while let Some(row) = fk_rows.next().map_err(map_sqlite_err)? {
         let id: i64 = row.get(0).map_err(map_sqlite_err)?;
+        let seq: i64 = row.get(1).map_err(map_sqlite_err)?;
         let target_table: String = row.get(2).map_err(map_sqlite_err)?;
         let from_col: String = row.get(3).map_err(map_sqlite_err)?;
         let to_col_opt: Option<String> = row.get(4).map_err(map_sqlite_err)?;
-        let target_column = match to_col_opt {
-            Some(c) if !c.is_empty() => c,
-            _ => lookup_first_pk_column(conn, schema, &target_table)?.unwrap_or_default(),
-        };
-        fks.entry(from_col.clone()).or_insert_with(|| ForeignKeyRef {
-            constraint_name: format!("fk_{table}_{from_col}_{id}"),
-            target_schema: schema.to_owned(),
-            target_table,
-            target_column,
-        });
+        fk_groups
+            .entry(id)
+            .or_default()
+            .push((seq, target_table, from_col, to_col_opt));
     }
 
-    // Single-column unique indexes (non-PK, non-partial)
-    let unique_cols = fetch_single_col_uniques_sync(conn, schema, table)?;
+    let mut parent_cache: HashMap<String, Option<SqliteParentTableInfo>> = HashMap::new();
+    let mut constraints = Vec::new();
+    for (id, mut entries) in fk_groups {
+        entries.sort_by_key(|(seq, _, _, _)| *seq);
+        let Some((_, first_target_table, _, _)) = entries.first() else {
+            continue;
+        };
+        let raw_target_table = first_target_table.clone();
+        let seq_contiguous = entries
+            .iter()
+            .enumerate()
+            .all(|(idx, (seq, _, _, _))| *seq == idx as i64);
+        let same_target = !raw_target_table.trim().is_empty()
+            && entries.iter().all(|(_, tt, _, _)| *tt == raw_target_table);
+
+        let cache_key = raw_target_table.to_ascii_lowercase();
+        let parent_info = if let Some(cached) = parent_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            let loaded = if raw_target_table.trim().is_empty() {
+                None
+            } else {
+                lookup_sqlite_parent_table_info(conn, schema, &raw_target_table)?
+            };
+            parent_cache.insert(cache_key, loaded.clone());
+            loaded
+        };
+
+        let target_table = parent_info
+            .as_ref()
+            .map_or(raw_target_table.clone(), |info| info.canonical_name.clone());
+
+        let mut source_columns = Vec::new();
+        let mut all_from_resolved = true;
+        for (_, _, from_col, _) in &entries {
+            if let Some(resolved_from) = resolve_sqlite_col_name(&child_col_names, from_col) {
+                source_columns.push(resolved_from);
+            } else {
+                all_from_resolved = false;
+            }
+        }
+
+        let all_named = entries
+            .iter()
+            .all(|(_, _, _, to_opt)| to_opt.as_deref().is_some_and(|s| !s.is_empty()));
+        let all_shorthand = entries
+            .iter()
+            .all(|(_, _, _, to_opt)| to_opt.as_deref().is_none_or(str::is_empty));
+
+        let target_columns = if seq_contiguous && same_target && all_from_resolved {
+            match &parent_info {
+                Some(info) if all_named => {
+                    let mut resolved = Vec::with_capacity(entries.len());
+                    let mut ok = true;
+                    for (_, _, _, to_opt) in &entries {
+                        if let Some(raw_to) = to_opt.as_deref()
+                            && let Some(matched) = resolve_sqlite_col_name(&info.all_columns, raw_to)
+                        {
+                            resolved.push(matched);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok && info.is_valid_parent_key(&resolved) {
+                        resolved
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Some(info) if all_shorthand => {
+                    if !info.pk_columns.is_empty() && info.pk_columns.len() == entries.len() {
+                        info.pk_columns.clone()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        let constraint_name = if source_columns.is_empty() {
+            format!("fk_{table}_{id}")
+        } else {
+            format!("fk_{table}_{}_{id}", source_columns.join("_"))
+        };
+        constraints.push(ForeignKeyRef {
+            constraint_name,
+            target_schema: schema.to_owned(),
+            target_table,
+            source_columns,
+            target_columns,
+        });
+    }
+    let mut fks = attach_foreign_keys_to_columns(constraints.clone());
+
+    let SqliteIndexMetadata {
+        has_origin_pk_index,
+        pk_index_collations,
+        unique_cols,
+        stable_unique_candidates: unique_index_candidates,
+    } = fetch_sqlite_index_metadata_sync(conn, schema, table, &raw_cols)?;
+
+    let mut pk_entries: Vec<(i64, &str, bool)> = raw_cols
+        .iter()
+        .filter(|(_, _, _, _, pk)| *pk > 0)
+        .map(|(name, _, nullable, _, pk)| (*pk, name.as_str(), *nullable))
+        .collect();
+    pk_entries.sort_by_key(|(pk, _, _)| *pk);
+
+    let stable_order = if !pk_entries.is_empty() {
+        if pk_entries.len() == 1 && !has_origin_pk_index {
+            vec![StableOrderKey::Column {
+                name: pk_entries[0].1.to_owned(),
+                nullable: false,
+                collation: None,
+            }]
+        } else if pk_entries.iter().all(|(_, _, nullable)| !*nullable) {
+            pk_entries
+                .iter()
+                .map(|(_, name, _)| StableOrderKey::Column {
+                    name: (*name).to_owned(),
+                    nullable: false,
+                    collation: pk_index_collations.get(*name).cloned(),
+                })
+                .collect()
+        } else {
+            let mut keys: Vec<StableOrderKey> = pk_entries
+                .iter()
+                .map(|(_, name, nullable)| StableOrderKey::Column {
+                    name: (*name).to_owned(),
+                    nullable: *nullable,
+                    collation: pk_index_collations.get(*name).cloned(),
+                })
+                .collect();
+            if let Some(alias) = probe_sqlite_rowid_alias(conn, schema, table, &child_col_names) {
+                keys.push(StableOrderKey::System(alias));
+            } else if let Some((_, ucols)) = unique_index_candidates.first() {
+                for (name, coll) in ucols {
+                    let already_present = keys.iter().any(|k| {
+                        matches!(
+                            k,
+                            StableOrderKey::Column { name: k_name, collation: k_coll, .. }
+                            if k_name == name && k_coll.as_deref() == Some(coll.as_str())
+                        )
+                    });
+                    if !already_present {
+                        keys.push(StableOrderKey::Column {
+                            name: name.clone(),
+                            nullable: false,
+                            collation: Some(coll.clone()),
+                        });
+                    }
+                }
+            }
+            keys
+        }
+    } else if let Some((_, cols)) = unique_index_candidates.first() {
+        cols.iter()
+            .map(|(name, coll)| StableOrderKey::Column {
+                name: name.clone(),
+                nullable: false,
+                collation: Some(coll.clone()),
+            })
+            .collect()
+    } else if let Some(alias) = probe_sqlite_rowid_alias(conn, schema, table, &child_col_names) {
+        vec![StableOrderKey::System(alias)]
+    } else {
+        Vec::new()
+    };
 
     let columns = raw_cols
         .into_iter()
-        .map(|(name, data_type, nullable, default_expr, is_primary_key)| {
+        .map(|(name, data_type, nullable, default_expr, pk)| {
+            let is_primary_key = pk > 0;
             let udt_name = data_type.trim().to_ascii_lowercase();
             let is_unique = is_primary_key || unique_cols.contains(&name);
             let foreign_key = fks.remove(&name);
@@ -1269,60 +1596,247 @@ fn fetch_column_metas_sync(
         })
         .collect();
 
-    Ok((
+    Ok(TableMetaWithOrder {
         columns,
-        ExecutedSql {
+        foreign_keys: constraints,
+        stable_order,
+        log: ExecutedSql {
             sql: info_sql,
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         },
-    ))
+    })
 }
 
-fn lookup_first_pk_column(conn: &Connection, schema: &str, table: &str) -> Result<Option<String>, DbError> {
-    let sql = format!("PRAGMA {}.table_info({})", quote_ident(schema), quote_ident(table));
-    let mut stmt = conn.prepare(&sql).map_err(map_sqlite_err)?;
+fn is_builtin_sqlite_collation(coll: &str) -> bool {
+    coll.eq_ignore_ascii_case("BINARY")
+        || coll.eq_ignore_ascii_case("NOCASE")
+        || coll.eq_ignore_ascii_case("RTRIM")
+}
+
+fn fetch_index_xinfo_key_cols_sync(
+    conn: &Connection,
+    schema: &str,
+    index_name: &str,
+) -> Result<Vec<(Option<String>, String)>, DbError> {
+    let info_sql = format!(
+        "PRAGMA {}.index_xinfo({})",
+        quote_ident(schema),
+        quote_ident(index_name)
+    );
+    let mut stmt = conn.prepare(&info_sql).map_err(map_sqlite_err)?;
     let mut rows = stmt.query([]).map_err(map_sqlite_err)?;
+    let mut entries: Vec<(i64, Option<String>, String)> = Vec::new();
     while let Some(row) = rows.next().map_err(map_sqlite_err)? {
-        let name: String = row.get(1).map_err(map_sqlite_err)?;
-        let pk: i64 = row.get(5).map_err(map_sqlite_err)?;
-        if pk > 0 {
-            return Ok(Some(name));
+        let seqno: i64 = row.get(0).map_err(map_sqlite_err)?;
+        let cid: i64 = row.get(1).map_err(map_sqlite_err)?;
+        let col_name: Option<String> = row.get(2).map_err(map_sqlite_err)?;
+        let coll: String = row.get(4).map_err(map_sqlite_err)?;
+        let key: i64 = row.get(5).map_err(map_sqlite_err)?;
+        if key == 0 {
+            continue;
+        }
+        let resolved_name = (cid >= 0)
+            .then_some(col_name)
+            .flatten()
+            .filter(|name| !name.is_empty());
+        entries.push((seqno, resolved_name, coll));
+    }
+    entries.sort_by_key(|(seqno, _, _)| *seqno);
+    Ok(entries
+        .into_iter()
+        .map(|(_, name, coll)| (name, coll))
+        .collect())
+}
+
+fn lookup_sqlite_parent_table_info(
+    conn: &Connection,
+    schema: &str,
+    target_table: &str,
+) -> Result<Option<SqliteParentTableInfo>, DbError> {
+    let master = master_table_ident(schema);
+    let lookup_sql = format!(
+        "SELECT name FROM {master} WHERE type = 'table' AND name = ?1 COLLATE NOCASE"
+    );
+    let mut stmt = conn.prepare(&lookup_sql).map_err(map_sqlite_err)?;
+    let mut rows = stmt.query([target_table]).map_err(map_sqlite_err)?;
+    let mut canonical: Option<String> = None;
+    while let Some(row) = rows.next().map_err(map_sqlite_err)? {
+        let name: String = row.get(0).map_err(map_sqlite_err)?;
+        if name == target_table {
+            canonical = Some(name);
+            break;
+        }
+        if canonical.is_none() {
+            canonical = Some(name);
         }
     }
-    Ok(None)
+    let Some(canonical_name) = canonical else {
+        return Ok(None);
+    };
+
+    let info_sql = format!(
+        "PRAGMA {}.table_xinfo({})",
+        quote_ident(schema),
+        quote_ident(&canonical_name)
+    );
+    let mut info_stmt = conn.prepare(&info_sql).map_err(map_sqlite_err)?;
+    let mut info_rows = info_stmt.query([]).map_err(map_sqlite_err)?;
+    let mut all_columns = Vec::new();
+    let mut pk_cols: Vec<(i64, String)> = Vec::new();
+    while let Some(row) = info_rows.next().map_err(map_sqlite_err)? {
+        let name: String = row.get(1).map_err(map_sqlite_err)?;
+        let pk: i64 = row.get(5).map_err(map_sqlite_err)?;
+        let hidden: i64 = row.get(6).map_err(map_sqlite_err)?;
+        if hidden == 1 {
+            continue;
+        }
+        all_columns.push(name.clone());
+        if pk > 0 {
+            pk_cols.push((pk, name));
+        }
+    }
+    if all_columns.is_empty() {
+        return Ok(None);
+    }
+    pk_cols.sort_by_key(|(pk, _)| *pk);
+    let pk_columns: Vec<String> = pk_cols.into_iter().map(|(_, name)| name).collect();
+
+    let mut unique_key_sets = Vec::new();
+    if !pk_columns.is_empty() {
+        unique_key_sets.push(pk_columns.clone());
+    }
+    let list_sql = format!(
+        "PRAGMA {}.index_list({})",
+        quote_ident(schema),
+        quote_ident(&canonical_name)
+    );
+    let mut list_stmt = conn.prepare(&list_sql).map_err(map_sqlite_err)?;
+    let mut list_rows = list_stmt.query([]).map_err(map_sqlite_err)?;
+    let mut unique_idx_names = Vec::new();
+    while let Some(row) = list_rows.next().map_err(map_sqlite_err)? {
+        let idx_name: String = row.get(1).map_err(map_sqlite_err)?;
+        let unique: i64 = row.get(2).map_err(map_sqlite_err)?;
+        let partial: i64 = row.get(4).map_err(map_sqlite_err)?;
+        if unique != 0 && partial == 0 {
+            unique_idx_names.push(idx_name);
+        }
+    }
+    for idx_name in unique_idx_names {
+        let key_cols = fetch_index_xinfo_key_cols_sync(conn, schema, &idx_name)?;
+        if !key_cols.is_empty() && key_cols.iter().all(|(col_opt, _)| col_opt.is_some()) {
+            unique_key_sets.push(key_cols.into_iter().filter_map(|(col_opt, _)| col_opt).collect());
+        }
+    }
+
+    Ok(Some(SqliteParentTableInfo {
+        canonical_name,
+        all_columns,
+        pk_columns,
+        unique_key_sets,
+    }))
 }
 
-fn fetch_single_col_uniques_sync(
+fn fetch_sqlite_index_metadata_sync(
     conn: &Connection,
     schema: &str,
     table: &str,
-) -> Result<HashSet<String>, DbError> {
+    raw_cols: &[(String, String, bool, Option<String>, i64)],
+) -> Result<SqliteIndexMetadata, DbError> {
     let list_sql = format!("PRAGMA {}.index_list({})", quote_ident(schema), quote_ident(table));
     let mut list_stmt = conn.prepare(&list_sql).map_err(map_sqlite_err)?;
     let mut list_rows = list_stmt.query([]).map_err(map_sqlite_err)?;
-    let mut unique_names = Vec::new();
+    let mut has_origin_pk_index = false;
+    let mut unique_entries = Vec::new();
     while let Some(row) = list_rows.next().map_err(map_sqlite_err)? {
         let name: String = row.get(1).map_err(map_sqlite_err)?;
         let unique: i64 = row.get(2).map_err(map_sqlite_err)?;
         let origin: String = row.get(3).map_err(map_sqlite_err)?;
         let partial: i64 = row.get(4).map_err(map_sqlite_err)?;
-        if unique != 0 && origin != "pk" && partial == 0 {
-            unique_names.push(name);
+        if origin == "pk" {
+            has_origin_pk_index = true;
+        }
+        if unique != 0 && partial == 0 {
+            unique_entries.push((name, origin));
         }
     }
 
-    let mut cols = HashSet::new();
-    for idx_name in unique_names {
-        let idx_cols = fetch_index_columns_sync(conn, schema, &idx_name)?;
-        if idx_cols.len() == 1
-            && let Some(col_name) = idx_cols.into_iter().next()
-            && col_name != "<expr>"
+    let mut pk_index_collations = HashMap::new();
+    let mut unique_cols = HashSet::new();
+    let mut stable_unique_candidates = Vec::new();
+    for (idx_name, origin) in unique_entries {
+        let idx_cols = fetch_index_xinfo_key_cols_sync(conn, schema, &idx_name)?;
+        if origin == "pk" {
+            for (col_opt, coll) in &idx_cols {
+                if let Some(col_name) = col_opt
+                    && is_builtin_sqlite_collation(coll)
+                {
+                    pk_index_collations.insert(col_name.clone(), coll.clone());
+                }
+            }
+        } else if idx_cols.len() == 1
+            && let Some((Some(col_name), _)) = idx_cols.first()
         {
-            cols.insert(col_name);
+            unique_cols.insert(col_name.clone());
+        }
+
+        let mut candidate_cols = Vec::with_capacity(idx_cols.len());
+        let mut all_valid = !idx_cols.is_empty();
+        for (col_opt, coll) in idx_cols {
+            let Some(col_name) = col_opt else {
+                all_valid = false;
+                break;
+            };
+            let is_non_null = raw_cols
+                .iter()
+                .any(|(rc_name, _, rc_nullable, _, _)| *rc_name == col_name && !*rc_nullable);
+            if !is_non_null || !is_builtin_sqlite_collation(&coll) {
+                all_valid = false;
+                break;
+            }
+            candidate_cols.push((col_name, coll));
+        }
+        if all_valid {
+            stable_unique_candidates.push((idx_name, candidate_cols));
         }
     }
-    Ok(cols)
+    stable_unique_candidates.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(&b.0)));
+    Ok(SqliteIndexMetadata {
+        has_origin_pk_index,
+        pk_index_collations,
+        unique_cols,
+        stable_unique_candidates,
+    })
+}
+
+fn probe_sqlite_rowid_alias(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+) -> Option<&'static str> {
+    let xinfo_sql = format!("PRAGMA {}.table_xinfo({})", quote_ident(schema), quote_ident(table));
+    let mut stmt = conn.prepare(&xinfo_sql).ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    let mut all_declared_names = Vec::new();
+    while let Some(row) = rows.next().ok()? {
+        let name: String = row.get(1).ok()?;
+        all_declared_names.push(name);
+    }
+
+    let fq_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    for alias in ["_rowid_", "rowid", "oid"] {
+        if columns.iter().any(|c| c.eq_ignore_ascii_case(alias))
+            || all_declared_names.iter().any(|c| c.eq_ignore_ascii_case(alias))
+        {
+            continue;
+        }
+        let probe_sql = format!("SELECT {alias} FROM {fq_table} LIMIT 0");
+        if conn.prepare(&probe_sql).is_ok() {
+            return Some(alias);
+        }
+    }
+    None
 }
 
 fn fetch_indexes_sync(
@@ -1731,6 +2245,7 @@ fn build_table_page_sql(
     table: &str,
     columns: &[ColumnMeta],
     req: &PageRequest,
+    stable_order: &[StableOrderKey],
     limit: i64,
     offset: i64,
 ) -> String {
@@ -1751,9 +2266,30 @@ fn build_table_page_sql(
             sql.push_str(&format!(" WHERE ({trimmed})"));
         }
     }
+    let mut order_terms = Vec::new();
     if let Some(sort) = &req.sort {
         let dir = if sort.ascending { "ASC" } else { "DESC" };
-        sql.push_str(&format!(" ORDER BY {} {dir} NULLS LAST", quote_ident(&sort.column)));
+        order_terms.push(format!("{} {dir} NULLS LAST", quote_ident(&sort.column)));
+    }
+    for key in stable_order {
+        match key {
+            StableOrderKey::Column { name, collation, .. } => {
+                if collation.is_none() && req.sort.as_ref().is_some_and(|s| s.column == *name) {
+                    continue;
+                }
+                if let Some(coll) = collation {
+                    order_terms.push(format!("{} COLLATE {} ASC", quote_ident(name), quote_ident(coll)));
+                } else {
+                    order_terms.push(format!("{} ASC", quote_ident(name)));
+                }
+            }
+            StableOrderKey::System(ident) => {
+                order_terms.push(format!("{ident} ASC"));
+            }
+        }
+    }
+    if !order_terms.is_empty() {
+        sql.push_str(&format!(" ORDER BY {}", order_terms.join(", ")));
     }
     sql.push_str(&format!(" LIMIT {} OFFSET {}", limit + 1, offset));
     sql

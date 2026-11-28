@@ -4,10 +4,10 @@ use chrono::{Duration, Utc};
 use rune::ColorScheme;
 use tv_core::{
     AccentColor, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, DatabaseInfo, DbEngine, DbObject,
-    DbObjectKind, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, IndexInfo,
-    PasswordMode, QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId,
-    SchemaInfo, SessionId, SortSpec, SslMode, StagedCellValue, StatementRisk, StoreData, TablePage, TableStats,
-    TableStructure, TableTransactionSupport, inspect_statement,
+    DbObjectKind, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkLookupComponent, FkPeekRow, ForeignKeyRef,
+    IndexInfo, PasswordMode, QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery,
+    SavedQueryId, SchemaInfo, SessionId, SortSpec, SslMode, StagedCellValue, StatementRisk, StoreData, TablePage,
+    TableStats, TableStructure, TableTransactionSupport, inspect_statement,
 };
 
 use crate::state::{
@@ -693,18 +693,27 @@ fn scene_workspace_fk_peek(s: &mut AppState) {
         let fk = sample_students_columns()[8]
             .foreign_key
             .clone()
-            .unwrap_or_else(|| ForeignKeyRef {
-                constraint_name: "students_group_id_fkey".to_owned(),
-                target_schema: "public".to_owned(),
-                target_table: "study_groups".to_owned(),
-                target_column: "group_id".to_owned(),
+            .unwrap_or_else(|| {
+                ForeignKeyRef::single(
+                    "students_group_id_fkey",
+                    "group_id",
+                    "public",
+                    "study_groups",
+                    "group_id",
+                )
             });
         let source_col = sample_students_columns()[8].clone();
+        let comp = FkLookupComponent {
+            target_column: "group_id".to_owned(),
+            source_col,
+            value: CellValue::Int(1),
+            raw_value: None,
+        };
         t.fk_peek = Some(FkPeekState {
             anchor_key: "fk-peek-r-0-8".to_owned(),
             fk: fk.clone(),
-            value: CellValue::Int(1),
-            source_col,
+            components: vec![comp.clone()],
+            choices: vec![(fk.clone(), vec![comp])],
             req_id: None,
             loading: false,
             result: Some(FkPeekRow {
@@ -1099,12 +1108,13 @@ fn sample_students_columns() -> Vec<ColumnMeta> {
             is_primary_key: false,
             is_unique: false,
             comment: None,
-            foreign_key: Some(ForeignKeyRef {
-                constraint_name: "students_group_id_fkey".to_owned(),
-                target_schema: "public".to_owned(),
-                target_table: "study_groups".to_owned(),
-                target_column: "group_id".to_owned(),
-            }),
+            foreign_key: Some(ForeignKeyRef::single(
+                "students_group_id_fkey",
+                "group_id",
+                "public",
+                "study_groups",
+                "group_id",
+            )),
         },
     ]
 }
@@ -1206,6 +1216,7 @@ fn sample_students_page(columns: Vec<ColumnMeta>) -> TablePage {
 
     TablePage {
         columns,
+        foreign_keys: Vec::new(),
         rows,
         raw_rows: Vec::new(),
         transaction_support: TableTransactionSupport::Supported,
@@ -1255,6 +1266,7 @@ fn sample_courses_page() -> TablePage {
             ],
         ],
         raw_rows: Vec::new(),
+        foreign_keys: Vec::new(),
         transaction_support: TableTransactionSupport::Supported,
         offset: 0,
         limit: 300,
@@ -1295,9 +1307,10 @@ fn sample_students_structure(columns: Vec<ColumnMeta>) -> TableStructure {
             definition: "CREATE INDEX students_profile_gin ON public.students USING gin (profile)".to_owned(),
         },
     ];
-    let ddl = tv_core::engine::postgres::synthesize_table_ddl("public", "students", &columns, &indexes);
+    let ddl = tv_core::engine::postgres::synthesize_table_ddl("public", "students", &columns, &[], &indexes);
     TableStructure {
         columns,
+        foreign_keys: Vec::new(),
         indexes,
         stats: TableStats {
             total_bytes: Some(98_304),

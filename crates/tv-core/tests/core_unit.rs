@@ -7,24 +7,24 @@ use tempfile::tempdir;
 use tv_core::engine::postgres::{quote_ident, synthesize_table_ddl};
 use tv_core::{
     AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ConnectionId, ConnectionProfile,
-    ConnectionStore, DbEngine, EnvTag, ExplainError, ExplainPlan, ExportFormat, ForeignKeyRef, IndexInfo,
-    MysqlQuoteMode, NewHistoryEntry, PasswordMode, PostgresServerEncoding, PostgresSessionMode, QueryStatementResult,
-    QueryStore, RawCellValue,
-    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SettingsStore, SortOrder, SqlSessionMode, SqliteRawValue,
-    SslMode, StagedCellValue, StagedChanges, StagedMutation, StagingError, StatementRisk, StoreData, UrlParseError,
-    ValidationError,
-    atomic_write_bytes, batch_sets_credentials_with_mysql_mode, batch_sets_credentials_with_session_mode,
-    build_explain_sql, build_explain_sql_for_engine, build_fk_where_clause, build_fk_where_clause_for_engine,
+    ConnectionStore, DbEngine, EnvTag, ExplainError, ExplainPlan, ExportFormat, FkLookupComponent, ForeignKeyRef,
+    IndexInfo, MysqlQuoteMode, MysqlRawValue, NewHistoryEntry, PasswordMode, PostgresServerEncoding,
+    PostgresSessionMode, QueryStatementResult, QueryStore, RawCellValue, SafetyDecision, SafetyPolicy, SavedQuery,
+    SavedQueryId, SettingsStore, SortOrder, SqlSessionMode, SqliteRawValue, SslMode, StagedCellValue, StagedChanges,
+    StagedMutation, StagingError, StatementRisk, StoreData, UrlParseError, ValidationError, atomic_write_bytes,
+    batch_sets_credentials_with_mysql_mode, batch_sets_credentials_with_session_mode, build_explain_sql,
+    build_explain_sql_for_engine, build_fk_where_clause, build_fk_where_clause_for_engine, collect_foreign_keys,
     cursor_line_col, evaluate_sql_safety, evaluate_sql_safety_for_engine,
     evaluate_sql_safety_for_engine_with_mysql_mode, evaluate_sql_safety_for_engine_with_session_mode,
     evaluate_staged_commit_safety, export_csv, export_json, export_rows, export_rows_for_engine, export_sql_inserts,
-    export_sql_inserts_for_engine, format_mysql_string_literal, format_sql, has_executable_sql_for_engine,
-    inspect_statement, inspect_statement_for_engine, inspect_statement_for_engine_with_session_mode,
-    postgres_slice_has_multiple_statements, split_statements, split_statements_for_engine,
+    export_sql_inserts_for_engine, format_fk_lookup_display, format_mysql_string_literal, format_sql,
+    has_executable_sql_for_engine, inspect_statement, inspect_statement_for_engine,
+    inspect_statement_for_engine_with_session_mode, postgres_slice_has_multiple_statements,
+    resolve_fk_lookup_components, resolve_fk_lookup_components_with_raw, split_statements, split_statements_for_engine,
     split_statements_for_engine_with_mysql_mode, split_statements_for_engine_with_session_mode, sql_sets_credentials,
     sql_sets_credentials_with_session_mode, statement_at_cursor, statement_at_cursor_for_engine,
-    statement_at_cursor_for_engine_with_mysql_mode, statement_at_cursor_for_engine_with_session_mode,
-    validate_row_editable, validate_table_filter_where,
+    statement_at_cursor_for_engine_with_mysql_mode,
+    statement_at_cursor_for_engine_with_session_mode, validate_row_editable, validate_table_filter_where,
 };
 
 #[test]
@@ -313,12 +313,13 @@ fn quote_ident_and_ddl_synthesis_escape_correctly() {
             is_primary_key: false,
             is_unique: false,
             comment: None,
-            foreign_key: Some(ForeignKeyRef {
-                constraint_name: "students_group_fk".to_owned(),
-                target_schema: "public".to_owned(),
-                target_table: "study_groups".to_owned(),
-                target_column: "group_id".to_owned(),
-            }),
+            foreign_key: Some(ForeignKeyRef::single(
+                "students_group_fk",
+                "group_id",
+                "public",
+                "study_groups",
+                "group_id",
+            )),
         },
     ];
     let indexes = vec![IndexInfo {
@@ -331,7 +332,7 @@ fn quote_ident_and_ddl_synthesis_escape_correctly() {
         definition: "CREATE INDEX students_group_idx ON public.students USING btree (group_id)".to_owned(),
     }];
 
-    let ddl = synthesize_table_ddl("public", "students", &cols, &indexes);
+    let ddl = synthesize_table_ddl("public", "students", &cols, &[], &indexes);
     assert!(ddl.contains("CREATE TABLE \"public\".\"students\""));
     assert!(ddl.contains("PRIMARY KEY (\"student_id\")"));
     assert!(ddl.contains("CONSTRAINT \"students_group_fk\" FOREIGN KEY (\"group_id\") REFERENCES \"public\".\"study_groups\" (\"group_id\")"));
@@ -670,11 +671,31 @@ fn staged_changes_build_transaction_diff_and_revert_cleanly() {
     ));
 
     // FK WHERE filter helper skips NULL and escapes strings cleanly.
+    let single_fk = ForeignKeyRef::single("fk_group", "student_id", "public", "study_groups", "group_id");
     assert_eq!(
-        build_fk_where_clause("group_id", &CellValue::Int(1), &cols[0]),
+        build_fk_where_clause(
+            &single_fk,
+            &[FkLookupComponent {
+                target_column: "group_id".to_owned(),
+                source_col: cols[0].clone(),
+                value: CellValue::Int(1),
+                raw_value: None,
+            }],
+        ),
         Some("\"group_id\" = 1".to_owned())
     );
-    assert_eq!(build_fk_where_clause("group_id", &CellValue::Null, &cols[0]), None);
+    assert_eq!(
+        build_fk_where_clause(
+            &single_fk,
+            &[FkLookupComponent {
+                target_column: "group_id".to_owned(),
+                source_col: cols[0].clone(),
+                value: CellValue::Null,
+                raw_value: None,
+            }],
+        ),
+        None
+    );
 }
 
 #[test]
@@ -1257,17 +1278,32 @@ fn staged_changes_build_statements_and_transactions_for_mysql_and_sqlite() {
     );
 
     // FK WHERE helper respects dialect quoting and literal formatting
+    let mysql_name_fk = ForeignKeyRef::single("fk_name", "full_name", "greendale", "people", "full_name");
     assert_eq!(
         build_fk_where_clause_for_engine(
             DbEngine::Mysql,
-            "full_name",
-            &CellValue::Text(r"Troy's \Fort".to_owned()),
-            &cols[1],
+            &mysql_name_fk,
+            &[FkLookupComponent {
+                target_column: "full_name".to_owned(),
+                source_col: cols[1].clone(),
+                value: CellValue::Text(r"Troy's \Fort".to_owned()),
+                raw_value: None,
+            }],
         ),
         Some("`full_name` = CONCAT('Troy''s ', CHAR(92 USING utf8mb4), 'Fort')".to_owned())
     );
+    let sqlite_bool_fk = ForeignKeyRef::single("fk_flag", "enrolled", "main", "flags", "enrolled");
     assert_eq!(
-        build_fk_where_clause_for_engine(DbEngine::Sqlite, "enrolled", &CellValue::Bool(true), &cols[2]),
+        build_fk_where_clause_for_engine(
+            DbEngine::Sqlite,
+            &sqlite_bool_fk,
+            &[FkLookupComponent {
+                target_column: "enrolled".to_owned(),
+                source_col: cols[2].clone(),
+                value: CellValue::Bool(true),
+                raw_value: None,
+            }],
+        ),
         Some("\"enrolled\" = 1".to_owned())
     );
 }
@@ -7219,4 +7255,276 @@ fn validate_table_filter_where_blocks_escape_and_mutations() {
             "expected rejection for unsafe filter on {engine:?}: {unsafe_filter}"
         );
     }
+}
+
+#[test]
+fn composite_fk_where_clause_resolution_and_ddl_deduplicate_properly() {
+    let comp_fk = ForeignKeyRef {
+        constraint_name: "enrollments_section_fk".to_owned(),
+        target_schema: "public".to_owned(),
+        target_table: "course_sections".to_owned(),
+        source_columns: vec!["course_code".to_owned(), "term".to_owned()],
+        target_columns: vec!["code".to_owned(), "semester".to_owned()],
+    };
+    let unresolved_fk = ForeignKeyRef {
+        constraint_name: "enrollments_broken_fk".to_owned(),
+        target_schema: "public".to_owned(),
+        target_table: "broken_parent".to_owned(),
+        source_columns: vec!["orphan_col".to_owned()],
+        target_columns: Vec::new(),
+    };
+    assert!(comp_fk.is_resolvable());
+    assert!(comp_fk.is_composite());
+    assert_eq!(comp_fk.target_column(), None);
+    assert_eq!(comp_fk.target_column_for("course_code"), Some("code"));
+    assert_eq!(comp_fk.target_column_for("term"), Some("semester"));
+    assert!(!unresolved_fk.is_resolvable());
+    assert_eq!(unresolved_fk.target_column(), None);
+
+    let cols = vec![
+        ColumnMeta {
+            name: "course_code".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(comp_fk.clone()),
+        },
+        ColumnMeta {
+            name: "term".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(comp_fk.clone()),
+        },
+        ColumnMeta {
+            name: "orphan_col".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(unresolved_fk.clone()),
+        },
+    ];
+
+    let full_row = vec![
+        CellValue::Text("SPAN-101".to_owned()),
+        CellValue::Text(r"Fall\2026".to_owned()),
+        CellValue::Text("Abed".to_owned()),
+    ];
+    let components = resolve_fk_lookup_components(&comp_fk, &cols, &full_row).expect("full composite components");
+    assert_eq!(
+        format_fk_lookup_display(&components),
+        r"code = SPAN-101, semester = Fall\2026"
+    );
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Postgres, &comp_fk, &components),
+        Some("\"code\" = 'SPAN-101' AND \"semester\" = 'Fall\\2026'".to_owned())
+    );
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Mysql, &comp_fk, &components),
+        Some("`code` = 'SPAN-101' AND `semester` = CONCAT('Fall', CHAR(92 USING utf8mb4), '2026')".to_owned())
+    );
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, &comp_fk, &components),
+        Some("\"code\" = 'SPAN-101' AND \"semester\" = 'Fall\\2026'".to_owned())
+    );
+
+    // Partial NULL, incomplete components, mismatched targets, and unresolvable FKs are rejected.
+    let partial_null_row = vec![
+        CellValue::Text("SPAN-101".to_owned()),
+        CellValue::Null,
+        CellValue::Text("Abed".to_owned()),
+    ];
+    assert_eq!(resolve_fk_lookup_components(&comp_fk, &cols, &partial_null_row), None);
+    assert_eq!(resolve_fk_lookup_components(&unresolved_fk, &cols, &full_row), None);
+    assert_eq!(build_fk_where_clause(&comp_fk, &components[..1]), None);
+    let swapped = vec![components[1].clone(), components[0].clone()];
+    assert_eq!(build_fk_where_clause(&comp_fk, &swapped), None);
+
+    // Synthesized DDL emits composite FKs once with full column lists.
+    let pg_ddl = synthesize_table_ddl("public", "enrollments", &cols, &[], &[]);
+    assert_eq!(
+        pg_ddl
+            .matches(
+                "CONSTRAINT \"enrollments_section_fk\" FOREIGN KEY (\"course_code\", \"term\") REFERENCES \"public\".\"course_sections\" (\"code\", \"semester\")"
+            )
+            .count(),
+        1
+    );
+    assert!(
+        pg_ddl.contains(
+            "CONSTRAINT \"enrollments_broken_fk\" FOREIGN KEY (\"orphan_col\") REFERENCES \"public\".\"broken_parent\""
+        )
+    );
+
+    let mysql_ddl = tv_core::engine::mysql::synthesize_mysql_table_ddl("greendale", "enrollments", &cols, &[], &[]);
+    assert_eq!(
+        mysql_ddl
+            .matches(
+                "CONSTRAINT `enrollments_section_fk` FOREIGN KEY (`course_code`, `term`) REFERENCES `public`.`course_sections` (`code`, `semester`)"
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn overlapping_single_and_composite_fks_preserved_in_helpers_and_ddl() {
+    let fk_term = ForeignKeyRef::single("fk_term", "term", "public", "terms", "term");
+    let fk_code = ForeignKeyRef::single("fk_code", "course_code", "public", "courses", "code");
+    let fk_section = ForeignKeyRef {
+        constraint_name: "fk_section".to_owned(),
+        target_schema: "public".to_owned(),
+        target_table: "course_sections".to_owned(),
+        source_columns: vec!["term".to_owned(), "course_code".to_owned()],
+        target_columns: vec!["term".to_owned(), "code".to_owned()],
+    };
+    let explicit = vec![fk_term.clone(), fk_code.clone(), fk_section.clone()];
+    let cols = vec![
+        ColumnMeta {
+            name: "term".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_term.clone()),
+        },
+        ColumnMeta {
+            name: "course_code".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_code.clone()),
+        },
+    ];
+
+    let all = collect_foreign_keys(&explicit, &cols);
+    assert_eq!(all.len(), 3);
+    assert_eq!(
+        tv_core::engine::foreign_keys_for_column(&explicit, &cols, "term"),
+        vec![&fk_term, &fk_section]
+    );
+    assert_eq!(
+        tv_core::engine::foreign_keys_for_column(&explicit, &cols, "course_code"),
+        vec![&fk_code, &fk_section]
+    );
+
+    let pg_ddl = synthesize_table_ddl("public", "signups", &cols, &explicit, &[]);
+    assert!(pg_ddl.contains("CONSTRAINT \"fk_term\" FOREIGN KEY (\"term\") REFERENCES \"public\".\"terms\" (\"term\")"));
+    assert!(pg_ddl.contains("CONSTRAINT \"fk_code\" FOREIGN KEY (\"course_code\") REFERENCES \"public\".\"courses\" (\"code\")"));
+    assert!(pg_ddl.contains(
+        "CONSTRAINT \"fk_section\" FOREIGN KEY (\"term\", \"course_code\") REFERENCES \"public\".\"course_sections\" (\"term\", \"code\")"
+    ));
+
+    let mysql_ddl =
+        tv_core::engine::mysql::synthesize_mysql_table_ddl("greendale", "signups", &cols, &explicit, &[]);
+    assert!(mysql_ddl.contains("CONSTRAINT `fk_section` FOREIGN KEY (`term`, `course_code`)"));
+}
+
+#[test]
+fn fk_where_clause_prefers_lossless_raw_value_until_edited() {
+    let col = ColumnMeta {
+        name: "flag".to_owned(),
+        data_type: "BOOLEAN".to_owned(),
+        udt_name: "boolean".to_owned(),
+        nullable: false,
+        default_expr: None,
+        is_primary_key: false,
+        is_unique: false,
+        comment: None,
+        foreign_key: None,
+    };
+    let fk = ForeignKeyRef::single("fk_flag", "flag", "main", "parents", "flag");
+
+    let comps_raw = resolve_fk_lookup_components_with_raw(
+        &fk,
+        std::slice::from_ref(&col),
+        &[CellValue::Bool(true)],
+        Some(&[Some(RawCellValue::Sqlite(SqliteRawValue::Text("true".to_owned())))]),
+    )
+    .expect("resolve with lossless SQLite raw text");
+    assert_eq!(format_fk_lookup_display(&comps_raw), "flag = true");
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, &fk, &comps_raw),
+        Some("\"flag\" = 'true'".to_owned())
+    );
+
+    let real_fk = ForeignKeyRef::single("fk_real", "flag", "main", "parents", "score");
+    let comps_real = resolve_fk_lookup_components_with_raw(
+        &real_fk,
+        std::slice::from_ref(&col),
+        &[CellValue::Float(1.0)],
+        Some(&[Some(RawCellValue::Sqlite(SqliteRawValue::Real(1.0)))]),
+    )
+    .expect("resolve with lossless SQLite real");
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, &real_fk, &comps_real),
+        Some("\"score\" = 1.0".to_owned())
+    );
+
+    let comps_pos_inf = resolve_fk_lookup_components_with_raw(
+        &real_fk,
+        std::slice::from_ref(&col),
+        &[CellValue::Float(f64::INFINITY)],
+        Some(&[Some(RawCellValue::Sqlite(SqliteRawValue::Real(f64::INFINITY)))]),
+    )
+    .expect("resolve with SQLite +inf");
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, &real_fk, &comps_pos_inf),
+        Some("\"score\" = 1e999".to_owned())
+    );
+
+    let comps_neg_inf = resolve_fk_lookup_components_with_raw(
+        &real_fk,
+        std::slice::from_ref(&col),
+        &[CellValue::Float(f64::NEG_INFINITY)],
+        Some(&[Some(RawCellValue::Sqlite(SqliteRawValue::Real(f64::NEG_INFINITY)))]),
+    )
+    .expect("resolve with SQLite -inf");
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, &real_fk, &comps_neg_inf),
+        Some("\"score\" = -1e999".to_owned())
+    );
+
+    let mysql_col = ColumnMeta {
+        data_type: "varchar(16)".to_owned(),
+        udt_name: "varchar".to_owned(),
+        ..col.clone()
+    };
+    let mysql_comps = resolve_fk_lookup_components_with_raw(
+        &fk,
+        std::slice::from_ref(&mysql_col),
+        &[CellValue::Bool(true)],
+        Some(&[Some(RawCellValue::Mysql(MysqlRawValue::Bytes(b"true".to_vec())))]),
+    )
+    .expect("resolve with lossless MySQL bytes");
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Mysql, &fk, &mysql_comps),
+        Some("`flag` = 'true'".to_owned())
+    );
+
+    let comps_edited = resolve_fk_lookup_components(&fk, &[col], &[CellValue::Bool(true)])
+        .expect("resolve edited cell without raw value");
+    assert_eq!(
+        build_fk_where_clause_for_engine(DbEngine::Sqlite, &fk, &comps_edited),
+        Some("\"flag\" = 1".to_owned())
+    );
 }

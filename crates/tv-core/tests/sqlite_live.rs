@@ -7,8 +7,9 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tv_core::{
-    CellValue, ConnectionProfile, DbEngine, DbError, DbObjectKind, ExplainPlan, PageRequest, SafetyPolicy, SortSpec,
-    StagedCellValue, StagedChanges, connect_session, test_connection,
+    CellValue, ConnectionProfile, DbEngine, DbError, DbObjectKind, ExplainPlan, FkLookupComponent, PageRequest,
+    SafetyPolicy, SortSpec, StagedCellValue, StagedChanges, connect_session, resolve_fk_lookup_components,
+    resolve_fk_lookup_components_with_raw, test_connection,
 };
 
 fn seed_greendale_db(db_path: &std::path::Path) {
@@ -311,7 +312,8 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
         let group_fk = structure.columns[12].foreign_key.as_ref().expect("group_id FK");
         assert_eq!(group_fk.target_schema, "main");
         assert_eq!(group_fk.target_table, "study_groups");
-        assert_eq!(group_fk.target_column, "group_id");
+        assert_eq!(group_fk.target_column(), Some("group_id"));
+        assert!(group_fk.is_resolvable());
 
         assert!(structure.indexes.iter().any(|i| i.name == "idx_students_name" && i.columns == ["full_name"]));
         assert!(structure.indexes.iter().any(|i| i.name == "idx_students_group" && i.columns == ["group_id"]));
@@ -328,7 +330,7 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
         assert!(!enroll_struct.columns[2].is_unique);
         let stu_fk = enroll_struct.columns[1].foreign_key.as_ref().expect("student_id FK");
         assert_eq!(stu_fk.target_table, "students");
-        assert_eq!(stu_fk.target_column, "student_id");
+        assert_eq!(stu_fk.target_column(), Some("student_id"));
 
         // describe_table on courses (TEXT PRIMARY KEY creates sqlite_autoindex with is_primary)
         let (courses_struct, _) = session
@@ -353,7 +355,15 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
 
         // fetch_fk_row (text PK and int PK + NULL guard)
         let (group_peek, peek_log) = session
-            .fetch_fk_row(group_fk, &CellValue::Int(2), &structure.columns[12])
+            .fetch_fk_row(
+                group_fk,
+                &[tv_core::FkLookupComponent {
+                    target_column: "group_id".to_owned(),
+                    source_col: structure.columns[12].clone(),
+                    value: CellValue::Int(2),
+                    raw_value: None,
+                }],
+            )
             .await
             .expect("fetch_fk_row group 2");
         assert!(peek_log.sql.contains("\"main\".\"study_groups\""));
@@ -362,14 +372,30 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
 
         let course_fk = enroll_struct.columns[2].foreign_key.as_ref().expect("course_code FK");
         let (course_peek, _) = session
-            .fetch_fk_row(course_fk, &CellValue::Text("FILM-201".to_owned()), &enroll_struct.columns[2])
+            .fetch_fk_row(
+                course_fk,
+                &[tv_core::FkLookupComponent {
+                    target_column: "course_code".to_owned(),
+                    source_col: enroll_struct.columns[2].clone(),
+                    value: CellValue::Text("FILM-201".to_owned()),
+                    raw_value: None,
+                }],
+            )
             .await
             .expect("fetch_fk_row FILM-201");
         let course_row = course_peek.row.expect("FILM-201 exists");
         assert_eq!(course_row[1], CellValue::Text("Meta Filmmaking".to_owned()));
 
         let null_peek = session
-            .fetch_fk_row(group_fk, &CellValue::Null, &structure.columns[12])
+            .fetch_fk_row(
+                group_fk,
+                &[tv_core::FkLookupComponent {
+                    target_column: "group_id".to_owned(),
+                    source_col: structure.columns[12].clone(),
+                    value: CellValue::Null,
+                    raw_value: None,
+                }],
+            )
             .await;
         assert!(matches!(null_peek, Err(DbError::InvalidInput(_))));
 
@@ -1407,5 +1433,820 @@ fn live_sqlite_read_only_memory_enforces_query_only_and_filter_guardrails() {
             .await
             .expect_err("ReadOnly session must reject staged commit");
         assert!(matches!(staged_err, DbError::InvalidInput(_)), "got {staged_err:?}");
+    });
+}
+
+#[test]
+fn live_sqlite_composite_fk_navigation_and_unresolvable_shorthands() {
+    let dir = TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("greendale_composite_fks.sqlite3");
+    {
+        let conn = Connection::open(&db_path).expect("create sqlite db");
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+
+             CREATE TABLE course_sections (
+                 term TEXT NOT NULL,
+                 course_code TEXT NOT NULL,
+                 room TEXT NOT NULL,
+                 PRIMARY KEY (course_code, term)
+             );
+             INSERT INTO course_sections (term, course_code, room) VALUES
+                 ('Fall', 'SPAN-101', 'Study Room F'),
+                 ('Spring', 'SPAN-101', 'Room 202'),
+                 ('Fall', 'FILM-201', 'Cafeteria');
+
+             CREATE TABLE pkless_parent (
+                 code TEXT NOT NULL,
+                 label TEXT NOT NULL
+             );
+             INSERT INTO pkless_parent (code, label) VALUES ('G1', 'Greendale Seven');
+
+             CREATE TABLE section_signups (
+                 signup_id INTEGER PRIMARY KEY,
+                 student_name TEXT NOT NULL,
+                 term TEXT,
+                 course_code TEXT,
+                 shorthand_code TEXT,
+                 shorthand_term TEXT,
+                 bad_arity_code TEXT,
+                 pkless_code TEXT,
+                 missing_parent_id INTEGER,
+                 FOREIGN KEY (term, course_code) REFERENCES course_sections (term, course_code),
+                 FOREIGN KEY (shorthand_code, shorthand_term) REFERENCES course_sections,
+                 FOREIGN KEY (bad_arity_code) REFERENCES course_sections,
+                 FOREIGN KEY (pkless_code) REFERENCES pkless_parent,
+                 FOREIGN KEY (missing_parent_id) REFERENCES nonexistent_table (id)
+             );
+             INSERT INTO section_signups VALUES
+                 (1, 'Troy Barnes', 'Spring', 'SPAN-101', 'FILM-201', 'Fall', 'SPAN-101', 'G1', 99),
+                 (2, 'Abed Nadir', 'Fall', 'SPAN-101', 'SPAN-101', NULL, NULL, NULL, NULL);",
+        )
+        .expect("seed composite fk schema");
+    }
+
+    let rt = Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let profile = ConnectionProfile::new_sqlite("Composite FKs", &db_path);
+        let (session, _) = connect_session(&profile, None, None)
+            .await
+            .expect("connect sqlite");
+
+        let (structure, _) = session
+            .describe_table("main", "section_signups")
+            .await
+            .expect("describe section_signups");
+
+        let term_fk = structure.columns[2].foreign_key.as_ref().expect("term FK");
+        let code_fk = structure.columns[3].foreign_key.as_ref().expect("course_code FK");
+        assert!(term_fk.is_resolvable());
+        assert!(term_fk.is_composite());
+        assert_eq!(term_fk.source_columns, vec!["term", "course_code"]);
+        assert_eq!(term_fk.target_columns, vec!["term", "course_code"]);
+        assert_eq!(code_fk, term_fk);
+
+        // Shorthand REFERENCES course_sections (without explicit column list) must resolve
+        // in parent PK ordinal order (course_code, term), NOT column declaration order (term, course_code).
+        let shorthand_fk = structure.columns[4]
+            .foreign_key
+            .as_ref()
+            .expect("shorthand_code FK");
+        assert!(shorthand_fk.is_resolvable());
+        assert_eq!(shorthand_fk.source_columns, vec!["shorthand_code", "shorthand_term"]);
+        assert_eq!(shorthand_fk.target_columns, vec!["course_code", "term"]);
+
+        // Unresolvable constraints: arity mismatch on shorthand, PK-less parent, missing parent.
+        for (idx, name) in [(6, "bad_arity_code"), (7, "pkless_code"), (8, "missing_parent_id")] {
+            let unresolved = structure.columns[idx]
+                .foreign_key
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected FK metadata for {name}"));
+            assert!(!unresolved.is_resolvable(), "{name} should be unresolvable");
+            assert!(unresolved.target_columns.is_empty());
+        }
+
+        let (page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "section_signups".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("fetch signups page");
+
+        // Troy Barnes -> Spring + SPAN-101 must resolve to Room 202 (not Study Room F).
+        let troy_explicit = resolve_fk_lookup_components(term_fk, &page.columns, &page.rows[0])
+            .expect("resolve explicit composite FK for Troy");
+        let (troy_peek, peek_log) = session
+            .fetch_fk_row(term_fk, &troy_explicit)
+            .await
+            .expect("peek explicit composite FK");
+        assert!(peek_log.sql.contains("\"term\" = 'Spring' AND \"course_code\" = 'SPAN-101'"));
+        assert_eq!(
+            troy_peek.row.expect("parent row")[2],
+            CellValue::Text("Room 202".to_owned())
+        );
+
+        let troy_shorthand = resolve_fk_lookup_components(shorthand_fk, &page.columns, &page.rows[0])
+            .expect("resolve shorthand composite FK for Troy");
+        let (short_peek, short_log) = session
+            .fetch_fk_row(shorthand_fk, &troy_shorthand)
+            .await
+            .expect("peek shorthand composite FK");
+        assert!(short_log.sql.contains("\"course_code\" = 'FILM-201' AND \"term\" = 'Fall'"));
+        assert_eq!(
+            short_peek.row.expect("shorthand parent row")[2],
+            CellValue::Text("Cafeteria".to_owned())
+        );
+
+        // Partial NULL in Abed's shorthand composite FK disables client resolution.
+        assert_eq!(resolve_fk_lookup_components(shorthand_fk, &page.columns, &page.rows[1]), None);
+
+        // Engine also rejects partial component slice and unresolvable FKs directly.
+        assert!(matches!(
+            session.fetch_fk_row(term_fk, &troy_explicit[..1]).await,
+            Err(DbError::InvalidInput(_))
+        ));
+        for idx in [6, 7, 8] {
+            let unresolved = structure.columns[idx].foreign_key.as_ref().expect("fk");
+            assert_eq!(resolve_fk_lookup_components(unresolved, &page.columns, &page.rows[0]), None);
+            let direct_err = session
+                .fetch_fk_row(
+                    unresolved,
+                    &[FkLookupComponent {
+                        target_column: "id".to_owned(),
+                        source_col: page.columns[idx].clone(),
+                        value: CellValue::Int(1),
+                        raw_value: None,
+                    }],
+                )
+                .await;
+            assert!(matches!(direct_err, Err(DbError::InvalidInput(_))));
+        }
+
+        // S1/S4/S5 regressions: overlapping single + composite FKs, raw TEXT inside BOOLEAN column, and non-unique parent targets.
+        session
+            .execute_sql(
+                &[
+                    "PRAGMA foreign_keys = OFF".to_owned(),
+                    "CREATE TABLE terms (term TEXT PRIMARY KEY)".to_owned(),
+                    "INSERT INTO terms VALUES ('Spring'), ('Fall')".to_owned(),
+                    "CREATE TABLE courses (course_code TEXT PRIMARY KEY)".to_owned(),
+                    "INSERT INTO courses VALUES ('SPAN-101')".to_owned(),
+                    "CREATE TABLE overlap_signups (
+                         id INTEGER PRIMARY KEY,
+                         term TEXT NOT NULL,
+                         course_code TEXT NOT NULL,
+                         FOREIGN KEY (term) REFERENCES terms (term),
+                         FOREIGN KEY (course_code) REFERENCES courses (course_code),
+                         FOREIGN KEY (term, course_code) REFERENCES course_sections (term, course_code)
+                     )"
+                    .to_owned(),
+                    "CREATE TABLE bool_parents (
+                         id INTEGER NOT NULL,
+                         flag TEXT NOT NULL,
+                         label TEXT NOT NULL,
+                         PRIMARY KEY (id, flag)
+                     )"
+                    .to_owned(),
+                    "INSERT INTO bool_parents VALUES (1, 'true', 'Text True'), (1, '1', 'Text One')".to_owned(),
+                    "CREATE TABLE bool_children (
+                         cid INTEGER PRIMARY KEY,
+                         pid INTEGER NOT NULL,
+                         flag BOOLEAN NOT NULL,
+                         FOREIGN KEY (pid, flag) REFERENCES bool_parents (id, flag)
+                     )"
+                    .to_owned(),
+                    "INSERT INTO bool_children VALUES (1, 1, 'true')".to_owned(),
+                    "CREATE TABLE non_unique_parent (
+                         id INTEGER PRIMARY KEY,
+                         tag TEXT NOT NULL
+                     )"
+                    .to_owned(),
+                    "INSERT INTO non_unique_parent VALUES (1, 'dup'), (2, 'dup')".to_owned(),
+                    "CREATE TABLE invalid_target_fk (
+                         cid INTEGER PRIMARY KEY,
+                         tag TEXT NOT NULL,
+                         FOREIGN KEY (tag) REFERENCES non_unique_parent (tag)
+                     )"
+                    .to_owned(),
+                    "INSERT INTO invalid_target_fk VALUES (1, 'dup')".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed S1/S4/S5 regression tables");
+
+        // S1: Overlapping single + composite FKs are all retained on TableStructure and TablePage.
+        let (overlap_struct, _) = session
+            .describe_table("main", "overlap_signups")
+            .await
+            .expect("describe overlap_signups");
+        assert_eq!(overlap_struct.foreign_keys.len(), 3);
+        assert_eq!(overlap_struct.foreign_keys_for_column("term").len(), 2);
+        assert_eq!(overlap_struct.foreign_keys_for_column("course_code").len(), 2);
+        let (overlap_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "overlap_signups".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("fetch overlap_signups page");
+        assert_eq!(overlap_page.foreign_keys.len(), 3);
+        assert!(
+            overlap_page
+                .all_foreign_keys()
+                .iter()
+                .any(|fk| fk.is_composite() && fk.target_table == "course_sections")
+        );
+
+        // S4: Lossless RawCellValue resolves SQLite TEXT 'true' inside a BOOLEAN column to 'Text True'.
+        let (bool_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "bool_children".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("fetch bool_children page");
+        let bool_fk = bool_page.foreign_keys.first().expect("bool_children FK");
+        let raw_row_opts: Vec<Option<tv_core::RawCellValue>> =
+            bool_page.raw_rows[0].iter().cloned().map(Some).collect();
+        let bool_comps = resolve_fk_lookup_components_with_raw(
+            bool_fk,
+            &bool_page.columns,
+            &bool_page.rows[0],
+            Some(&raw_row_opts),
+        )
+        .expect("resolve bool_children FK with raw");
+        let (bool_peek, bool_log) = session
+            .fetch_fk_row(bool_fk, &bool_comps)
+            .await
+            .expect("peek bool_parents");
+        assert!(bool_log.sql.contains("\"flag\" = 'true'"));
+        assert_eq!(
+            bool_peek.row.expect("bool parent row")[2],
+            CellValue::Text("Text True".to_owned())
+        );
+
+        // S5: Explicit FK referencing non-unique parent column(s) is unresolvable and rejected by fetch_fk_row.
+        let (bad_target_struct, _) = session
+            .describe_table("main", "invalid_target_fk")
+            .await
+            .expect("describe invalid_target_fk");
+        assert_eq!(bad_target_struct.foreign_keys.len(), 1);
+        assert!(!bad_target_struct.foreign_keys[0].is_resolvable());
+        let direct_bad_ref = tv_core::ForeignKeyRef::single(
+            "fk_bad_target",
+            "tag",
+            "main",
+            "non_unique_parent",
+            "tag",
+        );
+        let err = session
+            .fetch_fk_row(
+                &direct_bad_ref,
+                &[FkLookupComponent {
+                    target_column: "tag".to_owned(),
+                    source_col: bad_target_struct.columns[1].clone(),
+                    value: CellValue::Text("dup".to_owned()),
+                    raw_value: None,
+                }],
+            )
+            .await;
+        assert!(matches!(err, Err(DbError::InvalidInput(_))));
+
+        // Round 2 fixes: generated stored parent column FK + SQLite REAL infinity FK.
+        session
+            .execute_sql(
+                &[
+                    "PRAGMA foreign_keys = ON".to_owned(),
+                    "CREATE TABLE gen_parents (
+                         a TEXT NOT NULL,
+                         b TEXT GENERATED ALWAYS AS (upper(a)) STORED UNIQUE
+                     )"
+                    .to_owned(),
+                    "INSERT INTO gen_parents (a) VALUES ('Troy')".to_owned(),
+                    "CREATE TABLE gen_children (
+                         id INTEGER PRIMARY KEY,
+                         k TEXT NOT NULL,
+                         FOREIGN KEY (k) REFERENCES gen_parents (b)
+                     )"
+                    .to_owned(),
+                    "INSERT INTO gen_children VALUES (1, 'TROY')".to_owned(),
+                    "CREATE TABLE inf_parents (
+                         k REAL PRIMARY KEY,
+                         label TEXT NOT NULL
+                     )"
+                    .to_owned(),
+                    "INSERT INTO inf_parents VALUES (1e999, 'Positive Infinity'), (-1e999, 'Negative Infinity')"
+                        .to_owned(),
+                    "CREATE TABLE inf_children (
+                         id INTEGER PRIMARY KEY,
+                         k REAL NOT NULL,
+                         FOREIGN KEY (k) REFERENCES inf_parents (k)
+                     )"
+                    .to_owned(),
+                    "INSERT INTO inf_children VALUES (1, 1e999), (2, -1e999)".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed generated & infinity FK tables");
+
+        let (gen_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "gen_children".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("fetch gen_children page");
+        let gen_fk = gen_page.foreign_keys.first().expect("gen_children FK");
+        assert!(gen_fk.is_resolvable());
+        let gen_comps = resolve_fk_lookup_components_with_raw(gen_fk, &gen_page.columns, &gen_page.rows[0], None)
+            .expect("resolve generated parent FK");
+        let (gen_peek, _) = session
+            .fetch_fk_row(gen_fk, &gen_comps)
+            .await
+            .expect("peek generated parent row");
+        assert_eq!(gen_peek.row.expect("gen parent")[0], CellValue::Text("Troy".to_owned()));
+
+        let (inf_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "inf_children".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("fetch inf_children page");
+        let inf_fk = inf_page.foreign_keys.first().expect("inf_children FK");
+        for (row_idx, expected_label) in [(0, "Positive Infinity"), (1, "Negative Infinity")] {
+            let inf_raw_opts: Vec<Option<tv_core::RawCellValue>> =
+                inf_page.raw_rows[row_idx].iter().cloned().map(Some).collect();
+            let inf_comps = resolve_fk_lookup_components_with_raw(
+                inf_fk,
+                &inf_page.columns,
+                &inf_page.rows[row_idx],
+                Some(&inf_raw_opts),
+            )
+            .expect("resolve REAL infinity FK");
+            let (inf_peek, _) = session
+                .fetch_fk_row(inf_fk, &inf_comps)
+                .await
+                .expect("peek REAL infinity parent");
+            assert_eq!(
+                inf_peek.row.expect("inf parent")[1],
+                CellValue::Text(expected_label.to_owned())
+            );
+        }
+    });
+}
+
+#[test]
+fn live_sqlite_pagination_determinism_and_offset_recovery() {
+    let dir = TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("greendale_pagination.sqlite3");
+    {
+        let conn = Connection::open(&db_path).expect("create sqlite db");
+        conn.execute_batch(
+            "CREATE TABLE heap_items (
+                 category TEXT NOT NULL,
+                 label TEXT NOT NULL
+             );
+             INSERT INTO heap_items (category, label) VALUES
+                 ('Study', 'Spanish Notes'),
+                 ('Study', 'Anthology'),
+                 ('Club', 'Paintball'),
+                 ('Study', 'Blanket Fort'),
+                 ('Club', 'Inspector');
+
+             CREATE TABLE shadow_rowid (
+                 \"_rowid_\" TEXT NOT NULL,
+                 label TEXT NOT NULL
+             );
+             INSERT INTO shadow_rowid (\"_rowid_\", label) VALUES
+                 ('x', 'Troy'),
+                 ('y', 'Abed');
+
+             CREATE TABLE nullable_unique (
+                 code TEXT UNIQUE,
+                 label TEXT NOT NULL
+             );
+             INSERT INTO nullable_unique (code, label) VALUES
+                 (NULL, 'Row 1'),
+                 (NULL, 'Row 2'),
+                 (NULL, 'Row 3');
+
+             CREATE TABLE nonnull_unique (
+                 code TEXT NOT NULL UNIQUE,
+                 label TEXT NOT NULL
+             );
+             INSERT INTO nonnull_unique (code, label) VALUES
+                 ('B-2', 'Britta'),
+                 ('A-1', 'Annie');
+
+             CREATE TABLE nullable_pk (
+                 k TEXT PRIMARY KEY,
+                 label TEXT NOT NULL
+             );
+             INSERT INTO nullable_pk (k, label) VALUES
+                 (NULL, 'Null PK 1'),
+                 (NULL, 'Null PK 2'),
+                 ('A', 'Key A');
+
+             CREATE TABLE without_rowid_kv (
+                 k TEXT NOT NULL PRIMARY KEY,
+                 val TEXT NOT NULL
+             ) WITHOUT ROWID;
+             INSERT INTO without_rowid_kv (k, val) VALUES
+                 ('b', 'Two'),
+                 ('a', 'One');
+
+             CREATE TABLE nocase_bin_unique (
+                 code TEXT NOT NULL COLLATE NOCASE,
+                 label TEXT NOT NULL
+             );
+             CREATE UNIQUE INDEX u_nocase_bin ON nocase_bin_unique (code COLLATE BINARY);
+             CREATE INDEX idx_nocase_bin_nc ON nocase_bin_unique (code);
+             INSERT INTO nocase_bin_unique (code, label) VALUES
+                 ('a', 'Lower'),
+                 ('A', 'Upper');
+
+             CREATE TABLE generated_rowid (
+                 label TEXT NOT NULL,
+                 \"_rowid_\" TEXT GENERATED ALWAYS AS (label || '_g') VIRTUAL
+             );
+             INSERT INTO generated_rowid (label) VALUES ('Troy'), ('Abed');
+
+             CREATE TABLE shadow_all_pk_unique (
+                 \"_rowid_\" TEXT,
+                 \"rowid\" TEXT,
+                 \"oid\" TEXT,
+                 a TEXT,
+                 b TEXT,
+                 id INTEGER NOT NULL UNIQUE,
+                 PRIMARY KEY (a, b)
+             );
+             INSERT INTO shadow_all_pk_unique VALUES
+                 ('r1', 'r1', 'r1', NULL, 'Troy', 20),
+                 ('r2', 'r2', 'r2', NULL, 'Troy', 10);
+
+             CREATE VIEW heap_view AS SELECT category, label FROM heap_items;",
+        )
+        .expect("seed pagination tables");
+    }
+
+    let rt = Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let mut ro_profile = ConnectionProfile::new_sqlite("Pagination RO", &db_path);
+        ro_profile.safety = SafetyPolicy::ReadOnly;
+        let (ro_session, _) = connect_session(&ro_profile, None, None)
+            .await
+            .expect("connect sqlite readonly");
+
+        // 1. PK-less table orders stably by _rowid_, including under ReadOnly authorizer,
+        //    and appends _rowid_ as tie-breaker when sorting on non-unique `category`.
+        let (ro_heap, ro_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "category".to_owned(),
+                    ascending: true,
+                }),
+                limit: 2,
+                offset: 0,
+            })
+            .await
+            .expect("readonly heap page");
+        assert!(ro_logs[0].sql.contains("ORDER BY \"category\" ASC NULLS LAST, _rowid_ ASC"));
+        assert_eq!(ro_heap.rows.len(), 2);
+
+        let (ro_nullable_pk, ro_npk_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nullable_pk".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("nullable PK page under ReadOnly");
+        assert!(ro_npk_logs[0].sql.contains("ORDER BY \"k\" COLLATE \"BINARY\" ASC, _rowid_ ASC"));
+        assert_eq!(ro_nullable_pk.rows.len(), 3);
+
+        // User column literally named `_rowid_` falls back to `rowid`, including generated `_rowid_`.
+        let (shadow_page, shadow_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "shadow_rowid".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("shadow _rowid_ table");
+        assert!(shadow_logs[0].sql.contains("ORDER BY rowid ASC"));
+        assert_eq!(
+            shadow_page.rows,
+            vec![
+                vec![CellValue::Text("x".to_owned()), CellValue::Text("Troy".to_owned())],
+                vec![CellValue::Text("y".to_owned()), CellValue::Text("Abed".to_owned())],
+            ]
+        );
+
+        let (gen_page, gen_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "generated_rowid".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("generated _rowid_ table");
+        assert!(gen_logs[0].sql.contains("ORDER BY rowid ASC"));
+        assert_eq!(gen_page.rows.len(), 2);
+
+        // When nullable PK has all rowid aliases shadowed by user columns, fall back to non-null UNIQUE `id`.
+        let (tied_p0, tied_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "shadow_all_pk_unique".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 1,
+                offset: 0,
+            })
+            .await
+            .expect("shadow_all_pk_unique page 0");
+        let (tied_p1, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "shadow_all_pk_unique".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 1,
+                offset: 1,
+            })
+            .await
+            .expect("shadow_all_pk_unique page 1");
+        assert!(tied_logs[0].sql.contains("\"id\" COLLATE \"BINARY\" ASC"));
+        assert_eq!(tied_p0.rows[0][5], CellValue::Int(10));
+        assert_eq!(tied_p1.rows[0][5], CellValue::Int(20));
+
+        // S3: BINARY unique index on NOCASE column distinguishes `'A'` and `'a'` under both default and column sorts.
+        let (bin_p0, bin_p0_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nocase_bin_unique".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 1,
+                offset: 0,
+            })
+            .await
+            .expect("nocase_bin_unique page 0");
+        let (bin_p1, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nocase_bin_unique".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 1,
+                offset: 1,
+            })
+            .await
+            .expect("nocase_bin_unique page 1");
+        assert!(bin_p0_logs[0].sql.contains("ORDER BY \"code\" COLLATE \"BINARY\" ASC"));
+        assert_ne!(bin_p0.rows[0][0], bin_p1.rows[0][0]);
+
+        let (bin_sort_p0, bin_sort_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nocase_bin_unique".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "code".to_owned(),
+                    ascending: true,
+                }),
+                limit: 1,
+                offset: 0,
+            })
+            .await
+            .expect("sorted nocase_bin_unique page 0");
+        let (bin_sort_p1, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nocase_bin_unique".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "code".to_owned(),
+                    ascending: true,
+                }),
+                limit: 1,
+                offset: 1,
+            })
+            .await
+            .expect("sorted nocase_bin_unique page 1");
+        assert!(
+            bin_sort_logs[0]
+                .sql
+                .contains("ORDER BY \"code\" ASC NULLS LAST, \"code\" COLLATE \"BINARY\" ASC")
+        );
+        assert_ne!(bin_sort_p0.rows[0][0], bin_sort_p1.rows[0][0]);
+
+        // Nullable UNIQUE is skipped in favor of `_rowid_`; non-null UNIQUE orders by `code`.
+        let (_, nu_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nullable_unique".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("nullable_unique page");
+        assert!(nu_logs[0].sql.contains("ORDER BY _rowid_ ASC"));
+
+        let (nnu_page, nnu_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nonnull_unique".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("nonnull_unique page");
+        assert!(nnu_logs[0].sql.contains("ORDER BY \"code\" COLLATE \"BINARY\" ASC"));
+        assert_eq!(nnu_page.rows[0][0], CellValue::Text("A-1".to_owned()));
+
+        // WITHOUT ROWID orders by PK column cleanly, and VIEW queries without error.
+        let (wr_page, wr_logs) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "without_rowid_kv".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("without_rowid_kv page");
+        assert!(wr_logs[0].sql.contains("ORDER BY \"k\" COLLATE \"BINARY\" ASC"));
+        assert_eq!(wr_page.rows[0][0], CellValue::Text("a".to_owned()));
+
+        let (view_page, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_view".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("view page");
+        assert_eq!(view_page.rows.len(), 5);
+
+        // 2. Out-of-range offset recovery scenarios on heap_items (5 rows):
+        // 2a. Exact boundary offset == total (offset 5, limit 2 -> last page offset 4, exact total 5).
+        let (exact_boundary, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 2,
+                offset: 5,
+            })
+            .await
+            .expect("exact boundary offset recovery");
+        assert_eq!(exact_boundary.offset, 4);
+        assert_eq!(exact_boundary.rows.len(), 1);
+        assert_eq!(exact_boundary.total_rows_estimate, Some(5));
+        assert!(exact_boundary.total_is_exact);
+        assert!(!exact_boundary.has_more);
+
+        // 2b. Far out-of-range offset (offset 20, limit 2 -> offset 4, exact total 5).
+        let (far_oob, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 2,
+                offset: 20,
+            })
+            .await
+            .expect("far out-of-range recovery");
+        assert_eq!(far_oob.offset, 4);
+        assert_eq!(far_oob.rows.len(), 1);
+        assert_eq!(far_oob.total_rows_estimate, Some(5));
+        assert!(far_oob.total_is_exact);
+
+        // 2c. Filtered out-of-range recovery (3 matching rows -> offset 2, 1 row, exact total 3).
+        let (filtered_oob, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: Some("category = 'Study'".to_owned()),
+                sort: None,
+                limit: 2,
+                offset: 10,
+            })
+            .await
+            .expect("filtered out-of-range recovery");
+        assert_eq!(filtered_oob.offset, 2);
+        assert_eq!(filtered_oob.rows.len(), 1);
+        assert_eq!(filtered_oob.total_rows_estimate, Some(3));
+        assert!(filtered_oob.total_is_exact);
+
+        // 2d. Empty filtered nonzero offset recovers to offset 0, exact total 0.
+        let (filtered_empty, _) = ro_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: Some("category = 'None'".to_owned()),
+                sort: None,
+                limit: 2,
+                offset: 10,
+            })
+            .await
+            .expect("filtered empty recovery");
+        assert_eq!(filtered_empty.offset, 0);
+        assert!(filtered_empty.rows.is_empty());
+        assert_eq!(filtered_empty.total_rows_estimate, Some(0));
+        assert!(filtered_empty.total_is_exact);
+
+        // 2e. Shrink to 1 row, then 0 rows via RW session and verify recovery.
+        let mut rw_profile = ro_profile.clone();
+        rw_profile.safety = SafetyPolicy::Unrestricted;
+        let (rw_session, _) = connect_session(&rw_profile, None, None)
+            .await
+            .expect("connect sqlite rw");
+        rw_session
+            .execute_sql(&["DELETE FROM heap_items WHERE _rowid_ > 1".to_owned()], None)
+            .await
+            .expect("shrink heap_items to 1 row");
+        let (shrunk_one, _) = rw_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 3,
+                offset: 10,
+            })
+            .await
+            .expect("recover shrunk 1 row");
+        assert_eq!(shrunk_one.offset, 0);
+        assert_eq!(shrunk_one.rows.len(), 1);
+        assert_eq!(shrunk_one.total_rows_estimate, Some(1));
+        assert!(shrunk_one.total_is_exact);
+
+        rw_session
+            .execute_sql(&["DELETE FROM heap_items".to_owned()], None)
+            .await
+            .expect("shrink heap_items to 0 rows");
+        let (shrunk_zero, _) = rw_session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "heap_items".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 3,
+                offset: 10,
+            })
+            .await
+            .expect("recover empty table");
+        assert_eq!(shrunk_zero.offset, 0);
+        assert!(shrunk_zero.rows.is_empty());
+        assert_eq!(shrunk_zero.total_rows_estimate, Some(0));
+        assert!(shrunk_zero.total_is_exact);
     });
 }

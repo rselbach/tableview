@@ -18,11 +18,12 @@ use tv_app::views;
 use tv_app::worker::{CredentialBackend, SessionConnector, WorkerBridge, WorkerCmd};
 use tv_core::{
     AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, ConnectionStore, DatabaseInfo,
-    DbEngine, DbError, DbObject, DbObjectKind, DbSession, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow,
-    ForeignKeyRef, IndexInfo, MysqlQuoteMode, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult,
-    QueryStatementResult, RawCellValue, SafetyPolicy, SchemaInfo, ServerInfo, SettingsStore, SqlSessionMode,
-    SqliteRawValue, StagedCommitBatch, StoreData, TablePage, TableStats, TableStructure, TableTransactionSupport,
-    TransactionOutcome, connect_session,
+    DbEngine, DbError, DbObject, DbObjectKind, DbSession, EnvTag, ExecutedSql, ExplainPlan, ExportFormat,
+    FkLookupComponent, FkPeekRow, ForeignKeyRef, IndexInfo, MysqlQuoteMode, PageRequest, PasswordMode,
+    PostgresSessionMode, QueryBatchResult, QueryStatementResult, RawCellValue, SafetyPolicy, SchemaInfo, ServerInfo,
+    SettingsStore, SqlSessionMode, SqliteRawValue, StagedCellValue, StagedCommitBatch, StoreData, TablePage,
+    TableStats, TableStructure, TableTransactionSupport, TransactionOutcome, build_fk_where_clause_for_engine,
+    connect_session, format_fk_lookup_display,
 };
 use tv_update::{UpdateFailure, UpdateStatus};
 
@@ -2596,6 +2597,7 @@ fn launcher_new_connection_respects_and_reconciles_filters() {
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type MockFkPeekOverride = (Vec<ColumnMeta>, Option<Vec<CellValue>>);
 
 struct MockSession {
     engine: DbEngine,
@@ -2619,9 +2621,15 @@ struct MockSession {
     objects_delay_once: Mutex<Option<Duration>>,
     columns_delay_once: Mutex<Option<Duration>>,
     columns_override: Mutex<Option<Vec<ColumnSummary>>>,
+    table_columns_override: Mutex<Option<Vec<ColumnMeta>>>,
+    foreign_keys_override: Mutex<Option<Vec<ForeignKeyRef>>>,
     table_tx_support: Mutex<TableTransactionSupport>,
     rows_override: Mutex<Option<Vec<Vec<CellValue>>>>,
     raw_rows_override: Mutex<Option<Vec<Vec<RawCellValue>>>>,
+    page_override: Mutex<Option<TablePage>>,
+    last_fk_lookup: Mutex<Option<(ForeignKeyRef, Vec<FkLookupComponent>)>>,
+    fk_peek_override: Mutex<Option<MockFkPeekOverride>>,
+    last_page_requests: Mutex<Vec<PageRequest>>,
     fail_next_staged_commit: Mutex<Option<DbError>>,
     last_staged_batch: Mutex<Option<StagedCommitBatch>>,
     cancelled_keys: Mutex<Vec<u64>>,
@@ -2670,9 +2678,15 @@ impl MockSession {
             objects_delay_once: Mutex::new(None),
             columns_delay_once: Mutex::new(None),
             columns_override: Mutex::new(None),
+            table_columns_override: Mutex::new(None),
+            foreign_keys_override: Mutex::new(None),
             table_tx_support: Mutex::new(TableTransactionSupport::Supported),
             rows_override: Mutex::new(None),
             raw_rows_override: Mutex::new(None),
+            page_override: Mutex::new(None),
+            last_fk_lookup: Mutex::new(None),
+            fk_peek_override: Mutex::new(None),
+            last_page_requests: Mutex::new(Vec::new()),
             fail_next_staged_commit: Mutex::new(None),
             last_staged_batch: Mutex::new(None),
             cancelled_keys: Mutex::new(Vec::new()),
@@ -3200,6 +3214,10 @@ impl DbSession for MockSession {
     {
         Box::pin(async move {
             self.page_calls.fetch_add(1, Ordering::AcqRel);
+            self.last_page_requests
+                .lock()
+                .expect("last_page_requests lock")
+                .push(req.clone());
             self.check_transport()?;
             if self.disconnect_next_page.swap(false, Ordering::AcqRel) {
                 return Err(DbError::Disconnected);
@@ -3220,7 +3238,23 @@ impl DbSession for MockSession {
             if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            let columns = mock_columns_for(&req.table);
+            if let Some(page) = self.page_override.lock().expect("page_override lock").take() {
+                let sql = format!("SELECT * FROM \"{}\".\"{}\"", req.schema, req.table);
+                return Ok((
+                    page,
+                    vec![ExecutedSql {
+                        sql,
+                        duration_ms: 1,
+                        error: None,
+                    }],
+                ));
+            }
+            let columns = self
+                .table_columns_override
+                .lock()
+                .expect("table_columns_override lock")
+                .clone()
+                .unwrap_or_else(|| mock_columns_for(&req.table));
             let rows = if let Some(custom) =
                 self.rows_override.lock().expect("rows_override lock").clone()
             {
@@ -3239,6 +3273,12 @@ impl DbSession for MockSession {
                 .expect("raw_rows_override lock")
                 .clone()
                 .unwrap_or_default();
+            let foreign_keys = self
+                .foreign_keys_override
+                .lock()
+                .expect("foreign_keys_override lock")
+                .clone()
+                .unwrap_or_default();
             let transaction_support = self
                 .table_tx_support
                 .lock()
@@ -3249,6 +3289,7 @@ impl DbSession for MockSession {
             Ok((
                 TablePage {
                     columns,
+                    foreign_keys,
                     rows,
                     raw_rows,
                     transaction_support,
@@ -3282,11 +3323,23 @@ impl DbSession for MockSession {
         Box::pin(async move {
             self.describe_calls.fetch_add(1, Ordering::AcqRel);
             self.check_transport()?;
-            let columns = mock_columns_for(table);
+            let columns = self
+                .table_columns_override
+                .lock()
+                .expect("table_columns_override lock")
+                .clone()
+                .unwrap_or_else(|| mock_columns_for(table));
+            let foreign_keys = self
+                .foreign_keys_override
+                .lock()
+                .expect("foreign_keys_override lock")
+                .clone()
+                .unwrap_or_default();
             let pk_col = columns[0].name.clone();
             Ok((
                 TableStructure {
                     columns,
+                    foreign_keys,
                     indexes: vec![IndexInfo {
                         name: format!("{table}_pkey"),
                         columns: vec![pk_col.clone()],
@@ -3948,21 +4001,37 @@ impl DbSession for MockSession {
         })
     }
 
-    fn fetch_fk_row<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+    fn fetch_fk_row<'life0, 'life1, 'life2, 'async_trait>(
         &'life0 self,
         fk: &'life1 ForeignKeyRef,
-        _value: &'life2 CellValue,
-        _source_col: &'life3 ColumnMeta,
+        components: &'life2 [FkLookupComponent],
     ) -> BoxFuture<'async_trait, Result<(FkPeekRow, ExecutedSql), DbError>>
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
         'life2: 'async_trait,
-        'life3: 'async_trait,
         Self: 'async_trait,
     {
         Box::pin(async move {
             self.check_transport()?;
+            *self.last_fk_lookup.lock().expect("last_fk_lookup lock") = Some((fk.clone(), components.to_vec()));
+            if let Some((columns, row)) = self.fk_peek_override.lock().expect("fk_peek_override lock").clone() {
+                let lookup_display = format_fk_lookup_display(components);
+                return Ok((
+                    FkPeekRow {
+                        fk: fk.clone(),
+                        lookup_display,
+                        columns,
+                        row,
+                        elapsed_ms: 1,
+                    },
+                    ExecutedSql {
+                        sql: format!("SELECT * FROM \"{}\".\"{}\"", fk.target_schema, fk.target_table),
+                        duration_ms: 1,
+                        error: None,
+                    },
+                ));
+            }
             Err(DbError::InvalidInput(format!("unused mock fk {}", fk.constraint_name)))
         })
     }
@@ -9132,14 +9201,13 @@ fn staged_edits_preserved_across_reload_close_db_switch_fk_jump_and_races() {
         s.close_staged_diff_drawer();
         s.open_new_query_tab(tx);
         s.jump_to_foreign_key(
-            tv_core::ForeignKeyRef {
-                constraint_name: "fk_student".to_owned(),
-                target_schema: schema.clone(),
-                target_table: obj.clone(),
+            ForeignKeyRef::single("fk_student", "student_id", schema.clone(), obj.clone(), "student_id"),
+            vec![FkLookupComponent {
                 target_column: "student_id".to_owned(),
-            },
-            CellValue::Int(1),
-            source_col,
+                source_col,
+                value: CellValue::Int(1),
+                raw_value: None,
+            }],
             tx,
         );
     });
@@ -10373,4 +10441,654 @@ fn mysql_table_filter_uses_grid_quote_mode_independent_of_editor_mode() {
         .and_then(SessionState::active_table_tab)
         .expect("students tab");
     assert!(tab.filter_error.is_none());
+}
+
+#[test]
+fn composite_fk_navigation_uses_full_key_and_disables_partial_null_or_unresolved() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let sess_mock = cluster.latest_session();
+
+    let comp_fk = ForeignKeyRef {
+        constraint_name: "students_section_fk".to_owned(),
+        target_schema: "study_room".to_owned(),
+        target_table: "courses".to_owned(),
+        source_columns: vec!["course_code".to_owned(), "term".to_owned()],
+        target_columns: vec!["code".to_owned(), "semester".to_owned()],
+    };
+    let unresolved_fk = ForeignKeyRef {
+        constraint_name: "students_unresolved_fk".to_owned(),
+        target_schema: "study_room".to_owned(),
+        target_table: "broken_parent".to_owned(),
+        source_columns: vec!["broken_ref".to_owned()],
+        target_columns: Vec::new(),
+    };
+
+    let cols = vec![
+        ColumnMeta {
+            name: "course_code".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(comp_fk.clone()),
+        },
+        ColumnMeta {
+            name: "term".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(comp_fk.clone()),
+        },
+        ColumnMeta {
+            name: "broken_ref".to_owned(),
+            data_type: "integer".to_owned(),
+            udt_name: "int4".to_owned(),
+            nullable: true,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(unresolved_fk.clone()),
+        },
+    ];
+    *sess_mock
+        .table_columns_override
+        .lock()
+        .expect("table_columns_override") = Some(cols);
+    *sess_mock.rows_override.lock().expect("rows_override") = Some(vec![
+        vec![
+            CellValue::Text("SPAN-101".to_owned()),
+            CellValue::Text("Fall".to_owned()),
+            CellValue::Int(7),
+        ],
+        vec![
+            CellValue::Text("FILM-201".to_owned()),
+            CellValue::Null,
+            CellValue::Int(8),
+        ],
+    ]);
+    *sess_mock.fk_peek_override.lock().expect("fk_peek_override") = Some((
+        vec![
+            ColumnMeta {
+                name: "code".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "semester".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "room".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ],
+        Some(vec![
+            CellValue::Text("SPAN-101".to_owned()),
+            CellValue::Text("Fall".to_owned()),
+            CellValue::Text("Study Room F".to_owned()),
+        ]),
+    ));
+
+    rt.update(|s, _| s.reload_active_tab());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.as_ref().is_some_and(|p| p.columns.len() == 3))
+    });
+    rt.frame(0.1);
+
+    // Row 0 has full composite key -> resolve_fk_for_row returns both components and UI renders FK buttons.
+    // Row 1 has NULL `term` -> resolve_fk_for_row returns None. Unresolved FK returns None on all rows.
+    let comps_row0 = {
+        let tab = rt
+            .state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .expect("students tab");
+        assert_eq!(tab.resolve_fk_for_row(&comp_fk, RowKey::Existing(1)), None);
+        assert_eq!(tab.resolve_fk_for_row(&unresolved_fk, RowKey::Existing(0)), None);
+        tab.resolve_fk_for_row(&comp_fk, RowKey::Existing(0))
+            .expect("row 0 composite FK resolved")
+    };
+    if !rt
+        .state
+        .active_session()
+        .expect("session")
+        .inspector_pane
+        .is_open()
+    {
+        rt.key(KeyEvent {
+            key: Key::Command('3'),
+            mods: Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+    }
+    rt.update(|s, _| s.select_active_tab_row("r-0"));
+    rt.frame(0.1);
+
+    assert!(rt.find("fk-peek-r-0-0").is_some());
+    assert!(rt.find("fk-peek-r-0-2").is_none(), "unresolved FK button must be hidden");
+    assert!(rt.find("fk-peek-r-1-0").is_none(), "partial NULL FK button must be hidden");
+    assert!(rt.find("inspector/fk/0").is_some());
+    assert!(rt.find("inspector/fk/2").is_none());
+
+    // Selecting row 1 (partial NULL in composite FK) hides inspector FK jump button too.
+    rt.update(|s, _| s.select_active_tab_row("r-1"));
+    rt.frame(0.05);
+    assert!(rt.find("inspector/fk/0").is_none());
+    rt.update(|s, _| s.select_active_tab_row("r-0"));
+    rt.frame(0.05);
+
+    // Open FK peek on composite FK -> worker sends full components and renders Study Room F.
+    rt.update(|s, _| {
+        s.open_fk_peek("fk-peek-r-0-0".to_owned(), comp_fk.clone(), comps_row0.clone());
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .and_then(|t| t.fk_peek.as_ref())
+            .is_some_and(|p| !p.loading && p.result.is_some())
+    });
+    rt.frame(0.1);
+    assert!(has_text(&rt, "Study Room F"));
+    let (_, sent_comps) = sess_mock
+        .last_fk_lookup
+        .lock()
+        .expect("last_fk_lookup")
+        .clone()
+        .expect("fetch_fk_row called");
+    assert_eq!(sent_comps.len(), 2);
+    assert_eq!(sent_comps[0].target_column, "code");
+    assert_eq!(sent_comps[1].target_column, "semester");
+
+    // Click "Open in Tab →" -> jumps to target tab with full composite AND filter.
+    let (jx, jy) = rt.find("fk-peek-open-tab-btn").expect("Open in Tab button");
+    rt.pointer_down(jx, jy);
+    rt.pointer_up(jx, jy);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| t.object_name == "courses" && !t.page_loading)
+    });
+    let jumped_tab = rt
+        .state
+        .active_session()
+        .and_then(SessionState::active_table_tab)
+        .expect("courses tab");
+    assert_eq!(
+        jumped_tab.applied_filter.as_deref(),
+        Some("\"code\" = 'SPAN-101' AND \"semester\" = 'Fall'")
+    );
+}
+
+#[test]
+fn recovered_out_of_range_page_updates_tab_offset_readout_and_reload_request() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let sess_mock = cluster.latest_session();
+    let cols = rt
+        .state
+        .active_session()
+        .and_then(SessionState::active_table_tab)
+        .and_then(|t| t.columns())
+        .expect("columns")
+        .to_vec();
+
+    // Request reload from stale nonzero offset 10 -> backend recovers to last valid offset 4.
+    *sess_mock.page_override.lock().expect("page_override") = Some(TablePage {
+        columns: cols.clone(),
+        foreign_keys: Vec::new(),
+        rows: vec![vec![CellValue::Int(5), CellValue::Text("Jeff Winger".to_owned())]],
+        raw_rows: Vec::new(),
+        transaction_support: TableTransactionSupport::Supported,
+        offset: 4,
+        limit: 2,
+        total_rows_estimate: Some(5),
+        total_is_exact: true,
+        has_more: false,
+        elapsed_ms: 2,
+    });
+    rt.update(|s, _| {
+        let tab = s
+            .active_session_mut()
+            .and_then(SessionState::active_table_tab_mut)
+            .expect("table tab");
+        tab.page_size = 2;
+        tab.offset = 10;
+        s.reload_active_tab();
+    });
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.offset == 4)
+    });
+    rt.frame(0.05);
+
+    {
+        let tab = rt
+            .state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .expect("table tab");
+        assert_eq!(tab.offset, 4);
+        assert_eq!(tab.page_request().offset, 4);
+    }
+    assert!(has_text(&rt, "5–5 of 5 rows · 2 ms"));
+
+    // Subsequent reload uses recovered offset 4, then recovers an emptied table down to offset 0.
+    *sess_mock.page_override.lock().expect("page_override") = Some(TablePage {
+        columns: cols,
+        foreign_keys: Vec::new(),
+        rows: Vec::new(),
+        raw_rows: Vec::new(),
+        transaction_support: TableTransactionSupport::Supported,
+        offset: 0,
+        limit: 2,
+        total_rows_estimate: Some(0),
+        total_is_exact: true,
+        has_more: false,
+        elapsed_ms: 1,
+    });
+    rt.update(|s, _| s.reload_active_tab());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.offset == 0)
+    });
+    rt.frame(0.05);
+
+    {
+        let reqs = sess_mock.last_page_requests.lock().expect("last_page_requests");
+        assert_eq!(reqs.last().expect("last reload request").offset, 4);
+    }
+    let tab = rt
+        .state
+        .active_session()
+        .and_then(SessionState::active_table_tab)
+        .expect("table tab");
+    assert_eq!(tab.offset, 0);
+    assert_eq!(tab.page_request().offset, 0);
+    assert!(has_text(&rt, "0 rows · 1 ms"));
+}
+
+#[test]
+fn overlapping_fks_and_lossless_raw_fk_resolution_in_grid_peek_inspector_and_structure() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let sess_mock = cluster.latest_session();
+
+    let fk_term = ForeignKeyRef::single("fk_term", "term", "study_room", "terms", "term");
+    let fk_code = ForeignKeyRef::single("fk_code", "course_code", "study_room", "courses", "code");
+    let fk_section = ForeignKeyRef {
+        constraint_name: "fk_section".to_owned(),
+        target_schema: "study_room".to_owned(),
+        target_table: "course_sections".to_owned(),
+        source_columns: vec!["term".to_owned(), "course_code".to_owned()],
+        target_columns: vec!["term".to_owned(), "code".to_owned()],
+    };
+    let fk_flag = ForeignKeyRef::single("fk_flag", "flag", "study_room", "bool_parents", "flag");
+
+    let cols = vec![
+        ColumnMeta {
+            name: "term".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_term.clone()),
+        },
+        ColumnMeta {
+            name: "course_code".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_code.clone()),
+        },
+        ColumnMeta {
+            name: "flag".to_owned(),
+            data_type: "BOOLEAN".to_owned(),
+            udt_name: "boolean".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_flag.clone()),
+        },
+    ];
+    *sess_mock.table_columns_override.lock().expect("table_columns_override") = Some(cols);
+    *sess_mock.foreign_keys_override.lock().expect("foreign_keys_override") = Some(vec![
+        fk_term.clone(),
+        fk_code.clone(),
+        fk_section.clone(),
+        fk_flag.clone(),
+    ]);
+    *sess_mock.rows_override.lock().expect("rows_override") = Some(vec![vec![
+        CellValue::Text("Fall".to_owned()),
+        CellValue::Text("SPAN-101".to_owned()),
+        CellValue::Bool(true),
+    ]]);
+    *sess_mock.raw_rows_override.lock().expect("raw_rows_override") = Some(vec![vec![
+        RawCellValue::Sqlite(SqliteRawValue::Text("Fall".to_owned())),
+        RawCellValue::Sqlite(SqliteRawValue::Text("SPAN-101".to_owned())),
+        RawCellValue::Sqlite(SqliteRawValue::Text("true".to_owned())),
+    ]]);
+    *sess_mock.fk_peek_override.lock().expect("fk_peek_override") = Some((
+        vec![
+            ColumnMeta {
+                name: "term".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "code".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "room".to_owned(),
+                data_type: "text".to_owned(),
+                udt_name: "text".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ],
+        Some(vec![
+            CellValue::Text("Fall".to_owned()),
+            CellValue::Text("SPAN-101".to_owned()),
+            CellValue::Text("Study Room F".to_owned()),
+        ]),
+    ));
+
+    rt.update(|s, _| s.reload_active_tab());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| {
+                !t.page_loading
+                    && !t.structure_loading
+                    && t.page.as_ref().is_some_and(|p| p.foreign_keys.len() == 4)
+                    && t.structure.as_ref().is_some_and(|st| st.foreign_keys.len() == 4)
+            })
+    });
+    if !rt
+        .state
+        .active_session()
+        .expect("session")
+        .inspector_pane
+        .is_open()
+    {
+        rt.key(KeyEvent {
+            key: Key::Command('3'),
+            mods: Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+    }
+    rt.update(|s, _| s.select_active_tab_row("r-0"));
+    rt.frame(0.1);
+
+    // S1: Inspector shows BOTH overlapping FK jump buttons for `term` (idx 0 -> single + composite).
+    assert!(rt.find("inspector/fk/0").is_some());
+    assert!(rt.find("inspector/fk/0/1").is_some());
+
+    // S1: Clicking the grid `↗` button opens the peek popover with choices for `terms` and `course_sections`.
+    let (px, py) = rt.find("fk-peek-r-0-0").expect("grid fk peek button");
+    rt.pointer_down(px, py);
+    rt.pointer_up(px, py);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .and_then(|t| t.fk_peek.as_ref())
+            .is_some_and(|p| !p.loading)
+    });
+    rt.frame(0.1);
+    assert!(rt.find("fk-peek-choice/0").is_some());
+    let (cx, cy) = rt.find("fk-peek-choice/1").expect("composite FK choice button");
+    rt.pointer_down(cx, cy);
+    rt.pointer_up(cx, cy);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .and_then(|t| t.fk_peek.as_ref())
+            .is_some_and(|p| !p.loading && p.fk == fk_section)
+    });
+    let (sent_fk, sent_comps) = sess_mock
+        .last_fk_lookup
+        .lock()
+        .expect("last_fk_lookup")
+        .clone()
+        .expect("fetch_fk_row called for choice");
+    assert_eq!(sent_fk, fk_section);
+    assert_eq!(sent_comps.len(), 2);
+
+    // Close peek and switch to Structure view -> overlapping composite FK is shown alongside single FK.
+    rt.update(|s, _| {
+        s.close_fk_peek();
+        if let Some(tab) = s.active_session_mut().and_then(SessionState::active_table_tab_mut) {
+            tab.view_mode = TableViewMode::Structure;
+        }
+    });
+    rt.frame(0.1);
+    assert!(
+        rt.elements().iter().any(|e| {
+            e.text.as_deref().is_some_and(|text| {
+                text.contains("FK → study_room.terms.term")
+                    && text.contains("FK → study_room.course_sections (term, code)")
+            })
+        }),
+        "Structure view should render both overlapping FKs for `term`"
+    );
+
+    // S4: Existing unedited SQLite raw text `'true'` inside BOOLEAN preserves `'true'`,
+    // while staging an edit drops `raw_value` and formats from the staged cell value.
+    rt.update(|s, _| {
+        let sess = s.active_session_mut().expect("session");
+        sess.profile.engine = DbEngine::Sqlite;
+        let tab = sess.active_table_tab_mut().expect("table tab");
+        tab.engine = DbEngine::Sqlite;
+        tab.view_mode = TableViewMode::Data;
+        let raw_comps = tab
+            .resolve_fk_for_row(&fk_flag, RowKey::Existing(0))
+            .expect("resolve raw flag FK");
+        assert_eq!(
+            build_fk_where_clause_for_engine(DbEngine::Sqlite, &fk_flag, &raw_comps),
+            Some("\"flag\" = 'true'".to_owned())
+        );
+
+        let existing_row = tab.page.as_ref().expect("page").rows[0].clone();
+        tab.staged
+            .stage_cell_edit(0, &existing_row, 2, StagedCellValue::Literal("false".to_owned()));
+        let edited_comps = tab
+            .resolve_fk_for_row(&fk_flag, RowKey::Existing(0))
+            .expect("resolve edited flag FK");
+        assert!(edited_comps[0].raw_value.is_none());
+        assert_eq!(
+            build_fk_where_clause_for_engine(DbEngine::Sqlite, &fk_flag, &edited_comps),
+            Some("\"flag\" = 0".to_owned())
+        );
+    });
+}
+
+#[test]
+fn overlapping_fks_on_same_target_disambiguate_source_columns() {
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut rt = worker_runtime(&cluster);
+    rt.frame(0.0);
+
+    connect_select_db_schema_and_students(&mut rt);
+    let sess_mock = cluster.latest_session();
+
+    let fk_home = ForeignKeyRef {
+        constraint_name: "fk_home_room".to_owned(),
+        target_schema: "study_room".to_owned(),
+        target_table: "rooms".to_owned(),
+        source_columns: vec!["school".to_owned(), "home_room".to_owned()],
+        target_columns: vec!["school".to_owned(), "room".to_owned()],
+    };
+    let fk_work = ForeignKeyRef {
+        constraint_name: "fk_work_room".to_owned(),
+        target_schema: "study_room".to_owned(),
+        target_table: "rooms".to_owned(),
+        source_columns: vec!["school".to_owned(), "work_room".to_owned()],
+        target_columns: vec!["school".to_owned(), "room".to_owned()],
+    };
+
+    let cols = vec![
+        ColumnMeta {
+            name: "school".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: true,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_home.clone()),
+        },
+        ColumnMeta {
+            name: "home_room".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_home.clone()),
+        },
+        ColumnMeta {
+            name: "work_room".to_owned(),
+            data_type: "text".to_owned(),
+            udt_name: "text".to_owned(),
+            nullable: false,
+            default_expr: None,
+            is_primary_key: false,
+            is_unique: false,
+            comment: None,
+            foreign_key: Some(fk_work.clone()),
+        },
+    ];
+    *sess_mock.table_columns_override.lock().expect("table_columns_override") = Some(cols);
+    *sess_mock.foreign_keys_override.lock().expect("foreign_keys_override") =
+        Some(vec![fk_home, fk_work]);
+    *sess_mock.rows_override.lock().expect("rows_override") = Some(vec![vec![
+        CellValue::Text("Greendale".to_owned()),
+        CellValue::Text("Room F".to_owned()),
+        CellValue::Text("AC Annex".to_owned()),
+    ]]);
+
+    rt.update(|s, _| s.reload_active_tab());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.as_ref().is_some_and(|p| p.foreign_keys.len() == 2))
+    });
+    if !rt
+        .state
+        .active_session()
+        .expect("session")
+        .inspector_pane
+        .is_open()
+    {
+        rt.key(KeyEvent {
+            key: Key::Command('3'),
+            mods: Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        });
+    }
+    rt.update(|s, _| s.select_active_tab_row("r-0"));
+    rt.frame(0.1);
+
+    assert!(has_text(&rt, "→ rooms (school, home_room → school, room)"));
+    assert!(has_text(&rt, "→ rooms (school, work_room → school, room)"));
+
+    let (px, py) = rt.find("fk-peek-r-0-0").expect("grid fk peek button");
+    rt.pointer_down(px, py);
+    rt.pointer_up(px, py);
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .and_then(|t| t.fk_peek.as_ref())
+            .is_some_and(|p| !p.loading)
+    });
+    rt.frame(0.1);
+    assert!(has_text(&rt, "rooms (school, home_room → school, room)"));
+    assert!(has_text(&rt, "rooms (school, work_room → school, room)"));
 }

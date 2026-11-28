@@ -2,7 +2,7 @@ use chrono::Local;
 use rune::{El, ScrollSpec, TextEdit, Tx, col, rich, row, spacer, text};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{Button, ButtonVariant, ControlSize, Divider, IconButton, IconButtonVariant, Kit, TextInput};
-use tv_core::{CellValue, ColumnMeta};
+use tv_core::{CellValue, ColumnMeta, ForeignKeyRef, RawCellValue, resolve_fk_lookup_components_with_raw};
 
 use crate::icons;
 use crate::state::{AppState, QueryTabState, RowKey, SessionState, TableTabState, TableViewMode};
@@ -18,7 +18,9 @@ struct SelectedRowView {
     is_deleted: bool,
     edited_cols: Vec<bool>,
     columns: Vec<ColumnMeta>,
+    foreign_keys: Vec<ForeignKeyRef>,
     cells: Vec<CellValue>,
+    raw_cells: Vec<Option<RawCellValue>>,
     search: TextEdit,
     json_pretty: bool,
     clear_help: &'static str,
@@ -34,6 +36,7 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
         if tab.view_mode == TableViewMode::Data {
             tab.active_row_key().and_then(|rk| {
                 let cols = tab.columns()?.to_vec();
+                let foreign_keys = tab.all_foreign_keys();
                 match rk {
                     RowKey::Draft(id) => {
                         tab.staged.insert_row(id)?;
@@ -42,6 +45,7 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                             .map(|c| tab.effective_cell(rk, c))
                             .collect();
                         let editable = tab.can_edit_table(session.profile.safety).is_ok();
+                        let col_len = cols.len();
                         Some(SelectedRowView {
                             row_number: visual_idx + 1,
                             row_badge: format!("New Row #{}", id.get()),
@@ -49,9 +53,11 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                             editable,
                             is_draft: true,
                             is_deleted: false,
-                            edited_cols: vec![true; cols.len()],
+                            edited_cols: vec![true; col_len],
                             columns: cols,
+                            foreign_keys,
                             cells,
+                            raw_cells: vec![None; col_len],
                             search: tab.inspector_search.clone(),
                             json_pretty: tab.inspector_json_pretty,
                             clear_help: "Back to table details",
@@ -62,6 +68,9 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                         page.rows.get(idx)?;
                         let cells: Vec<CellValue> = (0..cols.len())
                             .map(|c| tab.effective_cell(rk, c))
+                            .collect();
+                        let raw_cells: Vec<Option<RawCellValue>> = (0..cols.len())
+                            .map(|c| tab.effective_raw_cell(rk, c))
                             .collect();
                         let edited_cols: Vec<bool> = (0..cols.len())
                             .map(|c| tab.staged.effective_existing_cell(idx, c).is_some())
@@ -78,7 +87,9 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                             is_deleted: tab.staged.is_row_deleted(idx),
                             edited_cols,
                             columns: cols,
+                            foreign_keys,
                             cells,
+                            raw_cells,
                             search: tab.inspector_search.clone(),
                             json_pretty: tab.inspector_json_pretty,
                             clear_help: "Back to table details",
@@ -93,6 +104,7 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
         q.active_result_state().and_then(|res| {
             let idx = res.selected_row?;
             let cells = res.statement.rows.get(idx)?;
+            let col_len = res.statement.columns.len();
             Some(SelectedRowView {
                 row_number: idx + 1,
                 row_badge: format!("Row #{}", idx + 1),
@@ -100,9 +112,11 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                 editable: false,
                 is_draft: false,
                 is_deleted: false,
-                edited_cols: vec![false; res.statement.columns.len()],
+                edited_cols: vec![false; col_len],
                 columns: res.statement.columns.clone(),
+                foreign_keys: Vec::new(),
                 cells: cells.clone(),
+                raw_cells: vec![None; col_len],
                 search: q.inspector_search.clone(),
                 json_pretty: q.inspector_json_pretty,
                 clear_help: "Back to query summary",
@@ -291,21 +305,38 @@ fn build_typed_field(
             k,
         ));
     }
-    if let Some(ref fk) = col_meta.foreign_key
-        && !val.is_null()
-    {
-        let fk_jump = fk.clone();
-        let val_jump = val.clone();
-        let col_jump = col_meta.clone();
+    let resolved_fks: Vec<(&ForeignKeyRef, Vec<tv_core::FkLookupComponent>)> =
+        tv_core::engine::foreign_keys_for_column(&sel.foreign_keys, &sel.columns, &col_meta.name)
+            .into_iter()
+            .filter_map(|fk| {
+                resolve_fk_lookup_components_with_raw(
+                    fk,
+                    &sel.columns,
+                    &sel.cells,
+                    Some(&sel.raw_cells),
+                )
+                .map(|comps| (fk, comps))
+            })
+            .collect();
+    let fk_refs: Vec<&ForeignKeyRef> = resolved_fks.iter().map(|(fk, _)| *fk).collect();
+    for (fk_idx, (fk, comps_jump)) in resolved_fks.iter().enumerate() {
+        let fk_jump = (*fk).clone();
+        let comps_jump = comps_jump.clone();
+        let btn_label = crate::views::table_grid::format_fk_choice_label(fk, &fk_refs, true);
+        let btn_key = if fk_idx == 0 {
+            format!("inspector/fk/{idx}")
+        } else {
+            format!("inspector/fk/{idx}/{fk_idx}")
+        };
         label_row = label_row.child(
-            Button::new(format!("→ {}", fk.target_table))
+            Button::new(btn_label)
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Mini)
                 .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
-                    s.jump_to_foreign_key(fk_jump.clone(), val_jump.clone(), col_jump.clone(), tx);
+                    s.jump_to_foreign_key(fk_jump.clone(), comps_jump.clone(), tx);
                 })
                 .build(k)
-                .key(format!("inspector/fk/{idx}")),
+                .key(btn_key),
         );
     }
     label_row = label_row

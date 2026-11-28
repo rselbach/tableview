@@ -10,8 +10,9 @@ use rune_kit::{
 };
 use tv_core::engine::encode_hex;
 use tv_core::{
-    CellValue, ColumnMeta, DbEngine, DbObjectKind, ExportFormat, SafetyPolicy, StagedCellValue, TablePage,
-    TableStructure, TableTransactionSupport, build_fk_where_clause_for_engine, export_rows_for_engine,
+    CellValue, ColumnMeta, DbEngine, DbObjectKind, ExportFormat, FkLookupComponent, ForeignKeyRef, SafetyPolicy,
+    StagedCellValue, TablePage, TableStructure, TableTransactionSupport, build_fk_where_clause_for_engine,
+    export_rows_for_engine, format_fk_lookup_display,
 };
 
 use crate::icons;
@@ -507,7 +508,11 @@ fn build_data_grid(
     );
 
     for col_meta in &page.columns {
-        let extra = if col_meta.foreign_key.is_some() { 20.0 } else { 0.0 };
+        let extra = if col_meta.foreign_key.as_ref().is_some_and(ForeignKeyRef::is_resolvable) {
+            20.0
+        } else {
+            0.0
+        };
         let mut column = TableColumn::new(&col_meta.name, &col_meta.name)
             .width(initial_col_width(col_meta) + extra)
             .min(68.0)
@@ -663,17 +668,24 @@ fn build_data_grid(
                     .border(0.5, warn_border);
             }
 
-            let fk_for_press = col_meta.foreign_key.clone();
-            let val_for_press = val.clone();
-            let col_for_press = col_meta.clone();
+            let col_fks: Vec<(ForeignKeyRef, Vec<FkLookupComponent>)> = page
+                .foreign_keys_for_column(&col_meta.name)
+                .into_iter()
+                .filter_map(|fk| tab.resolve_fk_for_row(fk, row_key).map(|comps| (fk.clone(), comps)))
+                .collect();
+            let anchor_key = format!("fk-peek-{row_id_str}-{col_idx}");
+            let fk_for_press = col_fks.clone();
+            let anchor_for_cell = anchor_key.clone();
 
             inner = inner
                 .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
-                    if platform::is_primary_mod(tx.mods())
-                        && !val_for_press.is_null()
-                        && let Some(ref fk) = fk_for_press
-                    {
-                        s.jump_to_foreign_key(fk.clone(), val_for_press.clone(), col_for_press.clone(), tx);
+                    if platform::is_primary_mod(tx.mods()) && !fk_for_press.is_empty() {
+                        if fk_for_press.len() == 1 {
+                            let (ref fk, ref comps) = fk_for_press[0];
+                            s.jump_to_foreign_key(fk.clone(), comps.clone(), tx);
+                        } else {
+                            s.open_fk_peek_choices(anchor_for_cell.clone(), fk_for_press.clone());
+                        }
                     } else {
                         s.select_table_cell(row_key, col_idx);
                     }
@@ -682,18 +694,17 @@ fn build_data_grid(
                     s.begin_cell_edit(row_key, col_idx, tx);
                 });
 
-            if let Some(ref fk) = col_meta.foreign_key
-                && !val.is_null()
-            {
-                let anchor_key = format!("fk-peek-{row_id_str}-{col_idx}");
+            if !col_fks.is_empty() {
                 let anchor_for_click = anchor_key.clone();
-                let fk_click = fk.clone();
-                let val_click = val;
-                let col_click = col_meta.clone();
+                let btn_label = if col_fks.len() == 1 {
+                    format!("Inspect {} foreign key", col_fks[0].0.target_table)
+                } else {
+                    format!("Inspect {} foreign keys", col_fks.len())
+                };
                 let fk_btn = row()
                     .key(anchor_key)
                     .role("button")
-                    .label(format!("Inspect {} foreign key", fk.target_table))
+                    .label(btn_label)
                     .focusable(false)
                     .size(18.0, 18.0)
                     .center()
@@ -702,15 +713,11 @@ fn build_data_grid(
                     .border(0.5, null_border)
                     .hover(hover_bg)
                     .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
-                        if platform::is_primary_mod(tx.mods()) {
-                            s.jump_to_foreign_key(fk_click.clone(), val_click.clone(), col_click.clone(), tx);
+                        if platform::is_primary_mod(tx.mods()) && col_fks.len() == 1 {
+                            let (ref fk, ref comps) = col_fks[0];
+                            s.jump_to_foreign_key(fk.clone(), comps.clone(), tx);
                         } else {
-                            s.open_fk_peek(
-                                anchor_for_click.clone(),
-                                fk_click.clone(),
-                                val_click.clone(),
-                                col_click.clone(),
-                            );
+                            s.open_fk_peek_choices(anchor_for_click.clone(), col_fks.clone());
                         }
                     })
                     .child(icon(&icons::ARROW_UP_RIGHT, 11.0).color(text_accent));
@@ -963,25 +970,25 @@ fn build_row_context_menu(
     let eff_row: Vec<CellValue> = (0..page.columns.len())
         .map(|ci| tab.effective_cell(row_key, ci))
         .collect();
-    let fk_links: Vec<_> = page
-        .columns
-        .iter()
-        .enumerate()
-        .filter_map(|(ci, col_meta)| {
-            let fk = col_meta.foreign_key.as_ref()?;
-            let val = eff_row.get(ci)?;
-            if val.is_null() {
-                return None;
-            }
-            Some((col_meta.clone(), fk.clone(), val.clone()))
-        })
-        .collect();
+    let mut fk_links = Vec::new();
+    for fk in page.all_foreign_keys() {
+        let Some(comps) = tab.resolve_fk_for_row(fk, row_key) else {
+            continue;
+        };
+        fk_links.push((fk.clone(), comps));
+    }
     if !fk_links.is_empty() {
         menu = menu.separator();
-        for (col_meta, fk, val) in fk_links {
-            let label = format!("Open FK → {}.{} ({})", fk.target_table, fk.target_column, val.display_compact());
+        for (fk, comps) in fk_links {
+            let label = if let Some(target_col) = fk.target_column()
+                && let Some(comp) = comps.first()
+            {
+                format!("Open FK → {}.{} ({})", fk.target_table, target_col, comp.value.display_compact())
+            } else {
+                format!("Open FK → {} ({})", fk.target_table, format_fk_lookup_display(&comps))
+            };
             menu = menu.item(MenuItem::new(label).on_select_tx(move |s: &mut AppState, tx: &mut Tx| {
-                s.jump_to_foreign_key(fk.clone(), val.clone(), col_meta.clone(), tx);
+                s.jump_to_foreign_key(fk.clone(), comps.clone(), tx);
             }));
         }
     }
@@ -1028,8 +1035,7 @@ fn build_row_context_menu(
 fn mount_fk_peek_popover(engine: DbEngine, peek: &FkPeekState, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     let fk_jump = peek.fk.clone();
-    let val_jump = peek.value.clone();
-    let col_jump = peek.source_col.clone();
+    let comps_jump = peek.components.clone();
 
     let mut card = col()
         .key("fk-peek-card")
@@ -1054,7 +1060,7 @@ fn mount_fk_peek_popover(engine: DbEngine, peek: &FkPeekState, k: &Kit, layer: &
                 .child(spacer())
                 .child(pill_badge(
                     "fk-peek/cond-badge",
-                    format!("{} = {}", peek.fk.target_column, peek.value.display_compact()),
+                    format_fk_lookup_display(&peek.components),
                     c.layer_02,
                     c.text_muted,
                     c.border_muted,
@@ -1071,6 +1077,33 @@ fn mount_fk_peek_popover(engine: DbEngine, peek: &FkPeekState, k: &Kit, layer: &
                 ),
         )
         .child(Divider::horizontal().build(k));
+
+    if peek.choices.len() > 1 {
+        let choice_refs: Vec<&ForeignKeyRef> = peek.choices.iter().map(|(fk, _)| fk).collect();
+        let mut choices_col = col().key("fk-peek-choices").w_full().gap(4.0);
+        for (chunk_idx, chunk) in peek.choices.chunks(2).enumerate() {
+            let mut choices_row = row().w_full().gap(4.0);
+            for (offset_in_chunk, (choice_fk, choice_comps)) in chunk.iter().enumerate() {
+                let idx = chunk_idx * 2 + offset_in_chunk;
+                let active = *choice_fk == peek.fk && *choice_comps == peek.components;
+                let choice_label = format_fk_choice_label(choice_fk, &choice_refs, false);
+                choices_row = choices_row.child(
+                    Button::new(choice_label)
+                        .variant(if active {
+                            ButtonVariant::Contrast
+                        } else {
+                            ButtonVariant::GhostMuted
+                        })
+                        .control_size(ControlSize::Mini)
+                        .on_press(move |s: &mut AppState| s.select_fk_peek_choice(idx))
+                        .build(k)
+                        .key(format!("fk-peek-choice/{idx}")),
+                );
+            }
+            choices_col = choices_col.child(choices_row);
+        }
+        card = card.child(choices_col);
+    }
 
     if peek.loading {
         card = card.child(
@@ -1121,10 +1154,7 @@ fn mount_fk_peek_popover(engine: DbEngine, peek: &FkPeekState, k: &Kit, layer: &
         }
     }
 
-    if let Some(filter_sql) =
-        build_fk_where_clause_for_engine(engine, &peek.fk.target_column, &peek.value, &peek.source_col)
-    {
-        let _ = filter_sql;
+    if build_fk_where_clause_for_engine(engine, &peek.fk, &peek.components).is_some() {
         card = card.child(
             row()
                 .w_full()
@@ -1136,7 +1166,7 @@ fn mount_fk_peek_popover(engine: DbEngine, peek: &FkPeekState, k: &Kit, layer: &
                         .variant(ButtonVariant::Contrast)
                         .control_size(ControlSize::Small)
                         .on_press_tx(move |s: &mut AppState, tx: &mut Tx| {
-                            s.jump_to_foreign_key(fk_jump.clone(), val_jump.clone(), col_jump.clone(), tx);
+                            s.jump_to_foreign_key(fk_jump.clone(), comps_jump.clone(), tx);
                         })
                         .build(k)
                         .key("fk-peek-open-tab-btn"),
@@ -1367,12 +1397,14 @@ fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit, cx: &Cx<AppS
     .column(TableColumn::new("comment", "Comment").flex(1.0).min(140.0))
     .row(move |_, _, r| struct_hscroll.attach_row(r))
     .cell(move |s: &AppState, row_idx, col_id| {
-        let Some(col_meta) = s
+        let Some(st) = s
             .active_session()
             .and_then(SessionState::active_table_tab)
             .and_then(|t| t.structure.as_ref())
-            .and_then(|st| st.columns.get(row_idx))
         else {
+            return Cell::text("");
+        };
+        let Some(col_meta) = st.columns.get(row_idx) else {
             return Cell::text("");
         };
         match col_id {
@@ -1384,7 +1416,8 @@ fn build_structure_view(s: &AppState, tab: &TableTabState, k: &Kit, cx: &Cx<AppS
                 .color(if col_meta.nullable { faint } else { muted }),
             "default" => Cell::text(col_meta.default_expr.as_deref().unwrap_or("")).mono().muted(),
             "keys" => {
-                let summary = format_constraints(col_meta);
+                let col_fks = st.foreign_keys_for_column(&col_meta.name);
+                let summary = format_constraints(col_meta, &col_fks);
                 if col_meta.is_primary_key {
                     Cell::text(summary).mono().color(warn_fg)
                 } else {
@@ -1830,7 +1863,7 @@ fn format_page_readout(tab: &TableTabState) -> String {
     format!("{start}–{end} of {total_part} · {} ms", page.elapsed_ms)
 }
 
-fn format_constraints(col: &ColumnMeta) -> String {
+fn format_constraints(col: &ColumnMeta, fks: &[&ForeignKeyRef]) -> String {
     let mut parts = Vec::new();
     if col.is_primary_key {
         parts.push("PK".to_owned());
@@ -1838,11 +1871,19 @@ fn format_constraints(col: &ColumnMeta) -> String {
     if col.is_unique {
         parts.push("UNIQUE".to_owned());
     }
-    if let Some(fk) = &col.foreign_key {
-        parts.push(format!(
-            "FK → {}.{}.{}",
-            fk.target_schema, fk.target_table, fk.target_column
-        ));
+    for fk in fks {
+        if let Some(target_col) = fk.target_column() {
+            parts.push(format!("FK → {}.{}.{}", fk.target_schema, fk.target_table, target_col));
+        } else if fk.is_resolvable() {
+            parts.push(format!(
+                "FK → {}.{} ({})",
+                fk.target_schema,
+                fk.target_table,
+                fk.target_columns.join(", ")
+            ));
+        } else {
+            parts.push(format!("FK → {}.{} (unresolved)", fk.target_schema, fk.target_table));
+        }
     }
     parts.join(" · ")
 }
@@ -1899,6 +1940,60 @@ fn cell_pill_el(label: &'static str, bg: Color, fg: Color, border: Color, font: 
         .fill(bg)
         .border(0.5, border)
         .child(text(label).font(font).color(fg))
+}
+
+/// Formats a compact label for a foreign-key action button, disambiguating schema, source columns,
+/// or constraint name when multiple constraints overlap on the same column or target table.
+pub(crate) fn format_fk_choice_label(fk: &ForeignKeyRef, all_fks: &[&ForeignKeyRef], with_arrow: bool) -> String {
+    let prefix = if with_arrow { "→ " } else { "" };
+    if all_fks.len() == 1 {
+        return format!("{prefix}{}", fk.target_table);
+    }
+    let diff_schema = all_fks
+        .iter()
+        .any(|o| o.target_table == fk.target_table && o.target_schema != fk.target_schema);
+    let target = if diff_schema {
+        format!("{}.{}", fk.target_schema, fk.target_table)
+    } else {
+        fk.target_table.clone()
+    };
+    let same_target_cols = all_fks
+        .iter()
+        .filter(|o| {
+            o.target_schema == fk.target_schema
+                && o.target_table == fk.target_table
+                && o.target_columns == fk.target_columns
+        })
+        .count()
+        > 1;
+    if same_target_cols {
+        let same_source_cols = all_fks
+            .iter()
+            .filter(|o| {
+                o.target_schema == fk.target_schema
+                    && o.target_table == fk.target_table
+                    && o.target_columns == fk.target_columns
+                    && o.source_columns == fk.source_columns
+            })
+            .count()
+            > 1;
+        if same_source_cols {
+            format!(
+                "{prefix}{target} ({} → {} · {})",
+                fk.source_columns.join(", "),
+                fk.target_columns.join(", "),
+                fk.constraint_name
+            )
+        } else {
+            format!(
+                "{prefix}{target} ({} → {})",
+                fk.source_columns.join(", "),
+                fk.target_columns.join(", ")
+            )
+        }
+    } else {
+        format!("{prefix}{target} ({})", fk.target_columns.join(", "))
+    }
 }
 
 /// Formats a byte preview helper cleanly for external views (used in inspector as well).

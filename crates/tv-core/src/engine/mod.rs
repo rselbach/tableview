@@ -88,7 +88,178 @@ pub struct ForeignKeyRef {
     pub constraint_name: String,
     pub target_schema: String,
     pub target_table: String,
+    pub source_columns: Vec<String>,
+    pub target_columns: Vec<String>,
+}
+
+impl ForeignKeyRef {
+    /// Constructs a single-column foreign-key reference.
+    pub fn single(
+        constraint_name: impl Into<String>,
+        source_column: impl Into<String>,
+        target_schema: impl Into<String>,
+        target_table: impl Into<String>,
+        target_column: impl Into<String>,
+    ) -> Self {
+        Self {
+            constraint_name: constraint_name.into(),
+            target_schema: target_schema.into(),
+            target_table: target_table.into(),
+            source_columns: vec![source_column.into()],
+            target_columns: vec![target_column.into()],
+        }
+    }
+
+    /// Returns `true` when the target relation and full ordered column mapping are known.
+    pub fn is_resolvable(&self) -> bool {
+        !self.target_table.trim().is_empty()
+            && !self.source_columns.is_empty()
+            && self.source_columns.len() == self.target_columns.len()
+            && self.source_columns.iter().all(|c| !c.trim().is_empty())
+            && self.target_columns.iter().all(|c| !c.trim().is_empty())
+    }
+
+    /// Returns `true` when this constraint references more than one column.
+    pub fn is_composite(&self) -> bool {
+        self.source_columns.len() > 1
+    }
+
+    /// Returns the single target column name when this constraint is single-column and resolvable.
+    pub fn target_column(&self) -> Option<&str> {
+        (self.target_columns.len() == 1 && self.is_resolvable()).then(|| self.target_columns[0].as_str())
+    }
+
+    /// Returns the target column paired with `source_column` when this constraint is resolvable.
+    pub fn target_column_for(&self, source_column: &str) -> Option<&str> {
+        if !self.is_resolvable() {
+            return None;
+        }
+        self.source_columns
+            .iter()
+            .zip(self.target_columns.iter())
+            .find(|(src, _)| src.as_str() == source_column)
+            .map(|(_, dst)| dst.as_str())
+    }
+}
+
+/// Ordered column value binding used to peek or jump to a referenced foreign-key row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FkLookupComponent {
     pub target_column: String,
+    pub source_col: ColumnMeta,
+    pub value: CellValue,
+    pub raw_value: Option<RawCellValue>,
+}
+
+/// Deterministic key or system row identifier used to stabilize paginated table ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StableOrderKey {
+    Column {
+        name: String,
+        nullable: bool,
+        collation: Option<String>,
+    },
+    System(&'static str),
+}
+
+pub(crate) struct DecodedPageBatch {
+    pub rows: Vec<Vec<CellValue>>,
+    pub raw_rows: Vec<Vec<RawCellValue>>,
+    pub has_more: bool,
+    pub log: ExecutedSql,
+}
+
+pub(crate) struct TableMetaWithOrder {
+    pub columns: Vec<ColumnMeta>,
+    pub foreign_keys: Vec<ForeignKeyRef>,
+    pub stable_order: Vec<StableOrderKey>,
+    pub log: ExecutedSql,
+}
+
+pub(crate) fn last_page_offset(total_rows: i64, limit: i64) -> i64 {
+    if total_rows <= 0 || limit <= 0 {
+        0
+    } else {
+        ((total_rows - 1) / limit) * limit
+    }
+}
+
+pub(crate) fn attach_foreign_keys_to_columns(
+    constraints: Vec<ForeignKeyRef>,
+) -> std::collections::HashMap<String, ForeignKeyRef> {
+    use std::cmp::Reverse;
+
+    let mut attached: std::collections::HashMap<String, ForeignKeyRef> = std::collections::HashMap::new();
+    for fk in constraints {
+        for src in &fk.source_columns {
+            if src.trim().is_empty() {
+                continue;
+            }
+            let replace = match attached.get(src) {
+                None => true,
+                Some(existing) => {
+                    (
+                        fk.is_resolvable(),
+                        Reverse(fk.source_columns.len()),
+                        Reverse(fk.constraint_name.as_str()),
+                    ) > (
+                        existing.is_resolvable(),
+                        Reverse(existing.source_columns.len()),
+                        Reverse(existing.constraint_name.as_str()),
+                    )
+                }
+            };
+            if replace {
+                attached.insert(src.clone(), fk.clone());
+            }
+        }
+    }
+    attached
+}
+
+/// Returns all unique foreign-key constraints from `explicit` followed by any fallback
+/// `ColumnMeta.foreign_key` entries not already represented.
+pub fn collect_foreign_keys<'a>(
+    explicit: &'a [ForeignKeyRef],
+    columns: &'a [ColumnMeta],
+) -> Vec<&'a ForeignKeyRef> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for fk in explicit.iter().chain(columns.iter().filter_map(|c| c.foreign_key.as_ref())) {
+        if seen.insert((
+            fk.constraint_name.as_str(),
+            fk.target_schema.as_str(),
+            fk.target_table.as_str(),
+            fk.source_columns.as_slice(),
+            fk.target_columns.as_slice(),
+        )) {
+            out.push(fk);
+        }
+    }
+    out
+}
+
+/// Returns all unique foreign-key constraints referencing `column`, placing `ColumnMeta.foreign_key` first if present.
+pub fn foreign_keys_for_column<'a>(
+    explicit: &'a [ForeignKeyRef],
+    columns: &'a [ColumnMeta],
+    column: &str,
+) -> Vec<&'a ForeignKeyRef> {
+    let mut matching: Vec<&'a ForeignKeyRef> = collect_foreign_keys(explicit, columns)
+        .into_iter()
+        .filter(|fk| fk.source_columns.iter().any(|src| src == column))
+        .collect();
+    if let Some(primary) = columns
+        .iter()
+        .find(|c| c.name == column)
+        .and_then(|c| c.foreign_key.as_ref())
+        && let Some(pos) = matching.iter().position(|fk| *fk == primary)
+        && pos > 0
+    {
+        let primary_ref = matching.remove(pos);
+        matching.insert(0, primary_ref);
+    }
+    matching
 }
 
 /// Full structural metadata for a column returned by `describe_table` and grid pagination.
@@ -143,8 +314,21 @@ pub struct TableStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableStructure {
     pub columns: Vec<ColumnMeta>,
+    pub foreign_keys: Vec<ForeignKeyRef>,
     pub indexes: Vec<IndexInfo>,
     pub stats: TableStats,
+}
+
+impl TableStructure {
+    /// Returns all unique foreign-key constraints declared on this table.
+    pub fn all_foreign_keys(&self) -> Vec<&ForeignKeyRef> {
+        collect_foreign_keys(&self.foreign_keys, &self.columns)
+    }
+
+    /// Returns all unique foreign-key constraints referencing `column`.
+    pub fn foreign_keys_for_column(&self, column: &str) -> Vec<&ForeignKeyRef> {
+        foreign_keys_for_column(&self.foreign_keys, &self.columns, column)
+    }
 }
 
 /// Server-side ordering requested on a data grid page.
@@ -247,6 +431,7 @@ impl RawCellValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TablePage {
     pub columns: Vec<ColumnMeta>,
+    pub foreign_keys: Vec<ForeignKeyRef>,
     pub rows: Vec<Vec<CellValue>>,
     pub raw_rows: Vec<Vec<RawCellValue>>,
     pub transaction_support: TableTransactionSupport,
@@ -261,6 +446,16 @@ pub struct TablePage {
 impl TablePage {
     pub fn raw_row(&self, idx: usize) -> Option<&[RawCellValue]> {
         self.raw_rows.get(idx).map(Vec::as_slice)
+    }
+
+    /// Returns all unique foreign-key constraints declared on this table.
+    pub fn all_foreign_keys(&self) -> Vec<&ForeignKeyRef> {
+        collect_foreign_keys(&self.foreign_keys, &self.columns)
+    }
+
+    /// Returns all unique foreign-key constraints referencing `column`.
+    pub fn foreign_keys_for_column(&self, column: &str) -> Vec<&ForeignKeyRef> {
+        foreign_keys_for_column(&self.foreign_keys, &self.columns, column)
     }
 }
 
@@ -772,8 +967,7 @@ pub trait DbSession: Send + Sync {
     async fn fetch_fk_row(
         &self,
         fk: &ForeignKeyRef,
-        value: &CellValue,
-        source_col: &ColumnMeta,
+        components: &[FkLookupComponent],
     ) -> Result<(FkPeekRow, ExecutedSql), DbError>;
     async fn cancel_running_query(&self) -> Result<(), DbError>;
     async fn cancel_query_by_key(&self, _cancel_key: u64) -> Result<(), DbError> {

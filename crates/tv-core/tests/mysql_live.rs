@@ -8,8 +8,8 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 use tv_core::engine::mysql::MysqlSession;
 use tv_core::{
-    CellValue, ConnectionProfile, DbEngine, DbError, DbObjectKind, DbSession, ForeignKeyRef, PageRequest,
-    PasswordMode, SortSpec, SslMode, StagedCellValue, StagedChanges,
+    CellValue, ConnectionProfile, DbEngine, DbError, DbObjectKind, DbSession, FkLookupComponent, ForeignKeyRef,
+    PageRequest, PasswordMode, SortSpec, SslMode, StagedCellValue, StagedChanges,
 };
 
 struct TempMysqlDatabaseGuard {
@@ -251,6 +251,39 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
         assert!(!page2.has_more);
         assert!(page2.total_is_exact);
         assert_eq!(page2.total_rows_estimate, Some(4));
+
+        // #22: Out-of-range offset recovers to last valid page and reports accurate exact total.
+        let (oob_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: db_name.clone(),
+                table: "students".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 2,
+                offset: 20,
+            })
+            .await
+            .expect("recover mysql out-of-range page");
+        assert_eq!(oob_page.offset, 2);
+        assert_eq!(oob_page.rows.len(), 2);
+        assert_eq!(oob_page.total_rows_estimate, Some(4));
+        assert!(oob_page.total_is_exact);
+
+        let (empty_oob, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: db_name.clone(),
+                table: "students".to_owned(),
+                filter_where: Some("student_id < 0".to_owned()),
+                sort: None,
+                limit: 2,
+                offset: 10,
+            })
+            .await
+            .expect("recover empty filtered mysql page");
+        assert_eq!(empty_oob.offset, 0);
+        assert!(empty_oob.rows.is_empty());
+        assert_eq!(empty_oob.total_rows_estimate, Some(0));
+        assert!(empty_oob.total_is_exact);
         assert_eq!(page2.rows[0][3], CellValue::Text(String::new()));
         assert_eq!(page2.rows[1][7], CellValue::Null);
         assert_eq!(page2.rows[1][8], CellValue::Bytes(Vec::new()));
@@ -330,7 +363,7 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
         assert_eq!(structure.columns[2].comment.as_deref(), Some("Preferred display name"));
         let fk = structure.columns[9].foreign_key.as_ref().expect("group_id FK");
         assert_eq!(fk.target_table, "study_groups");
-        assert_eq!(fk.target_column, "group_id");
+        assert_eq!(fk.target_column(), Some("group_id"));
 
         assert!(structure.indexes.iter().any(|i| i.is_primary && i.columns == ["student_id"]));
         assert!(structure.indexes.iter().any(|i| i.name == "students_name_idx"));
@@ -449,14 +482,19 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
         // FK Peek lookup
         let (peek, peek_log) = shared
             .fetch_fk_row(
-                &ForeignKeyRef {
-                    constraint_name: "students_group_fk".to_owned(),
-                    target_schema: db_name.clone(),
-                    target_table: "study_groups".to_owned(),
+                &ForeignKeyRef::single(
+                    "students_group_fk",
+                    "group_id",
+                    db_name.clone(),
+                    "study_groups",
+                    "group_id",
+                ),
+                &[FkLookupComponent {
                     target_column: "group_id".to_owned(),
-                },
-                &CellValue::Int(1),
-                &structure.columns[9],
+                    source_col: structure.columns[9].clone(),
+                    value: CellValue::Int(1),
+                    raw_value: None,
+                }],
             )
             .await
             .expect("fetch_fk_row succeeds");
@@ -468,8 +506,12 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
         let null_peek = shared
             .fetch_fk_row(
                 &structure.columns[9].foreign_key.clone().expect("fk"),
-                &CellValue::Null,
-                &structure.columns[9],
+                &[FkLookupComponent {
+                    target_column: "group_id".to_owned(),
+                    source_col: structure.columns[9].clone(),
+                    value: CellValue::Null,
+                    raw_value: None,
+                }],
             )
             .await;
         assert!(matches!(null_peek, Err(DbError::InvalidInput(_))));
