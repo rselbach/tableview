@@ -7,9 +7,10 @@ use rune::credentials::Credentials;
 use tv_core::engine::{connect_session, test_connection};
 use tv_core::{
     CellValue, ColumnMeta, ColumnSummary, ConnectionId, ConnectionProfile, DatabaseInfo, DbEngine, DbError, DbObject,
-    DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, NewHistoryEntry, PageRequest, PasswordMode,
-    QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo,
-    SessionId, TabId, TablePage, TableStructure, TransactionOutcome,
+    DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode, NewHistoryEntry, PageRequest,
+    PasswordMode, PostgresSessionMode, QueryBatchResult, QueryHistoryEntry, QueryStore, RequestId, SavedQuery,
+    SavedQueryId, SchemaInfo, ServerInfo, SessionId, SqlSessionMode, TabId, TablePage, TableStructure,
+    TransactionOutcome, batch_sets_credentials_with_session_mode, trim_sql_whitespace_for_engine,
 };
 
 const QUERY_HISTORY_LIMIT: usize = 200;
@@ -89,6 +90,7 @@ pub enum WorkerCmd {
         session_id: SessionId,
         tab_id: TabId,
         req_id: RequestId,
+        engine: DbEngine,
         connect_req_id: RequestId,
         connection_id: ConnectionId,
         connection_name: String,
@@ -96,6 +98,8 @@ pub enum WorkerCmd {
         statements: Vec<String>,
         executed_sql_text: String,
         row_limit: Option<usize>,
+        record_history: bool,
+        expected_sql_mode: SqlSessionMode,
     },
     CancelQuery {
         session_id: SessionId,
@@ -159,6 +163,7 @@ pub enum WorkerCmd {
         connect_req_id: RequestId,
         statement: String,
         analyze: bool,
+        expected_sql_mode: SqlSessionMode,
     },
     FetchFkPeek {
         session_id: SessionId,
@@ -177,6 +182,8 @@ pub enum WorkerEvent {
         session_id: SessionId,
         req_id: RequestId,
         server_info: ServerInfo,
+        mysql_quote_mode: Option<MysqlQuoteMode>,
+        postgres_session_mode: Option<PostgresSessionMode>,
         databases: Vec<DatabaseInfo>,
         active_database: Option<String>,
         schemas: Vec<SchemaInfo>,
@@ -199,6 +206,8 @@ pub enum WorkerEvent {
         req_id: RequestId,
         is_db_switch: bool,
         server_version: Option<String>,
+        mysql_quote_mode: Option<MysqlQuoteMode>,
+        postgres_session_mode: Option<PostgresSessionMode>,
         databases: Vec<DatabaseInfo>,
         active_database: String,
         schemas: Vec<SchemaInfo>,
@@ -248,6 +257,13 @@ pub enum WorkerEvent {
         result: Result<QueryBatchResult, DbError>,
         logs: Vec<ExecutedSql>,
         recorded_history: Option<QueryHistoryEntry>,
+    },
+    SessionModeUpdated {
+        session_id: SessionId,
+        connect_req_id: RequestId,
+        mode_seq: u64,
+        mysql_quote_mode: Option<MysqlQuoteMode>,
+        postgres_session_mode: Option<PostgresSessionMode>,
     },
     QueryLibraryLoaded {
         session_id: SessionId,
@@ -445,6 +461,7 @@ struct ReconnectGate {
 
 struct SessionEntry {
     connect_req_id: RequestId,
+    mode_seq: u64,
     session: Arc<dyn DbSession>,
     profile: ConnectionProfile,
     password: Option<String>,
@@ -552,6 +569,36 @@ async fn current_connect_req_id(
     map.get(&session_id)
         .filter(|entry| entry.connect_req_id == expected_connect_req_id)
         .map(|entry| entry.connect_req_id)
+}
+
+async fn emit_session_mode(
+    sessions: &SessionMap,
+    event_tx: &mpsc::Sender<WorkerEvent>,
+    waker: &Arc<std::sync::Mutex<Option<Waker>>>,
+    session_id: SessionId,
+    expected_connect_req_id: Option<RequestId>,
+) {
+    let mut map = sessions.lock().await;
+    let Some(entry) = map.get_mut(&session_id) else {
+        return;
+    };
+    if expected_connect_req_id.is_some_and(|exp| entry.connect_req_id != exp) {
+        return;
+    }
+    entry.mode_seq = entry.mode_seq.saturating_add(1);
+    let mysql_quote_mode = entry.session.mysql_quote_mode();
+    let postgres_session_mode = entry.session.postgres_session_mode();
+    emit(
+        event_tx,
+        waker,
+        WorkerEvent::SessionModeUpdated {
+            session_id,
+            connect_req_id: entry.connect_req_id,
+            mode_seq: entry.mode_seq,
+            mysql_quote_mode,
+            postgres_session_mode,
+        },
+    );
 }
 
 async fn reconnect_session(
@@ -690,9 +737,16 @@ async fn prepare_session(
     Ok((session, connect_req_id))
 }
 
+#[derive(Clone, Copy)]
+struct WorkerCtx<'a> {
+    sessions: &'a SessionMap,
+    connector: &'a SessionConnector,
+    event_tx: &'a mpsc::Sender<WorkerEvent>,
+    waker: &'a Arc<std::sync::Mutex<Option<Waker>>>,
+}
+
 async fn run_with_reconnect<T, F, Fut>(
-    sessions: &SessionMap,
-    connector: &SessionConnector,
+    ctx: WorkerCtx<'_>,
     session_id: SessionId,
     liveness: LivenessCheck,
     allow_retry_on_disconnect: bool,
@@ -703,11 +757,34 @@ where
     F: FnMut(Arc<dyn DbSession>) -> Fut,
     Fut: std::future::Future<Output = Result<T, DbError>>,
 {
-    let (session, connect_req_id) =
-        prepare_session(sessions, connector, session_id, liveness, expected_connect_req_id).await?;
+    let WorkerCtx {
+        sessions,
+        connector,
+        event_tx,
+        waker,
+    } = ctx;
+    let (session, connect_req_id) = match prepare_session(
+        sessions,
+        connector,
+        session_id,
+        liveness,
+        expected_connect_req_id,
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(err @ SessionCallError::Operation { .. }) => {
+            emit_session_mode(sessions, event_tx, waker, session_id, expected_connect_req_id).await;
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
     let engine = session.engine();
     match op(Arc::clone(&session)).await {
-        Ok(val) => Ok(val),
+        Ok(val) => {
+            emit_session_mode(sessions, event_tx, waker, session_id, Some(connect_req_id)).await;
+            Ok(val)
+        }
         Err(error) if is_session_disconnect_err(session.as_ref(), &error) => {
             let retry_allowed = supports_background_reconnect(engine)
                 && (allow_retry_on_disconnect || matches!(error, DbError::DisconnectedBeforeDispatch(_)));
@@ -727,7 +804,10 @@ where
                     })?;
             let fresh_engine = fresh_session.engine();
             match op(Arc::clone(&fresh_session)).await {
-                Ok(val) => Ok(val),
+                Ok(val) => {
+                    emit_session_mode(sessions, event_tx, waker, session_id, Some(fresh_cid)).await;
+                    Ok(val)
+                }
                 Err(error) if is_session_disconnect_err(fresh_session.as_ref(), &error) => {
                     let cid = current_connect_req_id(sessions, session_id, fresh_cid).await;
                     Err(SessionCallError::Disconnected {
@@ -735,13 +815,19 @@ where
                         cause: unwrap_disconnect_cause(error),
                     })
                 }
-                Err(error) => Err(SessionCallError::Operation {
-                    engine: fresh_engine,
-                    error,
-                }),
+                Err(error) => {
+                    emit_session_mode(sessions, event_tx, waker, session_id, Some(fresh_cid)).await;
+                    Err(SessionCallError::Operation {
+                        engine: fresh_engine,
+                        error,
+                    })
+                }
             }
         }
-        Err(error) => Err(SessionCallError::Operation { engine, error }),
+        Err(error) => {
+            emit_session_mode(sessions, event_tx, waker, session_id, Some(connect_req_id)).await;
+            Err(SessionCallError::Operation { engine, error })
+        }
     }
 }
 
@@ -940,6 +1026,8 @@ async fn handle_cmd(
                 (Vec::new(), None, Vec::new())
             };
 
+            let mysql_quote_mode = session.mysql_quote_mode();
+            let postgres_session_mode = session.postgres_session_mode();
             {
                 let mut map = sessions.lock().await;
                 if !is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
@@ -949,6 +1037,7 @@ async fn handle_cmd(
                     session_id,
                     SessionEntry {
                         connect_req_id: req_id,
+                        mode_seq: 0,
                         session,
                         profile,
                         password: pw,
@@ -956,22 +1045,24 @@ async fn handle_cmd(
                         reconnect_gate: Arc::new(tokio::sync::Mutex::new(ReconnectGate::default())),
                     },
                 );
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::Connected {
+                        session_id,
+                        req_id,
+                        server_info,
+                        mysql_quote_mode,
+                        postgres_session_mode,
+                        databases,
+                        active_database,
+                        schemas,
+                        active_schema,
+                        objects,
+                        logs,
+                    },
+                );
             }
-            emit(
-                &event_tx,
-                &waker,
-                WorkerEvent::Connected {
-                    session_id,
-                    req_id,
-                    server_info,
-                    databases,
-                    active_database,
-                    schemas,
-                    active_schema,
-                    objects,
-                    logs,
-                },
-            );
         }
 
         WorkerCmd::UpdateSessionProfile {
@@ -1048,6 +1139,8 @@ async fn handle_cmd(
             };
 
             let server_version = session.server_info().version.clone();
+            let mysql_quote_mode = session.mysql_quote_mode();
+            let postgres_session_mode = session.postgres_session_mode();
             {
                 let mut map = sessions.lock().await;
                 if !is_current_lifecycle_epoch(&session_epochs, session_id, lifecycle_epoch) {
@@ -1057,6 +1150,7 @@ async fn handle_cmd(
                     session_id,
                     SessionEntry {
                         connect_req_id: req_id,
+                        mode_seq: 0,
                         session,
                         profile,
                         password: pw,
@@ -1064,23 +1158,25 @@ async fn handle_cmd(
                         reconnect_gate: Arc::new(tokio::sync::Mutex::new(ReconnectGate::default())),
                     },
                 );
+                emit(
+                    &event_tx,
+                    &waker,
+                    WorkerEvent::SchemasAndObjectsLoaded {
+                        session_id,
+                        req_id,
+                        is_db_switch: true,
+                        server_version: Some(server_version),
+                        mysql_quote_mode,
+                        postgres_session_mode,
+                        databases,
+                        active_database: database,
+                        schemas,
+                        active_schema,
+                        objects,
+                        logs,
+                    },
+                );
             }
-            emit(
-                &event_tx,
-                &waker,
-                WorkerEvent::SchemasAndObjectsLoaded {
-                    session_id,
-                    req_id,
-                    is_db_switch: true,
-                    server_version: Some(server_version),
-                    databases,
-                    active_database: database,
-                    schemas,
-                    active_schema,
-                    objects,
-                    logs,
-                },
-            );
         }
 
         WorkerCmd::SelectSchema {
@@ -1090,8 +1186,12 @@ async fn handle_cmd(
             schema,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1142,8 +1242,12 @@ async fn handle_cmd(
             object,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1206,8 +1310,12 @@ async fn handle_cmd(
             active_schema,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1229,14 +1337,28 @@ async fn handle_cmd(
                             Vec::new()
                         };
                         let active_database = session.server_info().current_database.clone();
-                        Ok((databases, active_database, schemas, chosen, objects, logs))
+                        Ok((
+                            databases,
+                            active_database,
+                            schemas,
+                            chosen,
+                            objects,
+                            logs,
+                        ))
                     }
                 },
             )
             .await;
 
             match outcome {
-                Ok((databases, active_database, schemas, chosen, objects, logs)) => emit(
+                Ok((
+                    databases,
+                    active_database,
+                    schemas,
+                    chosen,
+                    objects,
+                    logs,
+                )) => emit(
                     &event_tx,
                     &waker,
                     WorkerEvent::SchemasAndObjectsLoaded {
@@ -1244,6 +1366,8 @@ async fn handle_cmd(
                         req_id,
                         is_db_switch: false,
                         server_version: None,
+                        mysql_quote_mode: None,
+                        postgres_session_mode: None,
                         databases,
                         active_database,
                         schemas,
@@ -1279,8 +1403,12 @@ async fn handle_cmd(
             request,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1348,8 +1476,12 @@ async fn handle_cmd(
             table,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::Fast,
                 true,
@@ -1406,6 +1538,7 @@ async fn handle_cmd(
             session_id,
             tab_id,
             req_id,
+            engine,
             connect_req_id,
             connection_id,
             connection_name,
@@ -1413,6 +1546,8 @@ async fn handle_cmd(
             statements,
             executed_sql_text,
             row_limit,
+            record_history,
+            expected_sql_mode,
         } => {
             let Some((mut cancel_rx, cancel_flag)) = cancel_handle else {
                 return;
@@ -1427,6 +1562,19 @@ async fn handle_cmd(
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await;
 
+            let initial_sql_mode = SqlSessionMode {
+                mysql: if engine == DbEngine::Mysql {
+                    expected_sql_mode.mysql
+                } else {
+                    None
+                },
+                postgres: if engine == DbEngine::Postgres {
+                    expected_sql_mode.postgres.clone()
+                } else {
+                    None
+                },
+            };
+            let mut skipped_for_mode_mismatch = false;
             let outcome = if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow() {
                 Err(SessionCallError::Operation {
                     engine: DbEngine::Postgres,
@@ -1493,11 +1641,12 @@ async fn handle_cmd(
                                 });
                             }
                             let exec_res = {
-                                let exec_fut = session.execute_sql_cancellable(
+                                let exec_fut = session.execute_sql_cancellable_checked(
                                     &statements,
                                     row_limit,
                                     cancel_key,
                                     Some(cancel_flag.as_ref()),
+                                    expected_sql_mode.clone(),
                                 );
                                 tokio::pin!(exec_fut);
                                 loop {
@@ -1519,7 +1668,16 @@ async fn handle_cmd(
                                 }
                             };
                             match exec_res {
-                                Ok(ok) => break Ok(ok),
+                                Ok((batch, logs)) => {
+                                    break Ok((batch, logs, session_cid));
+                                }
+                                Err(err @ (DbError::MysqlModeMismatch | DbError::PostgresStringModeMismatch)) => {
+                                    skipped_for_mode_mismatch = true;
+                                    break Err(SessionCallError::Operation {
+                                        engine: session.engine(),
+                                        error: err,
+                                    });
+                                }
                                 Err(DbError::DisconnectedBeforeDispatch(cause)) => {
                                     if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || *cancel_rx.borrow() {
                                         break Err(SessionCallError::Operation {
@@ -1611,9 +1769,12 @@ async fn handle_cmd(
             };
 
             let (result, logs) = match outcome {
-                Ok((batch, logs)) => (Ok(batch), logs),
-                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
-                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                Ok((batch, logs, cid)) => {
+                    emit_session_mode(&sessions, &event_tx, &waker, session_id, Some(cid)).await;
+                    (Ok(batch), logs)
+                }
+                Err(SessionCallError::Disconnected { connect_req_id: cid, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, cid, cause);
                     emit(
                         &event_tx,
                         &waker,
@@ -1628,18 +1789,40 @@ async fn handle_cmd(
                     );
                     return;
                 }
-                Err(SessionCallError::Operation { error, .. }) => (Err(error), Vec::new()),
+                Err(SessionCallError::Operation { error, .. }) => {
+                    emit_session_mode(
+                        &sessions,
+                        &event_tx,
+                        &waker,
+                        session_id,
+                        Some(connect_req_id),
+                    )
+                    .await;
+                    (Err(error), Vec::new())
+                }
             };
 
-            let recorded_history = if let Some(store) = query_store
-                && !executed_sql_text.trim().is_empty()
+            let has_credentials = batch_sets_credentials_with_session_mode(
+                engine,
+                &statements,
+                &executed_sql_text,
+                initial_sql_mode,
+            );
+            let recorded_history = if !skipped_for_mode_mismatch
+                && record_history
+                && !has_credentials
+                && let Some(store) = query_store
+                && !trim_sql_whitespace_for_engine(engine, &executed_sql_text).is_empty()
             {
                 let (duration_ms, rows_count, error) = match &result {
                     Ok(batch) => {
                         let err = if batch.cancelled {
                             Some("Query cancelled".to_owned())
+                        } else if batch.results.iter().any(|r| r.error.is_some()) {
+                            // Omit raw backend error strings from local history so constraints or data values are not leaked.
+                            Some("Query failed".to_owned())
                         } else {
-                            batch.results.iter().find_map(|r| r.error.clone())
+                            None
                         };
                         let rows = if batch.results.iter().any(|r| r.is_tabular()) {
                             Some(batch.results.iter().map(|r| r.rows.len() as u64).sum())
@@ -1652,7 +1835,10 @@ async fn handle_cmd(
                         };
                         (batch.total_elapsed_ms, rows, err)
                     }
-                    Err(err) => (start.elapsed().as_millis() as u64, None, Some(err.to_string())),
+                    Err(DbError::Cancelled) => {
+                        (start.elapsed().as_millis() as u64, None, Some("Query cancelled".to_owned()))
+                    }
+                    Err(_) => (start.elapsed().as_millis() as u64, None, Some("Query failed".to_owned())),
                 };
                 let entry = NewHistoryEntry {
                     connection_id: Some(connection_id),
@@ -1901,8 +2087,12 @@ async fn handle_cmd(
             statements,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::AlwaysPing,
                 false,
@@ -1968,6 +2158,7 @@ async fn handle_cmd(
             connect_req_id,
             statement,
             analyze,
+            expected_sql_mode,
         } => {
             let liveness = if analyze {
                 LivenessCheck::AlwaysPing
@@ -1975,15 +2166,20 @@ async fn handle_cmd(
                 LivenessCheck::Fast
             };
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 liveness,
                 !analyze,
                 Some(connect_req_id),
                 |session| {
                     let stmt = statement.clone();
-                    async move { session.explain_sql(&stmt, analyze).await }
+                    let expected_mode = expected_sql_mode.clone();
+                    async move { session.explain_sql_checked(&stmt, analyze, expected_mode).await }
                 },
             )
             .await;
@@ -2000,8 +2196,8 @@ async fn handle_cmd(
                         logs: vec![log],
                     },
                 ),
-                Err(SessionCallError::Disconnected { connect_req_id, cause }) => {
-                    emit_session_disconnected(&event_tx, &waker, session_id, connect_req_id, cause);
+                Err(SessionCallError::Disconnected { connect_req_id: cid, cause }) => {
+                    emit_session_disconnected(&event_tx, &waker, session_id, cid, cause);
                     emit(
                         &event_tx,
                         &waker,
@@ -2037,8 +2233,12 @@ async fn handle_cmd(
             source_col,
         } => {
             let outcome = run_with_reconnect(
-                &sessions,
-                &connector,
+                WorkerCtx {
+                    sessions: &sessions,
+                    connector: &connector,
+                    event_tx: &event_tx,
+                    waker: &waker,
+                },
                 session_id,
                 LivenessCheck::Fast,
                 true,

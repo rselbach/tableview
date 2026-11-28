@@ -29,11 +29,21 @@ pub use history::{NewHistoryEntry, QueryHistoryEntry, QueryStore, QueryStoreErro
 pub use ids::{ConnectionId, RequestId, SavedQueryId, SessionId, TabId};
 pub use safety::{
     SafetyDecision, StatementInspection, StatementRisk, evaluate_sql_safety, evaluate_sql_safety_for_engine,
+    evaluate_sql_safety_for_engine_with_mysql_mode, evaluate_sql_safety_for_engine_with_session_mode,
     evaluate_staged_commit_safety, inspect_statement, inspect_statement_for_engine,
+    inspect_statement_for_engine_with_mysql_mode, inspect_statement_for_engine_with_session_mode,
 };
 pub use sql::{
-    SqlStatement, cursor_line_col, format_sql, has_executable_sql, has_executable_sql_for_engine, split_statements,
-    split_statements_for_engine, statement_at_cursor, statement_at_cursor_for_engine,
+    MysqlFlavor, MysqlQuoteMode, MysqlServerVersion, PostgresSavepointMode, PostgresServerEncoding,
+    PostgresSessionMode, PostgresTxState, SqlSessionMode, SqlStatement,
+    batch_sets_credentials_with_mysql_mode, batch_sets_credentials_with_session_mode, cursor_line_col,
+    format_sql, has_executable_sql, has_executable_sql_for_engine, mysql_slice_has_multiple_statements,
+    postgres_slice_has_multiple_statements, split_statements, split_statements_for_engine,
+    split_statements_for_engine_with_mysql_mode, split_statements_for_engine_with_session_mode, sql_sets_credentials,
+    sql_sets_credentials_with_mysql_mode, sql_sets_credentials_with_session_mode, statement_at_cursor,
+    statement_at_cursor_for_engine, statement_at_cursor_for_engine_with_mysql_mode,
+    statement_at_cursor_for_engine_with_session_mode, trim_sql_whitespace_for_engine,
+    validate_mysql_single_statement_batch,
 };
 pub use staging::{
     DraftRowId, StagedCellValue, StagedChanges, StagedInsertRow, StagedRowUpdate, StagingError, build_fk_where_clause,
@@ -42,5 +52,5 @@ pub use staging::{
 };
 pub use storage::{
     AppSettings, AppearancePreference, ConnectionStore, SETTINGS_SCHEMA_VERSION, SettingsStore, SortOrder, StorageError,
-    StoreData,
+    StoreData, atomic_write_bytes,
 };

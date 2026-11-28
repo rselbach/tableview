@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,12 +14,15 @@ use tv_core::{
     ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult,
     QueryHistoryEntry, QueryStatementResult, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId,
     SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue, StagedChanges,
-    StatementInspection, StoreData, TabId, TablePage, TableStructure, build_explain_sql_for_engine,
-    build_fk_where_clause_for_engine, default_export_filename, evaluate_sql_safety_for_engine,
-    evaluate_staged_commit_safety, export_rows_for_engine,
+    StatementInspection, StorageError, StoreData, TabId, TablePage, TableStructure, atomic_write_bytes,
+    build_explain_sql_for_engine, build_fk_where_clause_for_engine, default_export_filename,
+    evaluate_sql_safety_for_engine_with_session_mode, evaluate_staged_commit_safety, export_rows_for_engine,
 };
 use tv_core::sql::{
-    cursor_line_col, format_sql, split_statements_for_engine, statement_at_cursor_for_engine,
+    MysqlQuoteMode, PostgresSessionMode, SqlSessionMode, batch_sets_credentials_with_session_mode, cursor_line_col,
+    format_sql, mysql_slice_has_multiple_statements, postgres_slice_has_multiple_statements,
+    split_statements_for_engine_with_session_mode, statement_at_cursor_for_engine_with_session_mode,
+    trim_sql_whitespace_for_engine,
 };
 
 use tv_update::{UpdateFailure, UpdateStatus};
@@ -97,6 +101,9 @@ pub enum ColumnLoadState {
 #[derive(Clone, Debug)]
 pub struct ConnectedData {
     pub server_version: String,
+    pub mode_seq: u64,
+    pub mysql_quote_mode: Option<MysqlQuoteMode>,
+    pub postgres_session_mode: Option<PostgresSessionMode>,
     pub databases: Vec<DatabaseInfo>,
     pub active_database: Option<String>,
     pub schemas: Vec<SchemaInfo>,
@@ -443,9 +450,11 @@ pub enum PendingProtectedAction {
         statements: Vec<String>,
         executed_sql_text: String,
         row_limit: Option<usize>,
+        approved_sql_mode: SqlSessionMode,
     },
     ExplainAnalyze {
         statement: String,
+        approved_sql_mode: SqlSessionMode,
     },
 }
 
@@ -851,6 +860,16 @@ impl QueryResultTabState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct HistoryIndicatorCache {
+    text: String,
+    engine: DbEngine,
+    sql_mode: SqlSessionMode,
+    current_key: Option<(usize, usize)>,
+    current_excluded: bool,
+    buffer_excluded: Option<bool>,
+}
+
 /// Interactive state for one SQL query workbench tab (editor, live timer, multi-result grids).
 pub struct QueryTabState {
     pub tab_id: TabId,
@@ -860,6 +879,7 @@ pub struct QueryTabState {
     pub saved_snapshot: String,
     pub row_limit: Option<usize>,
     pub limit_dropdown_open: bool,
+    pub record_history_override: Option<bool>,
     pub split_ratio: f32,
     pub running: bool,
     pub cancelling: bool,
@@ -879,6 +899,7 @@ pub struct QueryTabState {
     pub explain_raw_json: bool,
     pub inspector_search: TextEdit,
     pub inspector_json_pretty: bool,
+    history_indicator_cache: RefCell<Option<HistoryIndicatorCache>>,
 }
 
 impl QueryTabState {
@@ -897,6 +918,7 @@ impl QueryTabState {
             saved_snapshot: initial_sql,
             row_limit: Some(1000),
             limit_dropdown_open: false,
+            record_history_override: None,
             split_ratio: 0.42,
             running: false,
             cancelling: false,
@@ -916,6 +938,7 @@ impl QueryTabState {
             explain_raw_json: false,
             inspector_search: TextEdit::new(""),
             inspector_json_pretty: true,
+            history_indicator_cache: RefCell::new(None),
         }
     }
 
@@ -936,6 +959,129 @@ impl QueryTabState {
             .iter()
             .find(|(limit, _)| *limit == self.row_limit)
             .map_or("Limit 1,000", |(_, label)| *label)
+    }
+
+    pub fn effective_record_history(&self, global_enabled: bool) -> bool {
+        self.record_history_override.unwrap_or(global_enabled)
+    }
+
+    pub fn history_indicator_exclusions(
+        &self,
+        engine: DbEngine,
+        sql_mode: SqlSessionMode,
+    ) -> (bool, bool) {
+        let current_excluded = self.current_query_sets_credentials_with_session(engine, sql_mode.clone());
+        if current_excluded {
+            return (true, false);
+        }
+        let buffer_excluded = self.any_query_sets_credentials_with_session(engine, sql_mode);
+        (false, buffer_excluded)
+    }
+
+    pub fn current_query_sets_credentials(
+        &self,
+        engine: DbEngine,
+        mysql_mode: Option<MysqlQuoteMode>,
+    ) -> bool {
+        self.current_query_sets_credentials_with_session(engine, SqlSessionMode::mysql(mysql_mode))
+    }
+
+    pub fn current_query_sets_credentials_with_session(
+        &self,
+        engine: DbEngine,
+        sql_mode: SqlSessionMode,
+    ) -> bool {
+        let cur_key = (self.editor.anchor, self.editor.focus);
+        {
+            let cache = self.history_indicator_cache.borrow();
+            if let Some(entry) = cache.as_ref()
+                && entry.engine == engine
+                && entry.sql_mode == sql_mode
+                && entry.text == self.editor.text
+                && entry.current_key == Some(cur_key)
+            {
+                return entry.current_excluded;
+            }
+        }
+        let computed = statements_for_current(&self.editor, engine, sql_mode.clone()).is_some_and(
+            |(stmts, executed_sql_text)| {
+                batch_sets_credentials_with_session_mode(engine, &stmts, &executed_sql_text, sql_mode.clone())
+            },
+        );
+        let mut cache = self.history_indicator_cache.borrow_mut();
+        match cache.as_mut() {
+            Some(entry)
+                if entry.engine == engine
+                    && entry.sql_mode == sql_mode
+                    && entry.text == self.editor.text =>
+            {
+                entry.current_key = Some(cur_key);
+                entry.current_excluded = computed;
+            }
+            _ => {
+                *cache = Some(HistoryIndicatorCache {
+                    text: self.editor.text.clone(),
+                    engine,
+                    sql_mode,
+                    current_key: Some(cur_key),
+                    current_excluded: computed,
+                    buffer_excluded: None,
+                });
+            }
+        }
+        computed
+    }
+
+    pub fn any_query_sets_credentials(
+        &self,
+        engine: DbEngine,
+        mysql_mode: Option<MysqlQuoteMode>,
+    ) -> bool {
+        self.any_query_sets_credentials_with_session(engine, SqlSessionMode::mysql(mysql_mode))
+    }
+
+    pub fn any_query_sets_credentials_with_session(
+        &self,
+        engine: DbEngine,
+        sql_mode: SqlSessionMode,
+    ) -> bool {
+        {
+            let cache = self.history_indicator_cache.borrow();
+            if let Some(entry) = cache.as_ref()
+                && entry.engine == engine
+                && entry.sql_mode == sql_mode
+                && entry.text == self.editor.text
+                && let Some(cached) = entry.buffer_excluded
+            {
+                return cached;
+            }
+        }
+        let computed = statements_for_all(&self.editor.text, engine, sql_mode.clone()).is_some_and(
+            |(stmts, executed_sql_text)| {
+                batch_sets_credentials_with_session_mode(engine, &stmts, &executed_sql_text, sql_mode.clone())
+            },
+        );
+        let mut cache = self.history_indicator_cache.borrow_mut();
+        match cache.as_mut() {
+            Some(entry)
+                if entry.engine == engine
+                    && entry.sql_mode == sql_mode
+                    && entry.text == self.editor.text =>
+            {
+                entry.buffer_excluded = Some(computed);
+            }
+            _ => {
+                *cache = Some(HistoryIndicatorCache {
+                    text: self.editor.text.clone(),
+                    engine,
+                    sql_mode,
+                    current_key: None,
+                    current_excluded: false,
+                    buffer_excluded: Some(computed),
+                });
+            }
+        }
+        computed
     }
 
     pub fn active_result_state(&self) -> Option<&QueryResultTabState> {
@@ -1177,6 +1323,32 @@ impl SessionState {
         self.status = next;
     }
 
+    /// Returns live MySQL quoting flags reported by the connected worker session, if any.
+    pub fn mysql_quote_mode(&self) -> Option<MysqlQuoteMode> {
+        self.status.as_connected().and_then(|c| c.mysql_quote_mode)
+    }
+
+    /// Returns live PostgreSQL session string-escaping and transaction state reported by the worker.
+    pub fn postgres_session_mode(&self) -> Option<PostgresSessionMode> {
+        self.status
+            .as_connected()
+            .and_then(|c| c.postgres_session_mode.clone())
+    }
+
+    /// Returns live PostgreSQL `standard_conforming_strings` reported by the connected worker session.
+    pub fn postgres_standard_conforming_strings(&self) -> Option<bool> {
+        self.postgres_session_mode()
+            .map(|mode| mode.standard_conforming_strings)
+    }
+
+    /// Returns combined live SQL session dialect flags for statement splitting, safety, and history.
+    pub fn sql_mode(&self) -> SqlSessionMode {
+        SqlSessionMode {
+            mysql: self.mysql_quote_mode(),
+            postgres: self.postgres_session_mode(),
+        }
+    }
+
     /// Returns the active database, schema, and object selection, or the last snapshotted context if disconnected.
     pub fn current_reconnect_context(&self) -> ReconnectContext {
         match &self.status {
@@ -1298,6 +1470,8 @@ pub struct AppState {
     pub screen: Screen,
     pub overlay: OverlayState,
     pub appearance: ColorScheme,
+    pub record_query_history: bool,
+    pub settings_save_error: Option<String>,
     pub status_notice: Option<StatusNotice>,
     pub worker: Option<WorkerBridge>,
     pub update: UpdateUiState,
@@ -1343,17 +1517,17 @@ impl AppState {
             }
             Err(_) => (PathBuf::from("connections.json"), StoreData::default()),
         };
-        let (settings_path, settings) = match SettingsStore::open_default() {
+        let (settings_path, settings_result) = match SettingsStore::open_default() {
             Ok(store) => {
                 let path = store.path().to_path_buf();
-                let data = store.load().unwrap_or_default();
-                (path, data)
+                let result = store.load();
+                (path, result)
             }
-            Err(_) => (PathBuf::from("settings.json"), AppSettings::default()),
+            Err(err) => (PathBuf::from("settings.json"), Err(err)),
         };
         let mut state = Self::from_store_data(store_path, store_data, true);
         state.settings_path = settings_path;
-        state.appearance = appearance_from_pref(settings.appearance);
+        state.apply_settings_load(settings_result);
         let worker = WorkerBridge::spawn();
         let update_bridge = worker
             .as_ref()
@@ -1391,6 +1565,8 @@ impl AppState {
             screen: Screen::Launcher,
             overlay: OverlayState::None,
             appearance: ColorScheme::System,
+            record_query_history: true,
+            settings_save_error: None,
             status_notice: None,
             worker: None,
             update: UpdateUiState::default(),
@@ -3497,7 +3673,7 @@ impl AppState {
         .filter(modal.format.filter_name(), &[modal.format.extension()]);
 
         tx.save_file(options, move |s: &mut Self, result, _| match result {
-            Ok(Some(path)) => match std::fs::write(&path, &content) {
+            Ok(Some(path)) => match atomic_write_bytes(&path, content.as_bytes()) {
                 Ok(()) => {
                     s.overlay = OverlayState::None;
                     s.set_notice(format!("Exported {row_count} rows to {}", path.display()), false);
@@ -3520,6 +3696,7 @@ impl AppState {
         struct ReadyQuery {
             tab_id: TabId,
             engine: DbEngine,
+            sql_mode: SqlSessionMode,
             policy: SafetyPolicy,
             env: EnvTag,
             statements: Vec<String>,
@@ -3533,6 +3710,7 @@ impl AppState {
             let engine = session.profile.engine;
             let policy = session.profile.safety;
             let env = session.profile.env;
+            let sql_mode = session.sql_mode();
             let is_connected = session.status.as_connected().is_some();
             let Some(tab_id) = session.active_tab else {
                 return false;
@@ -3550,15 +3728,9 @@ impl AppState {
             }
 
             let extracted = if all {
-                let stmts = split_statements_for_engine(&tab.editor.text, engine);
-                if stmts.is_empty() {
-                    None
-                } else {
-                    let sql_text = tab.editor.text.trim().to_owned();
-                    Some((stmts.into_iter().map(|s| s.sql).collect(), sql_text))
-                }
+                statements_for_all(&tab.editor.text, engine, sql_mode.clone())
             } else {
-                statements_for_current(&tab.editor, engine)
+                statements_for_current(&tab.editor, engine, sql_mode.clone())
             };
 
             let Some((statements, executed_sql_text)) = extracted else {
@@ -3569,6 +3741,7 @@ impl AppState {
             ReadyQuery {
                 tab_id,
                 engine,
+                sql_mode,
                 policy,
                 env,
                 statements,
@@ -3580,6 +3753,7 @@ impl AppState {
         let ReadyQuery {
             tab_id,
             engine,
+            sql_mode,
             policy,
             env,
             statements,
@@ -3587,9 +3761,22 @@ impl AppState {
             row_limit,
         } = outcome;
 
-        match evaluate_sql_safety_for_engine(engine, policy, env, &statements) {
+        match evaluate_sql_safety_for_engine_with_session_mode(
+            engine,
+            policy,
+            env,
+            &statements,
+            sql_mode.clone(),
+        ) {
             SafetyDecision::Allow => {
-                self.dispatch_query_execution(session_id, tab_id, statements, executed_sql_text, row_limit);
+                self.dispatch_query_execution(
+                    session_id,
+                    tab_id,
+                    statements,
+                    executed_sql_text,
+                    row_limit,
+                    sql_mode,
+                );
             }
             SafetyDecision::Block { reason, .. } => {
                 if let Some(session) = self.sessions.get_mut(&session_id)
@@ -3622,6 +3809,7 @@ impl AppState {
                         statements,
                         executed_sql_text,
                         row_limit,
+                        approved_sql_mode: sql_mode,
                     },
                 }));
             }
@@ -3633,13 +3821,29 @@ impl AppState {
         let Screen::Workspace(session_id) = self.screen else {
             return false;
         };
-        let (tab_id, engine, policy, env, statement) = {
+        struct ReadyExplain {
+            tab_id: TabId,
+            engine: DbEngine,
+            sql_mode: SqlSessionMode,
+            policy: SafetyPolicy,
+            env: EnvTag,
+            statement: String,
+        }
+        let ReadyExplain {
+            tab_id,
+            engine,
+            sql_mode,
+            policy,
+            env,
+            statement,
+        } = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return false;
             };
             let engine = session.profile.engine;
             let policy = session.profile.safety;
             let env = session.profile.env;
+            let sql_mode = session.sql_mode();
             let is_connected = session.status.as_connected().is_some();
             let Some(tab_id) = session.active_tab else {
                 return false;
@@ -3655,18 +3859,52 @@ impl AppState {
                 tab.show_explain = true;
                 return true;
             }
-            let Some((stmts, _)) = statements_for_current(&tab.editor, engine) else {
+            let Some((stmts, _)) = statements_for_current(&tab.editor, engine, sql_mode.clone()) else {
                 self.set_notice("Place cursor inside a SQL statement to explain", false);
                 return true;
             };
+            if stmts.len() > 1
+                || stmts.first().is_some_and(|first| {
+                    (engine == DbEngine::Mysql && mysql_slice_has_multiple_statements(first, sql_mode.mysql))
+                        || (engine == DbEngine::Postgres
+                            && postgres_slice_has_multiple_statements(
+                                first,
+                                sql_mode.pg_standard_conforming_strings(),
+                            ))
+                })
+            {
+                tab.explain_error = Some(
+                    "EXPLAIN requires a single SQL statement; select or split a single statement before running EXPLAIN."
+                        .to_owned(),
+                );
+                tab.show_explain = true;
+                self.set_notice(
+                    "EXPLAIN requires a single SQL statement; select or split one statement",
+                    true,
+                );
+                return true;
+            }
             let first = stmts.into_iter().next().unwrap_or_default();
-            (tab_id, engine, policy, env, first)
+            ReadyExplain {
+                tab_id,
+                engine,
+                sql_mode,
+                policy,
+                env,
+                statement: first,
+            }
         };
 
         let analyze = analyze && engine.supports_explain_analyze();
         if analyze {
             let wrapped = vec![build_explain_sql_for_engine(engine, &statement, true)];
-            match evaluate_sql_safety_for_engine(engine, policy, env, &wrapped) {
+            match evaluate_sql_safety_for_engine_with_session_mode(
+                engine,
+                policy,
+                env,
+                &wrapped,
+                sql_mode.clone(),
+            ) {
                 SafetyDecision::Allow => {}
                 SafetyDecision::Block { reason, .. } => {
                     if let Some(session) = self.sessions.get_mut(&session_id)
@@ -3694,14 +3932,17 @@ impl AppState {
                         statements: inspected,
                         is_destructive,
                         destructive_ack: false,
-                        pending: PendingProtectedAction::ExplainAnalyze { statement },
+                        pending: PendingProtectedAction::ExplainAnalyze {
+                            statement,
+                            approved_sql_mode: sql_mode,
+                        },
                     }));
                     return true;
                 }
             }
         }
 
-        self.dispatch_explain_execution(session_id, tab_id, statement, analyze);
+        self.dispatch_explain_execution(session_id, tab_id, statement, analyze, sql_mode);
         true
     }
 
@@ -3716,11 +3957,39 @@ impl AppState {
         let OverlayState::SafetyConfirm(modal) = std::mem::take(&mut self.overlay) else {
             return;
         };
+        let approved_mode = match &modal.pending {
+            PendingProtectedAction::ExecuteSql { approved_sql_mode, .. }
+            | PendingProtectedAction::ExplainAnalyze { approved_sql_mode, .. } => {
+                approved_sql_mode.clone()
+            }
+        };
+        if let Some(session) = self.sessions.get(&modal.session_id) {
+            if session.profile.engine == DbEngine::Mysql
+                && session.mysql_quote_mode() != approved_mode.mysql
+            {
+                self.set_notice(
+                    "MySQL session mode changed before confirmation; re-run to inspect under the current mode",
+                    true,
+                );
+                return;
+            }
+            if session.profile.engine == DbEngine::Postgres
+                && approved_mode.postgres.is_some()
+                && session.postgres_session_mode() != approved_mode.postgres
+            {
+                self.set_notice(
+                    "PostgreSQL string escaping mode changed before confirmation; re-run to inspect under the current mode",
+                    true,
+                );
+                return;
+            }
+        }
         match modal.pending {
             PendingProtectedAction::ExecuteSql {
                 statements,
                 executed_sql_text,
                 row_limit,
+                approved_sql_mode,
             } => {
                 self.dispatch_query_execution(
                     modal.session_id,
@@ -3728,10 +3997,20 @@ impl AppState {
                     statements,
                     executed_sql_text,
                     row_limit,
+                    approved_sql_mode,
                 );
             }
-            PendingProtectedAction::ExplainAnalyze { statement } => {
-                self.dispatch_explain_execution(modal.session_id, modal.tab_id, statement, true);
+            PendingProtectedAction::ExplainAnalyze {
+                statement,
+                approved_sql_mode,
+            } => {
+                self.dispatch_explain_execution(
+                    modal.session_id,
+                    modal.tab_id,
+                    statement,
+                    true,
+                    approved_sql_mode,
+                );
             }
         }
     }
@@ -3743,12 +4022,15 @@ impl AppState {
         statements: Vec<String>,
         executed_sql_text: String,
         row_limit: Option<usize>,
+        expected_sql_mode: SqlSessionMode,
     ) {
         let req_id = self.alloc_req_id();
+        let global_record_history = self.record_query_history;
         let dispatch = {
             let Some(session) = self.sessions.get_mut(&session_id) else {
                 return;
             };
+            let engine = session.profile.engine;
             let connection_id = session.profile.id;
             let connection_name = session.profile.name.clone();
             let connect_req_id = session.active_connect_req_id;
@@ -3759,6 +4041,7 @@ impl AppState {
             let Some(tab) = session.tab_mut(tab_id).and_then(WorkspaceTab::as_query_mut) else {
                 return;
             };
+            let record_history = tab.effective_record_history(global_record_history);
             tab.running = true;
             tab.cancelling = false;
             tab.active_req_id = Some(req_id);
@@ -3767,7 +4050,7 @@ impl AppState {
             tab.batch_cancelled = false;
             tab.show_explain = false;
             tab.limit_dropdown_open = false;
-            (connect_req_id, connection_id, connection_name, database)
+            (engine, connect_req_id, connection_id, connection_name, database, record_history)
         };
 
         if let Some(worker) = &self.worker {
@@ -3775,13 +4058,16 @@ impl AppState {
                 session_id,
                 tab_id,
                 req_id,
-                connect_req_id: dispatch.0,
-                connection_id: dispatch.1,
-                connection_name: dispatch.2,
-                database: dispatch.3,
+                engine: dispatch.0,
+                connect_req_id: dispatch.1,
+                connection_id: dispatch.2,
+                connection_name: dispatch.3,
+                database: dispatch.4,
                 statements,
                 executed_sql_text,
                 row_limit,
+                record_history: dispatch.5,
+                expected_sql_mode,
             });
         } else if let Some(tab) = self
             .sessions
@@ -3800,6 +4086,7 @@ impl AppState {
         tab_id: TabId,
         statement: String,
         analyze: bool,
+        expected_sql_mode: SqlSessionMode,
     ) {
         let req_id = self.alloc_req_id();
         let connect_req_id = {
@@ -3823,6 +4110,7 @@ impl AppState {
                 connect_req_id,
                 statement,
                 analyze,
+                expected_sql_mode,
             });
         }
     }
@@ -4294,6 +4582,8 @@ impl AppState {
                 session_id,
                 req_id,
                 server_info,
+                mysql_quote_mode,
+                postgres_session_mode,
                 databases,
                 active_database,
                 schemas,
@@ -4322,6 +4612,9 @@ impl AppState {
 
                     session.set_status(ConnectionState::Connected(Box::new(ConnectedData {
                         server_version: server_info.version,
+                        mode_seq: 0,
+                        mysql_quote_mode,
+                        postgres_session_mode,
                         databases,
                         active_database: active_database.clone(),
                         schemas,
@@ -4498,6 +4791,8 @@ impl AppState {
                 req_id,
                 is_db_switch,
                 server_version,
+                mysql_quote_mode,
+                postgres_session_mode,
                 databases,
                 active_database,
                 schemas,
@@ -4535,6 +4830,14 @@ impl AppState {
                         if let Some(version) = server_version {
                             data.server_version = version;
                         }
+                        if is_db_switch {
+                            data.mode_seq = 0;
+                            if session.profile.engine == DbEngine::Mysql {
+                                data.mysql_quote_mode = mysql_quote_mode;
+                            } else if session.profile.engine == DbEngine::Postgres {
+                                data.postgres_session_mode = postgres_session_mode;
+                            }
+                        }
                         data.databases = databases;
                         data.active_database = Some(active_database);
                         data.schemas = schemas;
@@ -4547,6 +4850,9 @@ impl AppState {
                     } else if is_db_switch {
                         session.set_status(ConnectionState::Connected(Box::new(ConnectedData {
                             server_version: server_version.unwrap_or_default(),
+                            mode_seq: 0,
+                            mysql_quote_mode,
+                            postgres_session_mode,
                             databases,
                             active_database: Some(active_database),
                             schemas,
@@ -4734,6 +5040,29 @@ impl AppState {
                     && tab.running
                 {
                     tab.elapsed_ms = elapsed_ms;
+                }
+            }
+
+            WorkerEvent::SessionModeUpdated {
+                session_id,
+                connect_req_id,
+                mode_seq,
+                mysql_quote_mode,
+                postgres_session_mode,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return;
+                };
+                if connect_req_id == session.active_connect_req_id
+                    && let ConnectionState::Connected(ref mut data) = session.status
+                    && mode_seq > data.mode_seq
+                {
+                    data.mode_seq = mode_seq;
+                    if session.profile.engine == DbEngine::Mysql {
+                        data.mysql_quote_mode = mysql_quote_mode;
+                    } else if session.profile.engine == DbEngine::Postgres {
+                        data.postgres_session_mode = postgres_session_mode;
+                    }
                 }
             }
 
@@ -5045,22 +5374,87 @@ impl AppState {
         }
     }
 
-    pub fn persist_settings(&self) {
+    /// Loads settings from `path`, pausing query history recording and surfacing an error if
+    /// an existing settings file cannot be read or parsed.
+    pub fn load_settings_from(&mut self, path: PathBuf) {
+        self.settings_path = path.clone();
+        self.apply_settings_load(SettingsStore::at(path).load());
+    }
+
+    fn apply_settings_load(&mut self, result: Result<AppSettings, StorageError>) {
+        match result {
+            Ok(settings) => {
+                self.appearance = appearance_from_pref(settings.appearance);
+                self.record_query_history = settings.record_query_history;
+                self.settings_save_error = None;
+            }
+            Err(err) => {
+                let defaults = AppSettings {
+                    record_query_history: false,
+                    ..AppSettings::default()
+                };
+                self.appearance = appearance_from_pref(defaults.appearance);
+                self.record_query_history = defaults.record_query_history;
+                self.settings_save_error = Some(format!(
+                    "Failed to load settings from disk ({err}). Query history recording has been paused until settings are saved or fixed."
+                ));
+                self.set_notice(
+                    format!("Failed to load settings: {err}. Query history recording paused."),
+                    true,
+                );
+            }
+        }
+    }
+
+    pub fn persist_settings(&mut self) {
         if !self.persist_enabled {
             return;
         }
         let store = SettingsStore::at(self.settings_path.clone());
         let settings = AppSettings {
             appearance: pref_from_appearance(self.appearance),
+            record_query_history: self.record_query_history,
             ..AppSettings::default()
         };
-        drop(store.save(&settings));
+        match store.save(&settings) {
+            Ok(()) => {
+                let had_error = self.settings_save_error.take().is_some();
+                if had_error
+                    && self.status_notice.as_ref().is_some_and(|n| {
+                        n.is_error
+                            && (n.message.starts_with("Failed to save settings:")
+                                || n.message.starts_with("Failed to load settings:"))
+                    })
+                {
+                    self.status_notice = None;
+                }
+            }
+            Err(err) => {
+                self.settings_save_error = Some(format!(
+                    "Failed to save settings to disk ({err}). Changes apply to this session only and will reset on restart."
+                ));
+                self.set_notice(format!("Failed to save settings: {err}"), true);
+            }
+        }
     }
 
     pub fn set_appearance(&mut self, scheme: ColorScheme, tx: &mut Tx) {
         self.appearance = scheme;
         tx.set_color_scheme(scheme);
         self.persist_settings();
+    }
+
+    pub fn set_record_query_history(&mut self, enabled: bool) {
+        self.record_query_history = enabled;
+        self.persist_settings();
+    }
+
+    pub fn toggle_active_query_tab_history(&mut self) {
+        let global_enabled = self.record_query_history;
+        if let Some(tab) = self.active_session_mut().and_then(SessionState::active_query_tab_mut) {
+            let next = !tab.effective_record_history(global_enabled);
+            tab.record_history_override = Some(next);
+        }
     }
 
     pub fn open_settings(&mut self) {
@@ -5316,16 +5710,39 @@ fn unpack_batch(tab_id: TabId, result_gen: u64, batch: QueryBatchResult) -> Batc
     }
 }
 
-fn statements_for_current(editor: &TextEdit, engine: DbEngine) -> Option<(Vec<String>, String)> {
+fn statements_for_all(
+    text: &str,
+    engine: DbEngine,
+    sql_mode: SqlSessionMode,
+) -> Option<(Vec<String>, String)> {
+    let stmts = split_statements_for_engine_with_session_mode(text, engine, sql_mode);
+    if stmts.is_empty() {
+        return None;
+    }
+    let sql_text = trim_sql_whitespace_for_engine(engine, text).to_owned();
+    Some((stmts.into_iter().map(|s| s.sql).collect(), sql_text))
+}
+
+fn statements_for_current(
+    editor: &TextEdit,
+    engine: DbEngine,
+    sql_mode: SqlSessionMode,
+) -> Option<(Vec<String>, String)> {
     if editor.anchor != editor.focus {
         let sel = editor.selected();
-        let stmts = split_statements_for_engine(sel, engine);
+        let stmts = split_statements_for_engine_with_session_mode(sel, engine, sql_mode.clone());
         if !stmts.is_empty() {
             let texts = stmts.into_iter().map(|s| s.sql).collect();
-            return Some((texts, sel.trim().to_owned()));
+            return Some((texts, trim_sql_whitespace_for_engine(engine, sel).to_owned()));
         }
     }
-    let stmt = statement_at_cursor_for_engine(&editor.text, editor.anchor, editor.focus, engine)?;
+    let stmt = statement_at_cursor_for_engine_with_session_mode(
+        &editor.text,
+        editor.anchor,
+        editor.focus,
+        engine,
+        sql_mode,
+    )?;
     let sql = stmt.sql;
     Some((vec![sql.clone()], sql))
 }
@@ -5358,4 +5775,94 @@ fn connection_matches_search(c: &ConnectionProfile, query_lower: &str) -> bool {
         || c.file_path
             .as_ref()
             .is_some_and(|p| p.to_string_lossy().to_ascii_lowercase().contains(query_lower))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_mode_updated_ignores_stale_sequence_and_query_completed_preserves_mode() {
+        let profile = ConnectionProfile::new_postgres("greendale_pg", "127.0.0.1", "troy");
+        let conn_id = profile.id;
+        let mut state = AppState::init_in_memory(StoreData {
+            connections: vec![profile.clone()],
+            ..StoreData::default()
+        });
+        let sid = SessionId::new(1);
+        let connect_req_id = RequestId::new(1);
+        let mut sess = SessionState::new(sid, profile, connect_req_id);
+        sess.status = ConnectionState::Connected(Box::new(ConnectedData {
+            server_version: "PostgreSQL 18.6".to_owned(),
+            mode_seq: 0,
+            mysql_quote_mode: None,
+            postgres_session_mode: Some(PostgresSessionMode::new(true)),
+            databases: Vec::new(),
+            active_database: Some("greendale".to_owned()),
+            schemas: Vec::new(),
+            active_schema: Some("public".to_owned()),
+            objects: Vec::new(),
+            expanded_columns: HashMap::new(),
+            selected_object: None,
+        }));
+        let tid_a = state.alloc_tab_id();
+        let tid_b = state.alloc_tab_id();
+        sess.tabs.push(WorkspaceTab::new_query(tid_a, "Tab A".to_owned(), String::new(), None));
+        sess.tabs.push(WorkspaceTab::new_query(tid_b, "Tab B".to_owned(), String::new(), None));
+        state.sessions.insert(sid, sess);
+        state.screen = Screen::Workspace(sid);
+
+        let newer_mode = PostgresSessionMode::new(false);
+        let older_mode = PostgresSessionMode::new(true);
+        let mut tx = rune::Tx::default();
+
+        // Tab B's newer mode update (mode_seq = 2) arrives first.
+        state.handle_worker_event(
+            WorkerEvent::SessionModeUpdated {
+                session_id: sid,
+                connect_req_id,
+                mode_seq: 2,
+                mysql_quote_mode: None,
+                postgres_session_mode: Some(newer_mode.clone()),
+            },
+            &mut tx,
+        );
+        // Delayed older mode update (mode_seq = 1) must be ignored.
+        state.handle_worker_event(
+            WorkerEvent::SessionModeUpdated {
+                session_id: sid,
+                connect_req_id,
+                mode_seq: 1,
+                mysql_quote_mode: None,
+                postgres_session_mode: Some(older_mode),
+            },
+            &mut tx,
+        );
+        // Delayed QueryCompleted from Tab A carries no mode fields and preserves newer_mode.
+        state.handle_worker_event(
+            WorkerEvent::QueryCompleted {
+                session_id: sid,
+                tab_id: tid_a,
+                req_id: RequestId::new(10),
+                result: Ok(QueryBatchResult {
+                    results: Vec::new(),
+                    total_elapsed_ms: 1,
+                    cancelled: false,
+                }),
+                logs: Vec::new(),
+                recorded_history: None,
+            },
+            &mut tx,
+        );
+
+        let Some(cur) = state.sessions.get(&sid) else {
+            panic!("missing session");
+        };
+        assert_eq!(cur.postgres_session_mode(), Some(newer_mode));
+        assert_eq!(
+            cur.status.as_connected().map(|c| c.mode_seq),
+            Some(2)
+        );
+        assert_eq!(conn_id, cur.profile.id);
+    }
 }

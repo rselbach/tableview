@@ -13,6 +13,7 @@ chrono.workspace = true
 directories.workspace = true
 mysql_async.workspace = true
 rusqlite.workspace = true
+rustix.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 rustls-pki-types.workspace = true
@@ -20,6 +21,7 @@ rustls-webpki.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
@@ -28,5 +30,5 @@ url.workspace = true
 uuid.workspace = true
 webpki-roots.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+exacl.workspace = true

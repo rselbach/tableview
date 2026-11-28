@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::{Map, Number, Value};
 
 use crate::connection::DbEngine;
@@ -144,21 +146,39 @@ fn push_csv_field(out: &mut String, raw: &str) {
     out.push('"');
 }
 
+fn unique_json_keys(columns: &[ColumnMeta]) -> Vec<String> {
+    // Pre-reserve all original column names so disambiguating duplicates never shadows another column.
+    let mut used: HashSet<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let mut first_seen: HashSet<&str> = HashSet::with_capacity(columns.len());
+    let mut keys = Vec::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        if first_seen.insert(col.name.as_str()) {
+            keys.push(col.name.clone());
+        } else {
+            let mut suffix = idx;
+            let key = loop {
+                let candidate = format!("{}_{suffix}", col.name);
+                if used.insert(candidate.clone()) {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// Encodes rows as a pretty-printed JSON array, preserving booleans, integers, floats, nulls, and JSONB values.
 pub fn export_json(columns: &[ColumnMeta], rows: &[Vec<CellValue>]) -> String {
+    let keys = unique_json_keys(columns);
     let items: Vec<Value> = rows
         .iter()
         .map(|row| {
             let mut obj = Map::new();
-            for (idx, col) in columns.iter().enumerate() {
+            for (idx, key) in keys.iter().enumerate() {
                 let val = row.get(idx).unwrap_or(&CellValue::Null);
-                let json_val = cell_to_json(val);
-                // Preserve duplicate column names cleanly if a SQL query returned duplicate aliases.
-                if !obj.contains_key(&col.name) {
-                    obj.insert(col.name.clone(), json_val);
-                } else {
-                    obj.insert(format!("{}_{idx}", col.name), json_val);
-                }
+                obj.insert(key.clone(), cell_to_json(val));
             }
             Value::Object(obj)
         })

@@ -415,6 +415,10 @@ pub enum DbError {
     DisconnectedBeforeDispatch(Box<DbError>),
     #[error("query cancelled by user")]
     Cancelled,
+    #[error("MySQL session quote mode or server version changed before dispatch; re-run to inspect under the current mode")]
+    MysqlModeMismatch,
+    #[error("PostgreSQL string escaping mode changed before dispatch; re-run to inspect under the current mode")]
+    PostgresStringModeMismatch,
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -510,6 +514,19 @@ pub struct FkPeekRow {
 pub trait DbSession: Send + Sync {
     fn engine(&self) -> DbEngine;
     fn server_info(&self) -> &ServerInfo;
+    /// Returns live MySQL session quoting flags when backed by a MySQL/MariaDB session.
+    fn mysql_quote_mode(&self) -> Option<crate::sql::MysqlQuoteMode> {
+        None
+    }
+    /// Returns live PostgreSQL session string-escaping and transaction state when backed by PostgreSQL.
+    fn postgres_session_mode(&self) -> Option<crate::sql::PostgresSessionMode> {
+        None
+    }
+    /// Returns live PostgreSQL `standard_conforming_strings` state when backed by a PostgreSQL session.
+    fn postgres_standard_conforming_strings(&self) -> Option<bool> {
+        self.postgres_session_mode()
+            .map(|mode| mode.standard_conforming_strings)
+    }
     /// Returns `true` when the underlying transport is already known to be closed.
     fn is_disconnected(&self) -> bool {
         false
@@ -537,11 +554,108 @@ pub trait DbSession: Send + Sync {
         }
         self.execute_sql(statements, row_limit).await
     }
+    /// Executes SQL after verifying that any live MySQL quote mode/version or PostgreSQL
+    /// `standard_conforming_strings` setting matches `expected_sql_mode` on the dispatch connection.
+    async fn execute_sql_cancellable_checked(
+        &self,
+        statements: &[String],
+        row_limit: Option<usize>,
+        cancel_key: u64,
+        cancel_flag: Option<&std::sync::atomic::AtomicBool>,
+        expected_sql_mode: crate::sql::SqlSessionMode,
+    ) -> Result<(QueryBatchResult, Vec<ExecutedSql>), DbError> {
+        match self.engine() {
+            DbEngine::Mysql => {
+                let live_mode = self.mysql_quote_mode();
+                if live_mode != expected_sql_mode.mysql {
+                    return Err(DbError::MysqlModeMismatch);
+                }
+                if let Err(msg) = crate::sql::validate_mysql_single_statement_batch(statements, live_mode) {
+                    return Err(DbError::InvalidInput(msg));
+                }
+            }
+            DbEngine::Postgres => {
+                if let Some(ref expected_pg) = expected_sql_mode.postgres {
+                    if self.postgres_session_mode().as_ref() != Some(expected_pg) {
+                        return Err(DbError::PostgresStringModeMismatch);
+                    }
+                    let mut tracker = crate::sql::PgScsTracker::from_mode(expected_pg);
+                    for raw_stmt in statements {
+                        let stmt = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Postgres, raw_stmt);
+                        if stmt.is_empty() {
+                            continue;
+                        }
+                        let is_multi = match tracker.active {
+                            Some(scs) => crate::sql::postgres_slice_has_multiple_statements(stmt, scs),
+                            None => {
+                                crate::sql::postgres_slice_has_multiple_statements(stmt, true)
+                                    || crate::sql::postgres_slice_has_multiple_statements(stmt, false)
+                            }
+                        };
+                        if is_multi {
+                            return Err(DbError::InvalidInput(
+                                "PostgreSQL statement contains multiple semicolon-separated statements; split statements before executing"
+                                    .to_owned(),
+                            ));
+                        }
+                        tracker.apply(stmt);
+                    }
+                }
+            }
+            DbEngine::Sqlite => {}
+        }
+        self.execute_sql_cancellable(statements, row_limit, cancel_key, cancel_flag)
+            .await
+    }
     async fn execute_transaction(
         &self,
         statements: &[String],
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError>;
     async fn explain_sql(&self, statement: &str, analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError>;
+    /// Explains SQL after verifying that any live MySQL quote mode/version or PostgreSQL
+    /// `standard_conforming_strings` setting matches `expected_sql_mode` on the dispatch connection.
+    async fn explain_sql_checked(
+        &self,
+        statement: &str,
+        analyze: bool,
+        expected_sql_mode: crate::sql::SqlSessionMode,
+    ) -> Result<(ExplainPlan, ExecutedSql), DbError> {
+        match self.engine() {
+            DbEngine::Mysql => {
+                let live_mode = self.mysql_quote_mode();
+                if live_mode != expected_sql_mode.mysql {
+                    return Err(DbError::MysqlModeMismatch);
+                }
+                if crate::sql::mysql_slice_has_multiple_statements(
+                    crate::sql::trim_sql_whitespace_for_engine(DbEngine::Mysql, statement),
+                    live_mode,
+                ) {
+                    return Err(DbError::InvalidInput(
+                        "cannot EXPLAIN a MySQL slice containing multiple statements; select or split a single statement"
+                            .to_owned(),
+                    ));
+                }
+            }
+            DbEngine::Postgres => {
+                if let Some(ref expected_pg) = expected_sql_mode.postgres {
+                    if self.postgres_session_mode().as_ref() != Some(expected_pg) {
+                        return Err(DbError::PostgresStringModeMismatch);
+                    }
+                    if crate::sql::postgres_slice_has_multiple_statements(
+                        crate::sql::trim_sql_whitespace_for_engine(DbEngine::Postgres, statement),
+                        expected_pg.standard_conforming_strings,
+                    ) {
+                        return Err(DbError::InvalidInput(
+                            "cannot EXPLAIN a PostgreSQL slice containing multiple statements; select or split a single statement"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+            DbEngine::Sqlite => {}
+        }
+        self.explain_sql(statement, analyze).await
+    }
     async fn fetch_fk_row(
         &self,
         fk: &ForeignKeyRef,

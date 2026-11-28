@@ -5,7 +5,7 @@ use tv_update::UpdateStatus;
 use crate::platform::{self, Action};
 use crate::state::{AppState, OverlayState};
 
-/// Builds the application Settings modal dialog (`Appearance` and `Updates`).
+/// Builds the application Settings modal dialog (`Appearance`, `History`, and `Updates`).
 pub fn build_settings_modal(s: &AppState, k: &Kit, layer: &mut Vec<El>) {
     let c = &k.c;
     let scheme_idx = match s.appearance {
@@ -195,7 +195,45 @@ pub fn build_settings_modal(s: &AppState, k: &Kit, layer: &mut Vec<El>) {
                 ),
         );
 
-    let body = col()
+    let history_switch = Switch::new(s.record_query_history)
+        .label("Record query history")
+        .hide_label()
+        .on_toggle(|s: &mut AppState| s.set_record_query_history(!s.record_query_history))
+        .build(k)
+        .key("settings-record-history-switch");
+
+    let history_card = col()
+        .key("settings-history-card")
+        .w_full()
+        .padding(12.0)
+        .gap(10.0)
+        .radius(k.radius.md)
+        .fill(c.layer_02)
+        .border(0.5, c.border_muted)
+        .child(
+            row()
+                .w_full()
+                .gap(12.0)
+                .center_y()
+                .child(
+                    col()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .gap(2.0)
+                        .child(text("Record query history").font(k.ty.ui_medium).color(c.text_base))
+                        .child(
+                            text("Save executed SQL statements to local query history by default. Individual query tabs can override this.")
+                                .font(k.ty.caption())
+                                .color(c.text_muted)
+                                .wrap()
+                                .w_full(),
+                        ),
+                )
+                .child(history_switch),
+        );
+
+    let mut body = col()
         .key("settings-body")
         .w_full()
         .px(20.0)
@@ -218,27 +256,51 @@ pub fn build_settings_modal(s: &AppState, k: &Kit, layer: &mut Vec<El>) {
                 .w_full()
                 .gap(6.0)
                 .child(
+                    text("HISTORY")
+                        .font(k.ty.small_medium)
+                        .color(c.text_faint)
+                        .px(2.0),
+                )
+                .child(history_card),
+        )
+        .child(
+            col()
+                .w_full()
+                .gap(6.0)
+                .child(
                     text("UPDATES")
                         .font(k.ty.small_medium)
                         .color(c.text_faint)
                         .px(2.0),
                 )
                 .child(updates_card),
-        )
-        .child(
-            row()
-                .w_full()
-                .pt(2.0)
-                .child(spacer())
-                .child(
-                    Button::new("Done")
-                        .variant(ButtonVariant::Contrast)
-                        .control_size(ControlSize::Regular)
-                        .on_press(|s: &mut AppState| s.overlay = OverlayState::None)
-                        .build(k)
-                        .key("settings-done-btn"),
-                ),
         );
+
+    if let Some(ref err) = s.settings_save_error {
+        body = body.child(
+            text(err)
+                .key("settings-save-error")
+                .font(k.ty.caption())
+                .color(c.danger.fg)
+                .wrap()
+                .w_full(),
+        );
+    }
+
+    body = body.child(
+        row()
+            .w_full()
+            .pt(2.0)
+            .child(spacer())
+            .child(
+                Button::new("Done")
+                    .variant(ButtonVariant::Contrast)
+                    .control_size(ControlSize::Regular)
+                    .on_press(|s: &mut AppState| s.overlay = OverlayState::None)
+                    .build(k)
+                    .key("settings-done-btn"),
+            ),
+    );
 
     Dialog::new("settings-modal", "Settings")
         .open(true)

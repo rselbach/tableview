@@ -6,6 +6,7 @@ use rune_kit::{
     Button, ButtonVariant, Cell, Checkbox, ControlSize, Dialog, Field, Kit, Placement, RollingText, Select,
     SelectAppearance, Spinner, Table, TableColumn, TextInput,
 };
+use tv_core::DbEngine;
 
 use crate::icons;
 use crate::state::{
@@ -26,7 +27,14 @@ pub fn build_query_tab(
     cx: &Cx<AppState>,
     layer: &mut Vec<El>,
 ) -> El {
-    let action_bar = build_action_bar(tab, k, layer);
+    let action_bar = build_action_bar(
+        tab,
+        session.profile.engine,
+        session.sql_mode(),
+        s.record_query_history,
+        k,
+        layer,
+    );
 
     let split_key = format!("query-split-body-{}", tab.tab_id.get());
     let total_h = cx.layout_size(&split_key).map_or(540.0, |sz| sz[1]).max(260.0);
@@ -55,10 +63,32 @@ pub fn build_query_tab(
         .child(split_body)
 }
 
-fn build_action_bar(tab: &QueryTabState, k: &Kit, layer: &mut Vec<El>) -> El {
+fn build_action_bar(
+    tab: &QueryTabState,
+    engine: DbEngine,
+    sql_mode: tv_core::SqlSessionMode,
+    record_query_history: bool,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) -> El {
     let c = &k.c;
     let (line, col_num) = tab.cursor_line_col();
     let timer_font = k.ty.small.mono().features("'tnum'");
+    let tab_recording = tab.effective_record_history(record_query_history);
+    let (current_excluded, buffer_excluded) = if tab_recording {
+        tab.history_indicator_exclusions(engine, sql_mode)
+    } else {
+        (false, false)
+    };
+    let history_label = if !tab_recording {
+        "History Off"
+    } else if current_excluded {
+        "History Skipped"
+    } else if buffer_excluded {
+        "History: Current Only"
+    } else {
+        "History On"
+    };
 
     let mut left = row()
         .gap(8.0)
@@ -68,6 +98,14 @@ fn build_action_bar(tab: &QueryTabState, k: &Kit, layer: &mut Vec<El>) -> El {
                 .key("query-cursor-pos")
                 .font(timer_font)
                 .color(c.text_muted),
+        )
+        .child(
+            Button::new(history_label)
+                .variant(ButtonVariant::GhostMuted)
+                .control_size(ControlSize::Small)
+                .on_press(|s: &mut AppState| s.toggle_active_query_tab_history())
+                .build(k)
+                .key("query-history-toggle-btn"),
         );
 
     if tab.is_dirty() {

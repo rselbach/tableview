@@ -61,7 +61,10 @@ pub fn build_explain_sql(statement: &str, analyze: bool) -> String {
 
 /// Builds the dialect-appropriate `EXPLAIN` query string for `engine`.
 pub fn build_explain_sql_for_engine(engine: DbEngine, statement: &str, analyze: bool) -> String {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let trimmed = crate::sql::trim_sql_whitespace_for_engine(
+        engine,
+        crate::sql::trim_sql_whitespace_for_engine(engine, statement).trim_end_matches(';'),
+    );
     match engine {
         DbEngine::Postgres => {
             if analyze {

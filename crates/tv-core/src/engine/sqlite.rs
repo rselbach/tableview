@@ -477,7 +477,7 @@ impl DbSession for SqliteSession {
             let mut cancelled = false;
 
             for raw_stmt in &statements {
-                let stmt_sql = raw_stmt.trim();
+                let stmt_sql = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Sqlite, raw_stmt);
                 if stmt_sql.is_empty() {
                     continue;
                 }
@@ -572,7 +572,7 @@ impl DbSession for SqliteSession {
             });
 
             for raw_stmt in &statements {
-                let stmt_sql = raw_stmt.trim();
+                let stmt_sql = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Sqlite, raw_stmt);
                 if stmt_sql.is_empty() {
                     continue;
                 }
@@ -633,7 +633,7 @@ impl DbSession for SqliteSession {
     }
 
     async fn explain_sql(&self, statement: &str, _analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError> {
-        let trimmed = statement.trim().to_owned();
+        let trimmed = crate::sql::trim_sql_whitespace_for_engine(DbEngine::Sqlite, statement).to_owned();
         if trimmed.is_empty() {
             return Err(DbError::InvalidInput(
                 "cannot explain an empty SQL statement".to_owned(),

@@ -560,7 +560,11 @@ fn build_sidebar(s: &AppState, session: &SessionState, k: &Kit, layer: &mut Vec<
             if matches.is_empty() {
                 sb = sb.child(sidebar_message(
                     if session.query_history.is_empty() {
-                        "No executed SQL queries recorded yet."
+                        if s.record_query_history {
+                            "No executed SQL queries recorded yet."
+                        } else {
+                            "Query history recording is paused in Settings."
+                        }
                     } else {
                         "No history entries match your search."
                     },

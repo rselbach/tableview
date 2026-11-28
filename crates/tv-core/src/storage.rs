@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -31,10 +33,16 @@ pub struct AppSettings {
     pub version: u32,
     #[serde(default)]
     pub appearance: AppearancePreference,
+    #[serde(default = "default_record_query_history")]
+    pub record_query_history: bool,
 }
 
 const fn default_settings_version() -> u32 {
     SETTINGS_SCHEMA_VERSION
+}
+
+const fn default_record_query_history() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -42,6 +50,7 @@ impl Default for AppSettings {
         Self {
             version: SETTINGS_SCHEMA_VERSION,
             appearance: AppearancePreference::System,
+            record_query_history: true,
         }
     }
 }
@@ -209,7 +218,7 @@ impl ConnectionStore {
 
     /// Atomically writes connection data via a temporary sibling file and rename.
     pub fn save(&self, data: &StoreData) -> Result<(), StorageError> {
-        atomic_write_json(&self.path, data, "connections.json")
+        atomic_write_json(&self.path, data)
     }
 }
 
@@ -244,35 +253,247 @@ impl SettingsStore {
     pub fn load(&self) -> Result<AppSettings, StorageError> {
         match fs::read_to_string(&self.path) {
             Ok(raw) => serde_json::from_str(&raw).map_err(|e| StorageError::Parse(e.to_string())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AppSettings::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match fs::symlink_metadata(&self.path) {
+                Ok(_) => Err(StorageError::Io(format!(
+                    "settings file {} is a dangling symbolic link",
+                    self.path.display()
+                ))),
+                Err(meta_err) if meta_err.kind() == std::io::ErrorKind::NotFound => {
+                    if path_or_ancestor_is_dangling_symlink(&self.path) {
+                        Err(StorageError::Io(format!(
+                            "settings path {} traverses a dangling symbolic link",
+                            self.path.display()
+                        )))
+                    } else {
+                        Ok(AppSettings::default())
+                    }
+                }
+                Err(meta_err) => Err(StorageError::Io(meta_err.to_string())),
+            },
             Err(err) => Err(StorageError::Io(err.to_string())),
         }
     }
 
     /// Atomically writes settings via a temporary sibling file and rename.
     pub fn save(&self, settings: &AppSettings) -> Result<(), StorageError> {
-        atomic_write_json(&self.path, settings, "settings.json")
+        atomic_write_json(&self.path, settings)
     }
 }
 
-fn atomic_write_json<T: Serialize>(path: &Path, data: &T, fallback_name: &str) -> Result<(), StorageError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| StorageError::Io(e.to_string()))?;
+fn path_or_ancestor_is_dangling_symlink(path: &Path) -> bool {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if let Ok(meta) = fs::symlink_metadata(ancestor)
+            && meta.file_type().is_symlink()
+            && fs::metadata(ancestor).is_err()
+        {
+            return true;
+        }
     }
-    let encoded = serde_json::to_vec_pretty(data).map_err(|e| StorageError::Serialize(e.to_string()))?;
-    let tmp_name = format!(
-        ".{}.tmp.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or(fallback_name),
-        std::process::id()
-    );
-    let tmp_path = path.with_file_name(tmp_name);
-    {
-        let mut file = fs::File::create(&tmp_path).map_err(|e| StorageError::Io(e.to_string()))?;
-        file.write_all(&encoded).map_err(|e| StorageError::Io(e.to_string()))?;
-        file.sync_all().map_err(|e| StorageError::Io(e.to_string()))?;
+    false
+}
+
+fn resolve_atomic_write_target(path: &Path) -> std::io::Result<PathBuf> {
+    const MAX_SYMLINK_HOPS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link_target = fs::read_link(&current)?;
+                current = if link_target.is_absolute() {
+                    link_target
+                } else {
+                    match current.parent() {
+                        Some(parent) if !parent.as_os_str().is_empty() => parent.join(link_target),
+                        _ => Path::new(".").join(link_target),
+                    }
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(err) => return Err(err),
+        }
     }
-    fs::rename(&tmp_path, path).map_err(|e| StorageError::Io(e.to_string()))?;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("too many levels of symbolic links while resolving {}", path.display()),
+    ))
+}
+
+/// Atomically writes `bytes` to `path` (following symlinks) via a unique same-directory temporary file,
+/// `sync_all`, metadata/ACL preservation, and rename.
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let target = resolve_atomic_write_target(path)?;
+    let parent = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent)?;
+    let existing_meta = match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_file() => Some(meta),
+        Ok(meta) if meta.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                format!("cannot atomically write to directory {}", target.display()),
+            ));
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cannot atomically replace non-regular file {}", target.display()),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+    if existing_meta.is_some() {
+        // Require write permission on the destination before creating a replacement inode.
+        drop(fs::OpenOptions::new().write(true).open(&target)?);
+    }
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tableview-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    if let Some(dest_meta) = existing_meta {
+        #[cfg(unix)]
+        {
+            let tmp_meta = tmp.as_file().metadata()?;
+            let owner = (dest_meta.uid() != tmp_meta.uid()).then(|| rustix::fs::Uid::from_raw(dest_meta.uid()));
+            let group = (dest_meta.gid() != tmp_meta.gid()).then(|| rustix::fs::Gid::from_raw(dest_meta.gid()));
+            if owner.is_some() || group.is_some() {
+                rustix::fs::fchown(tmp.as_file(), owner, group)
+                    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
+            }
+        }
+        tmp.as_file().set_permissions(dest_meta.permissions())?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        preserve_xattrs(&target, tmp.as_file())?;
+        #[cfg(target_os = "macos")]
+        preserve_macos_acl(&target, tmp.path())?;
+    }
+    if let Err(persist_err) = tmp.persist(&target) {
+        #[cfg(target_os = "macos")]
+        clear_macos_acl_best_effort(persist_err.file.path());
+        return Err(persist_err.error);
+    }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_missing_xattr(err: rustix::io::Errno) -> bool {
+    // macOS ENOATTR = 93, Linux ENODATA = 61
+    err == rustix::io::Errno::NOENT || err.raw_os_error() == 93 || err.raw_os_error() == 61
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn list_xattr_names(path: &Path) -> std::io::Result<Vec<u8>> {
+    for _ in 0..4 {
+        let size = match rustix::fs::listxattr_query(path) {
+            Ok(size) => size,
+            Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS | rustix::io::Errno::NOENT) => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(std::io::Error::from_raw_os_error(err.raw_os_error())),
+        };
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; size];
+        match rustix::fs::listxattr(path, &mut *buf) {
+            Ok(len) => {
+                buf.truncate(len);
+                return Ok(buf);
+            }
+            Err(rustix::io::Errno::RANGE) => continue,
+            Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS | rustix::io::Errno::NOENT) => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(std::io::Error::from_raw_os_error(err.raw_os_error())),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(
+        rustix::io::Errno::RANGE.raw_os_error(),
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_xattr_value(path: &Path, name: &std::ffi::CStr) -> std::io::Result<Option<Vec<u8>>> {
+    for _ in 0..4 {
+        let size = match rustix::fs::getxattr_query(path, name) {
+            Ok(size) => size,
+            Err(err) if is_missing_xattr(err) => return Ok(None),
+            Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => return Ok(None),
+            Err(err) => return Err(std::io::Error::from_raw_os_error(err.raw_os_error())),
+        };
+        if size == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let mut val = vec![0u8; size];
+        match rustix::fs::getxattr(path, name, &mut *val) {
+            Ok(len) => {
+                val.truncate(len);
+                return Ok(Some(val));
+            }
+            Err(rustix::io::Errno::RANGE) => continue,
+            Err(err) if is_missing_xattr(err) => return Ok(None),
+            Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => return Ok(None),
+            Err(err) => return Err(std::io::Error::from_raw_os_error(err.raw_os_error())),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(
+        rustix::io::Errno::RANGE.raw_os_error(),
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preserve_xattrs(src: &Path, dst_file: &std::fs::File) -> std::io::Result<()> {
+    let names = list_xattr_names(src)?;
+    for raw_name in names.split(|&b| b == 0) {
+        if raw_name.is_empty() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        if raw_name == b"com.apple.provenance" || raw_name == b"com.apple.macl" {
+            continue;
+        }
+        let Ok(c_name) = std::ffi::CString::new(raw_name) else {
+            continue;
+        };
+        let Some(value) = read_xattr_value(src, &c_name)? else {
+            continue;
+        };
+        if let Err(err) =
+            rustix::fs::fsetxattr(dst_file, &c_name, &value, rustix::fs::XattrFlags::empty())
+            && !matches!(err, rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS)
+        {
+            return Err(std::io::Error::from_raw_os_error(err.raw_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_macos_acl_best_effort(path: &Path) {
+    drop(exacl::setfacl(&[path], &[], None));
+}
+
+#[cfg(target_os = "macos")]
+fn preserve_macos_acl(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let src_acls = exacl::getfacl(src, None)?;
+    let dst_acls = exacl::getfacl(dst, None)?;
+    if src_acls == dst_acls {
+        return Ok(());
+    }
+    exacl::setfacl(&[dst], &src_acls, None)
+}
+
+fn atomic_write_json<T: Serialize>(path: &Path, data: &T) -> Result<(), StorageError> {
+    let encoded = serde_json::to_vec_pretty(data).map_err(|e| StorageError::Serialize(e.to_string()))?;
+    atomic_write_bytes(path, &encoded).map_err(|e| StorageError::Io(e.to_string()))
 }
 
 /// Errors produced when loading or persisting connection storage.
