@@ -77,6 +77,7 @@ pub fn build_drawer(s: &AppState, session: &SessionState, tab: &TableTabState, k
 
     let can_commit = tab.staged.has_changes()
         && !tab.committing
+        && tab.can_edit_table(session.profile.safety).is_ok()
         && session.profile.safety != SafetyPolicy::ReadOnly;
 
     header = header

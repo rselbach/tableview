@@ -472,17 +472,31 @@ fn live_sqlite_full_session_introspection_crud_explain_and_readonly() {
         staged.stage_insert_cell_edit(draft, 11, StagedCellValue::Literal("2026-11-21T10:00:00Z".to_owned()));
         staged.stage_insert_cell_edit(draft, 12, StagedCellValue::Literal("1".to_owned()));
 
-        // Delete Jeff (student_id = 4); delete enrollment first or test delete on Jeff after clearing FK
-        // Wait: Jeff has no enrollments in seed data!
-        staged.toggle_delete_row(100, &page2.rows[1]);
-
-        let commit_stmts = staged
-            .build_statements_for_engine(DbEngine::Sqlite, "main", "students", &page1.columns)
-            .expect("build sqlite staged statements");
-        let (tx_out, tx_logs) = session
-            .execute_transaction(&commit_stmts)
+        // Refresh Jeff's row snapshot after earlier SQL UPDATE (student_id = 4) before staging delete
+        let (page2_fresh, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "students".to_owned(),
+                filter_where: Some("student_id = 4".to_owned()),
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
             .await
-            .expect("execute_transaction commit");
+            .expect("refresh jeff row after SQL update");
+        staged.toggle_delete_row_with_raw(
+            100,
+            &page2_fresh.rows[0],
+            page2_fresh.raw_row(0),
+        );
+
+        let commit_batch = staged
+            .build_commit_batch(DbEngine::Sqlite, "main", "students", &page1.columns)
+            .expect("build sqlite staged commit batch");
+        let (tx_out, tx_logs) = session
+            .execute_staged_mutations(&commit_batch)
+            .await
+            .expect("execute_staged_mutations commit");
         assert_eq!(tx_out.statements_executed, 3);
         assert_eq!(tx_out.total_rows_affected, 3);
         assert_eq!(tx_logs.len(), 5);
@@ -825,5 +839,427 @@ fn live_sqlite_cancellation_is_scoped_to_matching_query() {
             .await
             .expect("verify table after dropped future cancel");
         assert_eq!(verify_after_drop.results[0].rows.len(), 1);
+    });
+}
+
+#[test]
+fn live_sqlite_staged_mutations_enforce_typed_identity_null_pk_rejection_and_optimistic_concurrency() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("greendale_identity.db");
+    drop(rusqlite::Connection::open(&db_path).expect("create sqlite db file"));
+    let profile = ConnectionProfile::new_sqlite("Greendale Identity", &db_path);
+    let rt = Runtime::new().expect("create tokio runtime");
+
+    rt.block_on(async {
+        let (session, _) = connect_session(&profile, None, None)
+            .await
+            .expect("connect sqlite");
+
+        // 1. NULL PK rows in ordinary SQLite table must be rejected instead of corrupting sibling NULL rows.
+        session
+            .execute_sql(
+                &[
+                    "CREATE TABLE null_pks (id INT PRIMARY KEY, name TEXT)".to_owned(),
+                    "INSERT INTO null_pks VALUES (NULL, 'First'), (NULL, 'Second'), (10, 'Troy')".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed null_pks");
+
+        let (null_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "null_pks".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .expect("fetch null_pks");
+        assert!(
+            tv_core::validate_row_editable(
+                DbEngine::Sqlite,
+                &null_page.columns,
+                &null_page.rows[0],
+                null_page.raw_row(0),
+            )
+            .is_err()
+        );
+        assert!(
+            tv_core::validate_row_editable(
+                DbEngine::Sqlite,
+                &null_page.columns,
+                &null_page.rows[2],
+                null_page.raw_row(2),
+            )
+            .is_ok()
+        );
+        let mut null_edit = StagedChanges::new();
+        null_edit.stage_cell_edit_with_raw(
+            0,
+            &null_page.rows[0],
+            null_page.raw_row(0),
+            1,
+            StagedCellValue::Literal("Mutated".to_owned()),
+        );
+        assert!(matches!(
+            null_edit.build_commit_batch(DbEngine::Sqlite, "main", "null_pks", &null_page.columns),
+            Err(tv_core::StagingError::NullPrimaryKey { .. })
+        ));
+
+        // 2. Boolean-declared PK with mixed SQLite storage classes (Integer 1 vs Text 'true') decodes
+        // both to CellValue::Bool(true), so raw identity binding must update/delete ONLY the selected row.
+        session
+            .execute_sql(
+                &[
+                    "CREATE TABLE bool_keys (k BOOLEAN PRIMARY KEY, label TEXT)".to_owned(),
+                    "INSERT INTO bool_keys VALUES (1, 'troy_int'), ('true', 'abed_text')".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed bool_keys");
+
+        let (bool_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "bool_keys".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .expect("fetch bool_keys");
+        assert_eq!(bool_page.rows.len(), 2);
+        assert_eq!(bool_page.rows[0][0], CellValue::Bool(true));
+        assert_eq!(bool_page.rows[1][0], CellValue::Bool(true));
+
+        let text_idx = bool_page
+            .rows
+            .iter()
+            .position(|r| r[1] == CellValue::Text("abed_text".to_owned()))
+            .expect("find text PK row");
+        let mut bool_upd = StagedChanges::new();
+        bool_upd.stage_cell_edit_with_raw(
+            text_idx,
+            &bool_page.rows[text_idx],
+            bool_page.raw_row(text_idx),
+            1,
+            StagedCellValue::Literal("abed_updated".to_owned()),
+        );
+        let upd_batch = bool_upd
+            .build_commit_batch(DbEngine::Sqlite, "main", "bool_keys", &bool_page.columns)
+            .expect("build bool update");
+        let (out, _) = session
+            .execute_staged_mutations(&upd_batch)
+            .await
+            .expect("commit bool text PK update");
+        assert_eq!(out.total_rows_affected, 1);
+
+        let (verify_bool, _) = session
+            .execute_sql(
+                &["SELECT typeof(k), k, label FROM bool_keys ORDER BY label".to_owned()],
+                None,
+            )
+            .await
+            .expect("verify bool_keys after update");
+        assert_eq!(
+            verify_bool.results[0].rows[0],
+            vec![
+                CellValue::Text("text".to_owned()),
+                CellValue::Text("true".to_owned()),
+                CellValue::Text("abed_updated".to_owned()),
+            ]
+        );
+        assert_eq!(
+            verify_bool.results[0].rows[1],
+            vec![
+                CellValue::Text("integer".to_owned()),
+                CellValue::Int(1),
+                CellValue::Text("troy_int".to_owned()),
+            ]
+        );
+
+        let (bool_page2, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "bool_keys".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .expect("refetch bool_keys");
+        let text_idx2 = bool_page2
+            .rows
+            .iter()
+            .position(|r| r[1] == CellValue::Text("abed_updated".to_owned()))
+            .expect("find updated text row");
+        let mut bool_del = StagedChanges::new();
+        bool_del.toggle_delete_row_with_raw(
+            text_idx2,
+            &bool_page2.rows[text_idx2],
+            bool_page2.raw_row(text_idx2),
+        );
+        let del_batch = bool_del
+            .build_commit_batch(DbEngine::Sqlite, "main", "bool_keys", &bool_page2.columns)
+            .expect("build bool delete");
+        let (del_out, _) = session
+            .execute_staged_mutations(&del_batch)
+            .await
+            .expect("delete only text PK row");
+        assert_eq!(del_out.total_rows_affected, 1);
+
+        let (remain_bool, _) = session
+            .execute_sql(&["SELECT typeof(k), label FROM bool_keys".to_owned()], None)
+            .await
+            .expect("verify remaining int row");
+        assert_eq!(remain_bool.results[0].rows.len(), 1);
+        assert_eq!(
+            remain_bool.results[0].rows[0],
+            vec![CellValue::Text("integer".to_owned()), CellValue::Text("troy_int".to_owned())]
+        );
+
+        // 3. Optimistic concurrency rejects stale update and stale delete and rolls back whole batch.
+        session
+            .execute_sql(
+                &[
+                    "CREATE TABLE roster (id INT PRIMARY KEY, name TEXT, note TEXT)".to_owned(),
+                    "INSERT INTO roster VALUES (1, 'Annie', 'notes'), (2, 'Shirley', 'baking')".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed roster");
+        let (roster_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "roster".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "id".to_owned(),
+                    ascending: true,
+                }),
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .expect("fetch roster");
+
+        let mut stale_upd = StagedChanges::new();
+        stale_upd.stage_cell_edit_with_raw(
+            0,
+            &roster_page.rows[0],
+            roster_page.raw_row(0),
+            1,
+            StagedCellValue::Literal("Annie_Stale".to_owned()),
+        );
+        let ins = stale_upd.stage_insert_row(&roster_page.columns);
+        stale_upd.stage_insert_cell_edit(ins, 0, StagedCellValue::Literal("99".to_owned()));
+        stale_upd.stage_insert_cell_edit(ins, 1, StagedCellValue::Literal("ShouldRollback".to_owned()));
+        let stale_upd_batch = stale_upd
+            .build_commit_batch(DbEngine::Sqlite, "main", "roster", &roster_page.columns)
+            .expect("build stale update batch");
+
+        // Another connection mutates a non-edited column (`note`) concurrently!
+        session
+            .execute_sql(
+                &["UPDATE roster SET note = 'concurrent_edit' WHERE id = 1".to_owned()],
+                None,
+            )
+            .await
+            .expect("concurrent update");
+
+        let upd_conflict = session.execute_staged_mutations(&stale_upd_batch).await;
+        assert!(
+            matches!(upd_conflict, Err(DbError::StaleRowConflict(_))),
+            "expected StaleRowConflict on stale update, got {upd_conflict:?}"
+        );
+
+        let (roster_after_conflict, _) = session
+            .execute_sql(&["SELECT id, name, note FROM roster ORDER BY id".to_owned()], None)
+            .await
+            .expect("verify roster rolled back");
+        assert_eq!(roster_after_conflict.results[0].rows.len(), 2);
+        assert_eq!(
+            roster_after_conflict.results[0].rows[0],
+            vec![
+                CellValue::Int(1),
+                CellValue::Text("Annie".to_owned()),
+                CellValue::Text("concurrent_edit".to_owned()),
+            ]
+        );
+
+        // Concurrent delete before staged delete must fail with StaleRowConflict (not 0 rows ok).
+        let mut stale_del = StagedChanges::new();
+        stale_del.toggle_delete_row_with_raw(1, &roster_page.rows[1], roster_page.raw_row(1));
+        let stale_del_batch = stale_del
+            .build_commit_batch(DbEngine::Sqlite, "main", "roster", &roster_page.columns)
+            .expect("build stale del batch");
+        session
+            .execute_sql(&["DELETE FROM roster WHERE id = 2".to_owned()], None)
+            .await
+            .expect("concurrent delete");
+        let del_conflict = session.execute_staged_mutations(&stale_del_batch).await;
+        assert!(
+            matches!(del_conflict, Err(DbError::StaleRowConflict(_))),
+            "expected StaleRowConflict on deleted row, got {del_conflict:?}"
+        );
+
+        // 4. COLLATE NOCASE PK and text columns must still use BINARY comparison so case-only
+        // concurrent changes are caught as stale conflicts rather than silently overwriting.
+        session
+            .execute_sql(
+                &[
+                    "CREATE TABLE nocase_keys (code TEXT COLLATE NOCASE PRIMARY KEY, label TEXT COLLATE NOCASE)"
+                        .to_owned(),
+                    "INSERT INTO nocase_keys VALUES ('GREENDALE', 'StudyRoom'), ('ANNEX', 'RepairRoom')"
+                        .to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed nocase_keys");
+        let (nocase_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nocase_keys".to_owned(),
+                filter_where: None,
+                sort: Some(SortSpec {
+                    column: "code".to_owned(),
+                    ascending: true,
+                }),
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .expect("fetch nocase_keys");
+
+        let ann_idx = nocase_page
+            .rows
+            .iter()
+            .position(|r| r[0] == CellValue::Text("ANNEX".to_owned()))
+            .expect("find ANNEX row");
+        let grn_idx = nocase_page
+            .rows
+            .iter()
+            .position(|r| r[0] == CellValue::Text("GREENDALE".to_owned()))
+            .expect("find GREENDALE row");
+
+        let mut nocase_upd = StagedChanges::new();
+        nocase_upd.stage_cell_edit_with_raw(
+            ann_idx,
+            &nocase_page.rows[ann_idx],
+            nocase_page.raw_row(ann_idx),
+            1,
+            StagedCellValue::Literal("AirConditioning".to_owned()),
+        );
+        let nocase_upd_batch = nocase_upd
+            .build_commit_batch(DbEngine::Sqlite, "main", "nocase_keys", &nocase_page.columns)
+            .expect("build nocase update");
+
+        let mut nocase_del = StagedChanges::new();
+        nocase_del.toggle_delete_row_with_raw(
+            grn_idx,
+            &nocase_page.rows[grn_idx],
+            nocase_page.raw_row(grn_idx),
+        );
+        let nocase_del_batch = nocase_del
+            .build_commit_batch(DbEngine::Sqlite, "main", "nocase_keys", &nocase_page.columns)
+            .expect("build nocase delete");
+
+        session
+            .execute_sql(
+                &[
+                    "UPDATE nocase_keys SET label = 'repairroom' WHERE rowid = (SELECT rowid FROM nocase_keys WHERE code = 'ANNEX' COLLATE BINARY)".to_owned(),
+                    "UPDATE nocase_keys SET code = 'greendale' WHERE rowid = (SELECT rowid FROM nocase_keys WHERE code = 'GREENDALE' COLLATE BINARY)".to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("case-only concurrent mutations on nocase_keys");
+
+        let nocase_upd_err = session.execute_staged_mutations(&nocase_upd_batch).await;
+        assert!(
+            matches!(nocase_upd_err, Err(DbError::StaleRowConflict(_))),
+            "expected StaleRowConflict on case-only NOCASE column change, got {nocase_upd_err:?}"
+        );
+        let nocase_del_err = session.execute_staged_mutations(&nocase_del_batch).await;
+        assert!(
+            matches!(nocase_del_err, Err(DbError::StaleRowConflict(_))),
+            "expected StaleRowConflict on case-only NOCASE PK change, got {nocase_del_err:?}"
+        );
+        let (nocase_after, _) = session
+            .execute_sql(
+                &["SELECT code, label FROM nocase_keys ORDER BY code COLLATE BINARY".to_owned()],
+                None,
+            )
+            .await
+            .expect("verify nocase_keys untouched");
+        assert_eq!(
+            nocase_after.results[0].rows,
+            vec![
+                vec![
+                    CellValue::Text("ANNEX".to_owned()),
+                    CellValue::Text("repairroom".to_owned()),
+                ],
+                vec![
+                    CellValue::Text("greendale".to_owned()),
+                    CellValue::Text("StudyRoom".to_owned()),
+                ],
+            ]
+        );
+
+        // 5. Embedded NUL bytes in SQLite Copy SQL render via char(0) with zero raw NUL bytes and execute cleanly.
+        session
+            .execute_sql(
+                &[
+                    "CREATE TABLE nul_notes (id INT PRIMARY KEY, body TEXT, note TEXT)".to_owned(),
+                    "INSERT INTO nul_notes VALUES (1, 'a' || char(0) || 'b', 'x' || char(0, 0) || 'y')"
+                        .to_owned(),
+                ],
+                None,
+            )
+            .await
+            .expect("seed nul_notes");
+        let (nul_page, _) = session
+            .fetch_table_page(&PageRequest {
+                schema: "main".to_owned(),
+                table: "nul_notes".to_owned(),
+                filter_where: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("fetch nul_notes");
+        let mut nul_staged = StagedChanges::new();
+        nul_staged.stage_cell_edit_with_raw(
+            0,
+            &nul_page.rows[0],
+            nul_page.raw_row(0),
+            2,
+            StagedCellValue::Literal("m\0n".to_owned()),
+        );
+        let nul_batch = nul_staged
+            .build_commit_batch(DbEngine::Sqlite, "main", "nul_notes", &nul_page.columns)
+            .expect("build nul batch");
+        let nul_sql = nul_batch.render_sql(DbEngine::Sqlite).expect("render sqlite nul sql");
+        assert!(!nul_sql[0].contains('\0'), "rendered SQL must not contain raw NUL: {:?}", nul_sql[0]);
+        assert!(nul_sql[0].contains("char(0)"));
+        assert!(nul_sql[0].contains("char(0, 0)"));
+        session
+            .execute_sql(&nul_sql, None)
+            .await
+            .expect("execute rendered SQLite Copy SQL containing char(0)");
+        let (nul_hex, _) = session
+            .execute_sql(&["SELECT hex(note) FROM nul_notes WHERE id = 1".to_owned()], None)
+            .await
+            .expect("verify nul_notes update");
+        assert_eq!(nul_hex.results[0].rows[0][0], CellValue::Text("6D006E".to_owned()));
     });
 }

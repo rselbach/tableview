@@ -11,7 +11,7 @@ use rune_kit::{
 use tv_core::engine::encode_hex;
 use tv_core::{
     CellValue, ColumnMeta, DbEngine, DbObjectKind, ExportFormat, SafetyPolicy, StagedCellValue, TablePage,
-    TableStructure, build_fk_where_clause_for_engine, export_rows_for_engine,
+    TableStructure, TableTransactionSupport, build_fk_where_clause_for_engine, export_rows_for_engine,
 };
 
 use crate::icons;
@@ -149,11 +149,45 @@ pub fn build_table_tab(
         .min_h(0.0)
         .child(body);
 
+    if tab.view_mode == TableViewMode::Data
+        && tab.object_kind == DbObjectKind::Table
+        && session.profile.safety != SafetyPolicy::ReadOnly
+        && (tab.page.is_some() || tab.structure.is_some())
+        && !matches!(tab.transaction_support(), TableTransactionSupport::Supported)
+    {
+        root = root.child(build_nontransactional_banner(tab, k));
+    }
+
     if tab.view_mode == TableViewMode::Data && tab.staged.has_changes() {
         root = root.child(build_staged_banner(session, tab, k));
     }
 
     root.child(footer)
+}
+
+fn build_nontransactional_banner(tab: &TableTabState, k: &Kit) -> El {
+    let c = &k.c;
+    let msg = match tab.transaction_support() {
+        TableTransactionSupport::Unsupported { engine } => format!(
+            "Read-only grid: storage engine '{engine}' is non-transactional, so staged row edits cannot safely roll back."
+        ),
+        TableTransactionSupport::Unknown => {
+            "Read-only grid: storage engine transaction support could not be verified; staged edits are disabled."
+                .to_owned()
+        }
+        TableTransactionSupport::Supported => String::new(),
+    };
+    row()
+        .key("table-nontransactional-banner")
+        .w_full()
+        .h(32.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .fill(c.warning.bg)
+        .border_sides([1.0, 0.0, 0.0, 0.0], c.warning.border)
+        .child(icon(&icons::SHIELD, 13.0).color(c.warning.fg))
+        .child(text(msg).font(k.ty.small_medium).color(c.text_base))
 }
 
 fn build_staged_banner(session: &SessionState, tab: &TableTabState, k: &Kit) -> El {
@@ -872,8 +906,17 @@ fn build_row_context_menu(
     k: &Kit,
     layer: &mut Vec<El>,
 ) -> El {
-    let editable = tab.can_edit_table(session.profile.safety).is_ok()
-        && (matches!(row_key, RowKey::Draft(_)) || tab.has_primary_key());
+    let editable = match row_key {
+        RowKey::Draft(_) => tab.can_edit_table(session.profile.safety).is_ok(),
+        RowKey::Existing(idx) => tab.can_edit_existing_row(session.profile.safety, idx).is_ok(),
+    };
+    let delete_allowed = match row_key {
+        RowKey::Draft(_) => tab.can_edit_table(session.profile.safety).is_ok(),
+        RowKey::Existing(idx) => {
+            (tab.staged.is_row_deleted(idx) && tab.can_edit_table(session.profile.safety).is_ok())
+                || editable
+        }
+    };
     let target_col_idx = tab
         .selected_cell
         .filter(|(rk, _)| *rk == row_key)
@@ -913,7 +956,7 @@ fn build_row_context_menu(
         )
         .item(
             MenuItem::new(delete_label)
-                .disabled(!editable)
+                .disabled(!delete_allowed)
                 .on_select(move |s: &mut AppState| s.toggle_delete_row(row_key)),
         );
 
@@ -1635,7 +1678,10 @@ fn build_table_footer(session: &SessionState, tab: &TableTabState, k: &Kit, laye
         let can_delete = can_edit
             && tab.active_row_key().is_some_and(|rk| match rk {
                 RowKey::Draft(_) => true,
-                RowKey::Existing(_) => tab.has_primary_key(),
+                RowKey::Existing(idx) => {
+                    tab.staged.is_row_deleted(idx)
+                        || tab.can_edit_existing_row(session.profile.safety, idx).is_ok()
+                }
             });
         let can_export = tab.page.as_ref().is_some_and(|p| !p.columns.is_empty());
 

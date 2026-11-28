@@ -67,7 +67,7 @@ pub fn build(session: &SessionState, k: &Kit) -> El {
                             .map(|c| tab.staged.effective_existing_cell(idx, c).is_some())
                             .collect();
                         let editable =
-                            tab.can_edit_table(session.profile.safety).is_ok() && tab.has_primary_key();
+                            tab.can_edit_existing_row(session.profile.safety, idx).is_ok();
                         let row_num = (tab.offset + idx as i64 + 1).max(1) as usize;
                         Some(SelectedRowView {
                             row_number: row_num,

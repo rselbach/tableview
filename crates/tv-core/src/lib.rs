@@ -17,8 +17,9 @@ pub use connection::{
 };
 pub use engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
-    SortSpec, TablePage, TableStats, TableStructure, TransactionOutcome, connect_session, test_connection,
+    FkPeekRow, ForeignKeyRef, IndexInfo, MysqlRawValue, PageRequest, PostgresRawValue, QueryBatchResult,
+    QueryStatementResult, RawCellValue, SchemaInfo, ServerInfo, SortSpec, SqliteRawValue, TablePage, TableStats,
+    TableStructure, TableTransactionSupport, TransactionOutcome, connect_session, test_connection,
 };
 pub use explain::{ExplainError, ExplainNode, ExplainPlan, build_explain_sql, build_explain_sql_for_engine};
 pub use export::{
@@ -46,9 +47,10 @@ pub use sql::{
     validate_mysql_single_statement_batch,
 };
 pub use staging::{
-    DraftRowId, StagedCellValue, StagedChanges, StagedInsertRow, StagedRowUpdate, StagingError, build_fk_where_clause,
+    DraftRowId, StagedCellValue, StagedChanges, StagedColumnAssignment, StagedColumnValue, StagedCommitBatch,
+    StagedInsertRow, StagedMutation, StagedRowDelete, StagedRowUpdate, StagingError, build_fk_where_clause,
     build_fk_where_clause_for_engine, escape_mysql_string, escape_sql_string, format_cell_literal, format_literal,
-    format_pg_cell_literal, format_pg_literal,
+    format_mysql_string_literal, format_pg_cell_literal, format_pg_literal, validate_row_editable,
 };
 pub use storage::{
     AppSettings, AppearancePreference, ConnectionStore, SETTINGS_SCHEMA_VERSION, SettingsStore, SortOrder, StorageError,

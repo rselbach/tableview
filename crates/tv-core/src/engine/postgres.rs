@@ -20,11 +20,14 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 use crate::connection::{ConnectionProfile, DbEngine, PasswordMode, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
-    TablePage, TableStats, TableStructure, TransactionOutcome,
+    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, PostgresRawValue, QueryBatchResult, QueryStatementResult,
+    RawCellValue, SchemaInfo, ServerInfo, TablePage, TableStats, TableStructure, TableTransactionSupport,
+    TransactionOutcome, encode_hex,
 };
 use crate::explain::{ExplainPlan, build_explain_sql};
-use crate::staging::build_fk_where_clause;
+use crate::staging::{
+    StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation, build_fk_where_clause, strip_hex_prefix,
+};
 use std::collections::HashMap;
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
@@ -945,6 +948,8 @@ impl DbSession for PostgresSession {
                 TablePage {
                     columns,
                     rows: Vec::new(),
+                    raw_rows: Vec::new(),
+                    transaction_support: TableTransactionSupport::Supported,
                     offset,
                     limit,
                     total_rows_estimate: Some(0),
@@ -995,15 +1000,28 @@ impl DbSession for PostgresSession {
         let has_more = pg_rows.len() > limit as usize;
         let row_count = pg_rows.len().min(limit as usize);
         let mut decoded_rows = Vec::with_capacity(row_count);
+        let mut raw_rows = Vec::with_capacity(row_count);
         for row in pg_rows.into_iter().take(limit as usize) {
             let mut cells = Vec::with_capacity(columns.len());
+            let mut raw_cells = Vec::with_capacity(columns.len());
             for (idx, col) in columns.iter().enumerate() {
                 let raw = row
                     .try_get::<usize, Option<String>>(idx)
                     .map_err(|e| self.map_session_err(e))?;
-                cells.push(CellValue::parse_from_pg_text(&col.udt_name, raw));
+                let cell = CellValue::parse_from_pg_text(&col.udt_name, raw.clone());
+                let raw_cell = match raw {
+                    None => PostgresRawValue::Null,
+                    Some(s) if col.udt_name == "bytea" => match &cell {
+                        CellValue::Bytes(bytes) => PostgresRawValue::Bytes(bytes.clone()),
+                        _ => PostgresRawValue::Text(s),
+                    },
+                    Some(s) => PostgresRawValue::Text(s),
+                };
+                cells.push(cell);
+                raw_cells.push(RawCellValue::Postgres(raw_cell));
             }
             decoded_rows.push(cells);
+            raw_rows.push(raw_cells);
         }
 
         let filter_active = req
@@ -1045,6 +1063,8 @@ impl DbSession for PostgresSession {
             TablePage {
                 columns,
                 rows: decoded_rows,
+                raw_rows,
+                transaction_support: TableTransactionSupport::Supported,
                 offset,
                 limit,
                 total_rows_estimate,
@@ -1171,6 +1191,7 @@ impl DbSession for PostgresSession {
                 estimated_rows,
                 comment,
                 ddl,
+                transaction_support: TableTransactionSupport::Supported,
             }
         } else {
             TableStats {
@@ -1180,6 +1201,7 @@ impl DbSession for PostgresSession {
                 estimated_rows: None,
                 comment: None,
                 ddl: synthesize_table_ddl(schema, table, &columns, &indexes),
+                transaction_support: TableTransactionSupport::Supported,
             }
         };
 
@@ -1323,6 +1345,117 @@ impl DbSession for PostgresSession {
                         duration_ms: stmt_start.elapsed().as_millis() as u64,
                         error: None,
                     });
+                }
+                Err(pg_err) => {
+                    let mapped = self.map_session_err(pg_err);
+                    drop(self.client.simple_query("ROLLBACK").await);
+                    let after_scs = self.sync_standard_conforming_strings().await;
+                    self.record_pg_transaction_ended(after_scs);
+                    return Err(mapped);
+                }
+            }
+        }
+
+        let commit_start = Instant::now();
+        match self.client.simple_query("COMMIT").await {
+            Ok(_) => {
+                let after_scs = self.sync_standard_conforming_strings().await;
+                self.record_pg_transaction_ended(after_scs);
+                logs.push(ExecutedSql {
+                    sql: "COMMIT;".to_owned(),
+                    duration_ms: commit_start.elapsed().as_millis() as u64,
+                    error: None,
+                });
+                Ok((
+                    TransactionOutcome {
+                        statements_executed: executed,
+                        total_rows_affected,
+                        elapsed_ms: total_start.elapsed().as_millis() as u64,
+                    },
+                    logs,
+                ))
+            }
+            Err(pg_err) => {
+                let mapped = self.map_session_err(pg_err);
+                drop(self.client.simple_query("ROLLBACK").await);
+                let after_scs = self.sync_standard_conforming_strings().await;
+                self.record_pg_transaction_ended(after_scs);
+                Err(mapped)
+            }
+        }
+    }
+
+    async fn execute_staged_mutations(
+        &self,
+        batch: &StagedCommitBatch,
+    ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if batch.mutations.is_empty() {
+            return Err(DbError::InvalidInput("no staged changes to execute".to_owned()));
+        }
+        let _guard = self.client_lock.lock().await;
+        self.ensure_alive()
+            .map_err(|e| DbError::DisconnectedBeforeDispatch(Box::new(e)))?;
+        let total_start = Instant::now();
+        let mut logs = Vec::with_capacity(batch.mutations.len() + 2);
+        let mut total_rows_affected = 0u64;
+        let mut executed = 0usize;
+
+        let begin_start = Instant::now();
+        if let Err(pg_err) = self.client.simple_query("BEGIN").await {
+            let mapped = self.map_aux_query_err(pg_err);
+            logs.push(ExecutedSql {
+                sql: "BEGIN;".to_owned(),
+                duration_ms: begin_start.elapsed().as_millis() as u64,
+                error: Some(mapped.to_string()),
+            });
+            return Err(mapped);
+        }
+        logs.push(ExecutedSql {
+            sql: "BEGIN;".to_owned(),
+            duration_ms: begin_start.elapsed().as_millis() as u64,
+            error: None,
+        });
+
+        for mutation in &batch.mutations {
+            let (sql, params, op_kind, row_label) =
+                match build_pg_staged_mutation_sql(&batch.schema, &batch.table, mutation) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        drop(self.client.simple_query("ROLLBACK").await);
+                        let after_scs = self.sync_standard_conforming_strings().await;
+                        self.record_pg_transaction_ended(after_scs);
+                        return Err(err);
+                    }
+                };
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let stmt_start = Instant::now();
+            match self.client.execute(&sql, &param_refs).await {
+                Ok(1) => {
+                    total_rows_affected = total_rows_affected.saturating_add(1);
+                    executed += 1;
+                    logs.push(ExecutedSql {
+                        sql,
+                        duration_ms: stmt_start.elapsed().as_millis() as u64,
+                        error: None,
+                    });
+                }
+                Ok(affected) => {
+                    drop(self.client.simple_query("ROLLBACK").await);
+                    let after_scs = self.sync_standard_conforming_strings().await;
+                    self.record_pg_transaction_ended(after_scs);
+                    let msg = if affected == 0 {
+                        format!(
+                            "Staged {op_kind} ({row_label}) matched 0 rows: the row was modified or deleted since it was loaded. Transaction rolled back; review your staged changes and reload."
+                        )
+                    } else {
+                        format!(
+                            "Staged {op_kind} ({row_label}) matched {affected} rows instead of 1. Transaction rolled back to prevent unintended changes."
+                        )
+                    };
+                    return Err(DbError::StaleRowConflict(msg));
                 }
                 Err(pg_err) => {
                     let mapped = self.map_session_err(pg_err);
@@ -1902,6 +2035,244 @@ fn human_pg_type(udt_name: &str) -> &str {
     }
 }
 
+fn pg_cast_for_udt(udt: &str) -> &str {
+    match udt {
+        "bool" => "boolean",
+        "int2" => "smallint",
+        "int4" => "integer",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        other => other,
+    }
+}
+
+fn push_pg_typed_param(params: &mut Vec<String>, col: &ColumnMeta, raw: &str) -> String {
+    let trimmed = raw.trim();
+    match col.udt_name.as_str() {
+        "bool" => {
+            let norm = match trimmed.to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" | "yes" | "y" | "on" => "true",
+                "false" | "f" | "0" | "no" | "n" | "off" => "false",
+                _ => trimmed,
+            };
+            params.push(norm.to_owned());
+            format!("CAST(${}::text AS boolean)", params.len())
+        }
+        "bytea" => {
+            let hex = strip_hex_prefix(trimmed);
+            if hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                params.push(hex.to_owned());
+                format!("pg_catalog.decode(${}::text, 'hex')", params.len())
+            } else {
+                params.push(raw.to_owned());
+                format!("CAST(${}::text AS bytea)", params.len())
+            }
+        }
+        "text" | "varchar" | "bpchar" | "name" | "citext" => {
+            params.push(raw.to_owned());
+            format!("${}::text", params.len())
+        }
+        "bit" | "varbit" => {
+            params.push(trimmed.to_owned());
+            format!("CAST(${}::text AS varbit)", params.len())
+        }
+        "int2" | "int4" | "int8" | "float4" | "float8" | "numeric" | "money" | "uuid" | "date" | "time"
+        | "timetz" | "timestamp" | "timestamptz" => {
+            params.push(trimmed.to_owned());
+            format!("CAST(${}::text AS {})", params.len(), pg_cast_for_udt(&col.udt_name))
+        }
+        "json" | "jsonb" => {
+            params.push(raw.to_owned());
+            format!("CAST(${}::text AS {})", params.len(), col.udt_name)
+        }
+        _ if col.udt_name.starts_with('_') => {
+            let cast = if col.data_type.ends_with("[]") {
+                col.data_type.as_str()
+            } else {
+                "text[]"
+            };
+            params.push(raw.to_owned());
+            format!("CAST(${}::text AS {cast})", params.len())
+        }
+        _ => {
+            params.push(raw.to_owned());
+            let dtype = col.data_type.trim();
+            if dtype.is_empty() {
+                format!("${}::text", params.len())
+            } else {
+                format!("CAST(${}::text AS {dtype})", params.len())
+            }
+        }
+    }
+}
+
+fn pg_raw_text_value(val: &StagedColumnValue) -> String {
+    match &val.raw {
+        Some(RawCellValue::Postgres(PostgresRawValue::Text(s))) => s.clone(),
+        Some(RawCellValue::Postgres(PostgresRawValue::Bytes(bytes))) => encode_hex(bytes),
+        _ => val.display.copy_text(),
+    }
+}
+
+fn append_pg_predicates(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<String>,
+    pk_predicates: &[StagedColumnValue],
+    concurrency_predicates: &[StagedColumnValue],
+) -> Result<(), DbError> {
+    if pk_predicates.is_empty() {
+        return Err(DbError::InvalidInput(
+            "table requires a primary key to update or delete existing rows safely".to_owned(),
+        ));
+    }
+    for pk in pk_predicates {
+        if pk.raw.as_ref().is_some_and(RawCellValue::is_null) || pk.display.is_null() {
+            return Err(DbError::InvalidInput(format!(
+                "primary key column '{}' cannot be NULL",
+                pk.column.name
+            )));
+        }
+        let q = quote_ident(&pk.column.name);
+        if pk.column.udt_name == "bytea" {
+            let hex = match &pk.raw {
+                Some(RawCellValue::Postgres(PostgresRawValue::Bytes(bytes))) => encode_hex(bytes),
+                _ => strip_hex_prefix(&pk.display.copy_text()).to_owned(),
+            };
+            params.push(hex);
+            clauses.push(format!("{q} = pg_catalog.decode(${}::text, 'hex')", params.len()));
+        } else {
+            let raw_text = pg_raw_text_value(pk);
+            let expr = push_pg_typed_param(params, &pk.column, &raw_text);
+            clauses.push(format!("{q} = {expr}"));
+            if matches!(
+                pk.column.udt_name.as_str(),
+                "text" | "varchar" | "bpchar" | "name" | "citext"
+            ) {
+                params.push(raw_text);
+                clauses.push(format!(
+                    "{q}::text COLLATE \"C\" = ${}::text COLLATE \"C\"",
+                    params.len()
+                ));
+            }
+        }
+    }
+    for col in concurrency_predicates {
+        let q = quote_ident(&col.column.name);
+        if col.raw.as_ref().is_some_and(RawCellValue::is_null) || col.display.is_null() {
+            clauses.push(format!("{q} IS NULL"));
+        } else if col.column.udt_name == "bytea" {
+            let hex = match &col.raw {
+                Some(RawCellValue::Postgres(PostgresRawValue::Bytes(bytes))) => encode_hex(bytes),
+                _ => strip_hex_prefix(&col.display.copy_text()).to_owned(),
+            };
+            params.push(hex);
+            clauses.push(format!("{q} = pg_catalog.decode(${}::text, 'hex')", params.len()));
+        } else {
+            let raw_text = pg_raw_text_value(col);
+            params.push(raw_text);
+            clauses.push(format!(
+                "{q}::text COLLATE \"C\" = ${}::text COLLATE \"C\"",
+                params.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn build_pg_staged_mutation_sql(
+    schema: &str,
+    table: &str,
+    mutation: &StagedMutation,
+) -> Result<(String, Vec<String>, &'static str, String), DbError> {
+    let fq_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    match mutation {
+        StagedMutation::Update {
+            row_label,
+            assignments,
+            pk_predicates,
+            concurrency_predicates,
+        } => {
+            if assignments.is_empty() {
+                return Err(DbError::InvalidInput("update has no column assignments".to_owned()));
+            }
+            let mut params = Vec::new();
+            let mut set_clauses = Vec::with_capacity(assignments.len());
+            for a in assignments {
+                let expr = match &a.value {
+                    StagedCellValue::Null => "NULL".to_owned(),
+                    StagedCellValue::DefaultExpr => "DEFAULT".to_owned(),
+                    StagedCellValue::Literal(raw) => push_pg_typed_param(&mut params, &a.column, raw),
+                };
+                set_clauses.push(format!("{} = {expr}", quote_ident(&a.column.name)));
+            }
+            let mut where_clauses = Vec::new();
+            append_pg_predicates(
+                &mut where_clauses,
+                &mut params,
+                pk_predicates,
+                concurrency_predicates,
+            )?;
+            let sql = format!(
+                "UPDATE {fq_table} SET {} WHERE {};",
+                set_clauses.join(", "),
+                where_clauses.join(" AND ")
+            );
+            Ok((sql, params, "update", row_label.clone()))
+        }
+        StagedMutation::Insert {
+            row_label,
+            assignments,
+        } => {
+            if assignments.is_empty() {
+                return Ok((
+                    format!("INSERT INTO {fq_table} DEFAULT VALUES;"),
+                    Vec::new(),
+                    "insert",
+                    row_label.clone(),
+                ));
+            }
+            let mut params = Vec::new();
+            let mut col_names = Vec::with_capacity(assignments.len());
+            let mut val_exprs = Vec::with_capacity(assignments.len());
+            for a in assignments {
+                col_names.push(quote_ident(&a.column.name));
+                let expr = match &a.value {
+                    StagedCellValue::Null => "NULL".to_owned(),
+                    StagedCellValue::DefaultExpr => "DEFAULT".to_owned(),
+                    StagedCellValue::Literal(raw) => push_pg_typed_param(&mut params, &a.column, raw),
+                };
+                val_exprs.push(expr);
+            }
+            let sql = format!(
+                "INSERT INTO {fq_table} ({}) VALUES ({});",
+                col_names.join(", "),
+                val_exprs.join(", ")
+            );
+            Ok((sql, params, "insert", row_label.clone()))
+        }
+        StagedMutation::Delete {
+            row_label,
+            pk_predicates,
+            concurrency_predicates,
+        } => {
+            let mut params = Vec::new();
+            let mut where_clauses = Vec::new();
+            append_pg_predicates(
+                &mut where_clauses,
+                &mut params,
+                pk_predicates,
+                concurrency_predicates,
+            )?;
+            let sql = format!(
+                "DELETE FROM {fq_table} WHERE {};",
+                where_clauses.join(" AND ")
+            );
+            Ok((sql, params, "delete", row_label.clone()))
+        }
+    }
+}
+
 /// Quotes a PostgreSQL SQL identifier safely by doubling embedded double quotes.
 pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
@@ -2449,11 +2820,14 @@ pub fn concise_pg_version(raw: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use crate::connection::{ConnectionProfile, SslMode};
+    use crate::connection::{ConnectionProfile, DbEngine, SslMode};
+    use crate::engine::{CellValue, ColumnMeta, PostgresRawValue, RawCellValue};
+    use crate::staging::StagedCellValue;
 
     use super::{
-        PgLiveSessionState, PgSqlstateError, build_pg_config, concise_pg_version,
+        PgLiveSessionState, PgSqlstateError, build_pg_config, build_pg_staged_mutation_sql, concise_pg_version,
         evaluate_mid_batch_pg_mode, is_pg_disconnect_sqlstate, should_retire_after_cancel,
     };
 
@@ -3097,5 +3471,125 @@ mod tests {
         idle_batch_tracker.apply("ROLLBACK");
         assert_eq!(idle_batch_tracker.tx_state, Some(PostgresTxState::Idle));
         assert_eq!(idle_batch_tracker.active, None);
+    }
+
+    #[test]
+    fn build_pg_staged_mutation_sql_binds_parameters_and_concurrency_predicates() {
+        let cols = vec![
+            ColumnMeta {
+                name: "student_id".to_owned(),
+                data_type: "integer".to_owned(),
+                udt_name: "int4".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: true,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "code".to_owned(),
+                data_type: "character varying(8)".to_owned(),
+                udt_name: "varchar".to_owned(),
+                nullable: false,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "badge".to_owned(),
+                data_type: "bytea".to_owned(),
+                udt_name: "bytea".to_owned(),
+                nullable: true,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+            ColumnMeta {
+                name: "flags".to_owned(),
+                data_type: "bit(4)".to_owned(),
+                udt_name: "bit".to_owned(),
+                nullable: true,
+                default_expr: None,
+                is_primary_key: false,
+                is_unique: false,
+                comment: None,
+                foreign_key: None,
+            },
+        ];
+        let row = vec![
+            CellValue::Int(4),
+            CellValue::Text("GREENDLE".to_owned()),
+            CellValue::Bytes(vec![0xca, 0xfe]),
+            CellValue::Text("1010".to_owned()),
+        ];
+        let raw_row = vec![
+            RawCellValue::Postgres(PostgresRawValue::Text("4".to_owned())),
+            RawCellValue::Postgres(PostgresRawValue::Text("GREENDLE".to_owned())),
+            RawCellValue::Postgres(PostgresRawValue::Bytes(vec![0xca, 0xfe])),
+            RawCellValue::Postgres(PostgresRawValue::Text("1010".to_owned())),
+        ];
+        let mut staged = crate::staging::StagedChanges::new();
+        staged.stage_cell_edit_with_raw(
+            0,
+            &row,
+            Some(&raw_row),
+            1,
+            StagedCellValue::Literal("TOO_LONG_VALUE".to_owned()),
+        );
+        staged.stage_cell_edit_with_raw(
+            0,
+            &row,
+            Some(&raw_row),
+            3,
+            StagedCellValue::Literal("10101".to_owned()),
+        );
+        let batch = staged
+            .build_commit_batch(DbEngine::Postgres, "public", "students", &cols)
+            .expect("build pg batch");
+        let (sql, params, op_kind, _) =
+            build_pg_staged_mutation_sql("public", "students", &batch.mutations[0])
+                .expect("build pg sql");
+        assert_eq!(op_kind, "update");
+        // Must bind without column length modifiers so Postgres enforces declared lengths cleanly!
+        assert!(sql.contains("SET \"code\" = $1::text, \"flags\" = CAST($2::text AS varbit)"));
+        assert!(!sql.contains("character varying(8)"));
+        assert!(!sql.contains("bit(4)"));
+        assert!(sql.contains("\"student_id\" = CAST($3::text AS integer)"));
+        assert!(sql.contains("\"code\"::text COLLATE \"C\" = $4::text COLLATE \"C\""));
+        assert!(sql.contains("\"badge\" = pg_catalog.decode($5::text, 'hex')"));
+        assert!(sql.contains("\"flags\"::text COLLATE \"C\" = $6::text COLLATE \"C\""));
+        assert_eq!(params, vec!["TOO_LONG_VALUE", "10101", "4", "GREENDLE", "cafe", "1010"]);
+
+        // Text PK must also add COLLATE "C" alongside indexable equality so case-insensitive ICU PKs detect drift.
+        let mut text_pk_col = cols[1].clone();
+        text_pk_col.is_primary_key = true;
+        let tp_cols = vec![text_pk_col, cols[3].clone()];
+        let tp_row = vec![CellValue::Text("Troy".to_owned()), CellValue::Text("1010".to_owned())];
+        let tp_raw = vec![
+            RawCellValue::Postgres(PostgresRawValue::Text("Troy".to_owned())),
+            RawCellValue::Postgres(PostgresRawValue::Text("1010".to_owned())),
+        ];
+        let mut tp_staged = crate::staging::StagedChanges::new();
+        tp_staged.stage_cell_edit_with_raw(
+            0,
+            &tp_row,
+            Some(&tp_raw),
+            1,
+            StagedCellValue::Literal("1111".to_owned()),
+        );
+        let tp_batch = tp_staged
+            .build_commit_batch(DbEngine::Postgres, "public", "codes", &tp_cols)
+            .expect("build text pk pg batch");
+        let (tp_sql, tp_params, _, _) =
+            build_pg_staged_mutation_sql("public", "codes", &tp_batch.mutations[0])
+                .expect("build text pk pg sql");
+        assert!(tp_sql.contains("\"code\" = $2::text"));
+        assert!(tp_sql.contains("\"code\"::text COLLATE \"C\" = $3::text COLLATE \"C\""));
+        assert_eq!(tp_params, vec!["1111", "Troy", "Troy", "1010"]);
     }
 }

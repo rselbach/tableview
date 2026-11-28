@@ -5,17 +5,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rusqlite::types::ValueRef;
-use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags};
+use rusqlite::types::{Value as SqliteValue, ValueRef};
+use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags, params_from_iter};
 
 use crate::connection::{ConnectionProfile, DbEngine, SafetyPolicy};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
-    TablePage, TableStats, TableStructure, TransactionOutcome,
+    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, RawCellValue, SchemaInfo,
+    ServerInfo, SqliteRawValue, TablePage, TableStats, TableStructure, TableTransactionSupport, TransactionOutcome,
+    decode_hex,
 };
 use crate::explain::{ExplainPlan, build_explain_sql_for_engine};
-use crate::staging::build_fk_where_clause_for_engine;
+use crate::staging::{
+    LogicalColType, StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation, build_fk_where_clause_for_engine,
+    classify_column_type, strip_hex_prefix,
+};
 
 #[derive(Default)]
 struct SqliteCancelState {
@@ -484,6 +488,8 @@ impl DbSession for SqliteSession {
                     TablePage {
                         columns,
                         rows: Vec::new(),
+                        raw_rows: Vec::new(),
+                        transaction_support: TableTransactionSupport::Supported,
                         offset,
                         limit,
                         total_rows_estimate: Some(0),
@@ -509,13 +515,17 @@ impl DbSession for SqliteSession {
             let mut stmt = conn.prepare(&sql).map_err(map_sqlite_err)?;
             let mut raw_rows = stmt.query([]).map_err(map_sqlite_err)?;
             let mut decoded_rows = Vec::new();
+            let mut raw_rows_out = Vec::new();
             while let Some(row) = raw_rows.next().map_err(map_sqlite_err)? {
                 let mut cells = Vec::with_capacity(columns.len());
+                let mut raw_cells = Vec::with_capacity(columns.len());
                 for (idx, col) in columns.iter().enumerate() {
                     let val_ref = row.get_ref(idx).map_err(map_sqlite_err)?;
+                    raw_cells.push(RawCellValue::Sqlite(sqlite_value_ref_to_raw(val_ref)));
                     cells.push(decode_sqlite_cell(val_ref, &col.data_type));
                 }
                 decoded_rows.push(cells);
+                raw_rows_out.push(raw_cells);
             }
             let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -527,6 +537,7 @@ impl DbSession for SqliteSession {
 
             let has_more = decoded_rows.len() > limit as usize;
             decoded_rows.truncate(limit as usize);
+            raw_rows_out.truncate(limit as usize);
 
             let filter_active = req
                 .filter_where
@@ -559,6 +570,8 @@ impl DbSession for SqliteSession {
                 TablePage {
                     columns,
                     rows: decoded_rows,
+                    raw_rows: raw_rows_out,
+                    transaction_support: TableTransactionSupport::Supported,
                     offset,
                     limit,
                     total_rows_estimate,
@@ -638,6 +651,7 @@ impl DbSession for SqliteSession {
                 estimated_rows,
                 comment: None,
                 ddl: ddl_parts.join("\n\n"),
+                transaction_support: TableTransactionSupport::Supported,
             };
 
             Ok((
@@ -729,6 +743,111 @@ impl DbSession for SqliteSession {
                             duration_ms: stmt_start.elapsed().as_millis() as u64,
                             error: None,
                         });
+                    }
+                    Err(mapped) => {
+                        drop(conn.execute_batch("ROLLBACK"));
+                        return Err(mapped);
+                    }
+                }
+            }
+
+            let commit_start = Instant::now();
+            match conn.execute_batch("COMMIT") {
+                Ok(()) => {
+                    logs.push(ExecutedSql {
+                        sql: "COMMIT;".to_owned(),
+                        duration_ms: commit_start.elapsed().as_millis() as u64,
+                        error: None,
+                    });
+                    Ok((
+                        TransactionOutcome {
+                            statements_executed: executed,
+                            total_rows_affected,
+                            elapsed_ms: total_start.elapsed().as_millis() as u64,
+                        },
+                        logs,
+                    ))
+                }
+                Err(err) => {
+                    let mapped = map_sqlite_err(err);
+                    drop(conn.execute_batch("ROLLBACK"));
+                    Err(mapped)
+                }
+            }
+        })
+        .await
+    }
+
+    async fn execute_staged_mutations(
+        &self,
+        batch: &StagedCommitBatch,
+    ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if batch.mutations.is_empty() {
+            return Err(DbError::InvalidInput("no staged changes to execute".to_owned()));
+        }
+        let batch = batch.clone();
+        self.with_conn(move |conn| {
+            let schema = normalize_schema(&batch.schema);
+            let total_start = Instant::now();
+            let mut logs = Vec::with_capacity(batch.mutations.len() + 2);
+            let mut total_rows_affected = 0u64;
+            let mut executed = 0usize;
+
+            let begin_start = Instant::now();
+            if let Err(err) = conn.execute_batch("BEGIN IMMEDIATE") {
+                let mapped = map_sqlite_err(err);
+                logs.push(ExecutedSql {
+                    sql: "BEGIN IMMEDIATE;".to_owned(),
+                    duration_ms: begin_start.elapsed().as_millis() as u64,
+                    error: Some(mapped.to_string()),
+                });
+                return Err(mapped);
+            }
+            logs.push(ExecutedSql {
+                sql: "BEGIN IMMEDIATE;".to_owned(),
+                duration_ms: begin_start.elapsed().as_millis() as u64,
+                error: None,
+            });
+
+            for mutation in &batch.mutations {
+                let (sql, params, op_kind, row_label) =
+                    match build_sqlite_staged_mutation_sql(schema, &batch.table, mutation) {
+                        Ok(plan) => plan,
+                        Err(err) => {
+                            drop(conn.execute_batch("ROLLBACK"));
+                            return Err(err);
+                        }
+                    };
+                let stmt_start = Instant::now();
+                let res = (|| -> Result<u64, DbError> {
+                    let mut prepared = conn.prepare(&sql).map_err(map_sqlite_err)?;
+                    prepared
+                        .execute(params_from_iter(params.iter()))
+                        .map_err(map_sqlite_err)?;
+                    Ok(conn.changes())
+                })();
+                match res {
+                    Ok(1) => {
+                        total_rows_affected = total_rows_affected.saturating_add(1);
+                        executed += 1;
+                        logs.push(ExecutedSql {
+                            sql,
+                            duration_ms: stmt_start.elapsed().as_millis() as u64,
+                            error: None,
+                        });
+                    }
+                    Ok(changes) => {
+                        drop(conn.execute_batch("ROLLBACK"));
+                        let msg = if changes == 0 {
+                            format!(
+                                "Staged {op_kind} ({row_label}) matched 0 rows: the row was modified or deleted since it was loaded. Transaction rolled back; review your staged changes and reload."
+                            )
+                        } else {
+                            format!(
+                                "Staged {op_kind} ({row_label}) matched {changes} rows instead of 1. Transaction rolled back to prevent unintended changes."
+                            )
+                        };
+                        return Err(DbError::StaleRowConflict(msg));
                     }
                     Err(mapped) => {
                         drop(conn.execute_batch("ROLLBACK"));
@@ -1252,6 +1371,237 @@ fn classify_declared_type(decl_type: &str) -> SqliteTypeHint {
         "UUID" => SqliteTypeHint::Uuid,
         "NUMERIC" | "DECIMAL" => SqliteTypeHint::Numeric,
         _ => SqliteTypeHint::None,
+    }
+}
+
+fn sqlite_value_ref_to_raw(val: ValueRef<'_>) -> SqliteRawValue {
+    match val {
+        ValueRef::Null => SqliteRawValue::Null,
+        ValueRef::Integer(i) => SqliteRawValue::Integer(i),
+        ValueRef::Real(f) => SqliteRawValue::Real(f),
+        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => SqliteRawValue::Text(s.to_owned()),
+            Err(_) => SqliteRawValue::NonUtf8Text(bytes.to_vec()),
+        },
+        ValueRef::Blob(bytes) => SqliteRawValue::Blob(bytes.to_vec()),
+    }
+}
+
+fn sqlite_assignment_to_bound(col: &ColumnMeta, val: &StagedCellValue) -> Result<SqliteValue, DbError> {
+    match val {
+        StagedCellValue::Null => Ok(SqliteValue::Null),
+        StagedCellValue::DefaultExpr => Err(DbError::InvalidInput(format!(
+            "SQLite does not support DEFAULT assignment in UPDATE for column '{}'",
+            col.name
+        ))),
+        StagedCellValue::Literal(raw) => {
+            let trimmed = raw.trim();
+            Ok(match classify_column_type(col) {
+                LogicalColType::Bool => match trimmed.to_ascii_lowercase().as_str() {
+                    "true" | "t" | "1" | "yes" | "y" | "on" => SqliteValue::Integer(1),
+                    "false" | "f" | "0" | "no" | "n" | "off" => SqliteValue::Integer(0),
+                    _ => SqliteValue::Text(trimmed.to_owned()),
+                },
+                LogicalColType::Int => match trimmed.parse::<i64>() {
+                    Ok(i) => SqliteValue::Integer(i),
+                    Err(_) => SqliteValue::Text(trimmed.to_owned()),
+                },
+                LogicalColType::Float => match trimmed.parse::<f64>() {
+                    Ok(f) if f.is_finite() => SqliteValue::Real(f),
+                    _ => SqliteValue::Text(trimmed.to_owned()),
+                },
+                LogicalColType::Numeric => {
+                    if let Ok(i) = trimmed.parse::<i64>() {
+                        SqliteValue::Integer(i)
+                    } else if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
+                        SqliteValue::Real(trimmed.parse::<f64>().unwrap_or_default())
+                    } else {
+                        SqliteValue::Text(trimmed.to_owned())
+                    }
+                }
+                LogicalColType::Bytes => {
+                    let hex = strip_hex_prefix(trimmed);
+                    match decode_hex(hex) {
+                        Some(bytes) => SqliteValue::Blob(bytes),
+                        None => SqliteValue::Text(raw.clone()),
+                    }
+                }
+                LogicalColType::Json | LogicalColType::Text | LogicalColType::Array => {
+                    SqliteValue::Text(raw.clone())
+                }
+                LogicalColType::Date
+                | LogicalColType::Time
+                | LogicalColType::Timestamp
+                | LogicalColType::TimestampTz
+                | LogicalColType::Uuid => SqliteValue::Text(trimmed.to_owned()),
+            })
+        }
+    }
+}
+
+fn sqlite_col_val_to_bound(val: &StagedColumnValue) -> Result<(SqliteValue, Option<&'static str>), DbError> {
+    if let Some(RawCellValue::Sqlite(raw)) = &val.raw {
+        return match raw {
+            SqliteRawValue::Null => Ok((SqliteValue::Null, Some("null"))),
+            SqliteRawValue::Integer(i) => Ok((SqliteValue::Integer(*i), Some("integer"))),
+            SqliteRawValue::Real(f) => Ok((SqliteValue::Real(*f), Some("real"))),
+            SqliteRawValue::Text(s) => Ok((SqliteValue::Text(s.clone()), Some("text"))),
+            SqliteRawValue::NonUtf8Text(_) => Err(DbError::InvalidInput(format!(
+                "row contains non-UTF-8 SQLite TEXT in column '{}' and cannot be bound",
+                val.column.name
+            ))),
+            SqliteRawValue::Blob(b) => Ok((SqliteValue::Blob(b.clone()), Some("blob"))),
+        };
+    }
+    Ok(match &val.display {
+        CellValue::Null => (SqliteValue::Null, Some("null")),
+        CellValue::Bool(b) => (SqliteValue::Integer(i64::from(*b)), None),
+        CellValue::Int(i) => (SqliteValue::Integer(*i), Some("integer")),
+        CellValue::Float(f) if f.is_finite() => (SqliteValue::Real(*f), Some("real")),
+        CellValue::Bytes(b) => (SqliteValue::Blob(b.clone()), Some("blob")),
+        other => (SqliteValue::Text(other.copy_text()), None),
+    })
+}
+
+fn push_sqlite_value_predicate(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<SqliteValue>,
+    quoted_col: &str,
+    bound: SqliteValue,
+    tname: Option<&'static str>,
+) {
+    if matches!(bound, SqliteValue::Null) {
+        clauses.push(format!("{quoted_col} IS NULL"));
+        return;
+    }
+    // Use BINARY collation on text predicates so NOCASE columns still detect case-only drift.
+    let lhs = if tname == Some("text") || matches!(bound, SqliteValue::Text(_)) {
+        format!("{quoted_col} COLLATE BINARY")
+    } else {
+        quoted_col.to_owned()
+    };
+    if let Some(t) = tname {
+        clauses.push(format!("{lhs} = ? AND typeof({quoted_col}) = ?"));
+        params.push(bound);
+        params.push(SqliteValue::Text(t.to_owned()));
+    } else {
+        clauses.push(format!("{lhs} = ?"));
+        params.push(bound);
+    }
+}
+
+fn append_sqlite_predicates(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<SqliteValue>,
+    pk_predicates: &[StagedColumnValue],
+    concurrency_predicates: &[StagedColumnValue],
+) -> Result<(), DbError> {
+    if pk_predicates.is_empty() {
+        return Err(DbError::InvalidInput(
+            "table requires a primary key to update or delete existing rows safely".to_owned(),
+        ));
+    }
+    for pk in pk_predicates {
+        let q = quote_ident(&pk.column.name);
+        let (bound, tname) = sqlite_col_val_to_bound(pk)?;
+        if matches!(bound, SqliteValue::Null) {
+            return Err(DbError::InvalidInput(format!(
+                "primary key column '{}' cannot be NULL",
+                pk.column.name
+            )));
+        }
+        push_sqlite_value_predicate(clauses, params, &q, bound, tname);
+    }
+    for col in concurrency_predicates {
+        let q = quote_ident(&col.column.name);
+        let (bound, tname) = sqlite_col_val_to_bound(col)?;
+        push_sqlite_value_predicate(clauses, params, &q, bound, tname);
+    }
+    Ok(())
+}
+
+fn build_sqlite_staged_mutation_sql(
+    schema: &str,
+    table: &str,
+    mutation: &StagedMutation,
+) -> Result<(String, Vec<SqliteValue>, &'static str, String), DbError> {
+    let fq_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    match mutation {
+        StagedMutation::Update {
+            row_label,
+            assignments,
+            pk_predicates,
+            concurrency_predicates,
+        } => {
+            if assignments.is_empty() {
+                return Err(DbError::InvalidInput("update has no column assignments".to_owned()));
+            }
+            let mut set_clauses = Vec::with_capacity(assignments.len());
+            let mut params = Vec::with_capacity(assignments.len() + pk_predicates.len() * 2 + concurrency_predicates.len() * 2);
+            for a in assignments {
+                set_clauses.push(format!("{} = ?", quote_ident(&a.column.name)));
+                params.push(sqlite_assignment_to_bound(&a.column, &a.value)?);
+            }
+            let mut where_clauses = Vec::new();
+            append_sqlite_predicates(
+                &mut where_clauses,
+                &mut params,
+                pk_predicates,
+                concurrency_predicates,
+            )?;
+            let sql = format!(
+                "UPDATE {fq_table} SET {} WHERE {};",
+                set_clauses.join(", "),
+                where_clauses.join(" AND ")
+            );
+            Ok((sql, params, "update", row_label.clone()))
+        }
+        StagedMutation::Insert {
+            row_label,
+            assignments,
+        } => {
+            if assignments.is_empty() {
+                return Ok((
+                    format!("INSERT INTO {fq_table} DEFAULT VALUES;"),
+                    Vec::new(),
+                    "insert",
+                    row_label.clone(),
+                ));
+            }
+            let mut col_names = Vec::with_capacity(assignments.len());
+            let mut placeholders = Vec::with_capacity(assignments.len());
+            let mut params = Vec::with_capacity(assignments.len());
+            for a in assignments {
+                col_names.push(quote_ident(&a.column.name));
+                placeholders.push("?".to_owned());
+                params.push(sqlite_assignment_to_bound(&a.column, &a.value)?);
+            }
+            let sql = format!(
+                "INSERT INTO {fq_table} ({}) VALUES ({});",
+                col_names.join(", "),
+                placeholders.join(", ")
+            );
+            Ok((sql, params, "insert", row_label.clone()))
+        }
+        StagedMutation::Delete {
+            row_label,
+            pk_predicates,
+            concurrency_predicates,
+        } => {
+            let mut params = Vec::new();
+            let mut where_clauses = Vec::new();
+            append_sqlite_predicates(
+                &mut where_clauses,
+                &mut params,
+                pk_predicates,
+                concurrency_predicates,
+            )?;
+            let sql = format!(
+                "DELETE FROM {fq_table} WHERE {};",
+                where_clauses.join(" AND ")
+            );
+            Ok((sql, params, "delete", row_label.clone()))
+        }
     }
 }
 

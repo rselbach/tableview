@@ -10,7 +10,7 @@ use tv_core::{
     DbError, DbObject, DbSession, ExecutedSql, ExplainPlan, FkPeekRow, ForeignKeyRef, MysqlQuoteMode,
     NewHistoryEntry, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult, QueryHistoryEntry,
     QueryStore, RequestId, SavedQuery, SavedQueryId, SchemaInfo, ServerInfo, SessionId, SqlSessionMode, TabId,
-    TablePage, TableStructure, TransactionOutcome, batch_sets_credentials_with_session_mode,
+    TablePage, TableStructure, TransactionOutcome, StagedCommitBatch, batch_sets_credentials_with_session_mode,
     trim_sql_whitespace_for_engine,
 };
 
@@ -163,7 +163,7 @@ pub enum WorkerCmd {
         tab_id: TabId,
         req_id: RequestId,
         connect_req_id: RequestId,
-        statements: Vec<String>,
+        batch: StagedCommitBatch,
     },
     ExplainSql {
         session_id: SessionId,
@@ -2459,7 +2459,7 @@ async fn handle_cmd(
             tab_id,
             req_id,
             connect_req_id,
-            statements,
+            batch,
         } => {
             let outcome = run_with_reconnect(
                 worker_ctx,
@@ -2468,8 +2468,8 @@ async fn handle_cmd(
                 false,
                 Some(connect_req_id),
                 |session| {
-                    let stmts = statements.clone();
-                    async move { session.execute_transaction(&stmts).await }
+                    let batch = batch.clone();
+                    async move { session.execute_staged_mutations(&batch).await }
                 },
             )
             .await;
@@ -2500,9 +2500,13 @@ async fn handle_cmd(
                         },
                     );
                 }
-                Err(SessionCallError::Operation { error, .. }) => {
+                Err(SessionCallError::Operation { engine, error }) => {
+                    let sql = batch
+                        .render_sql(engine)
+                        .map(|s| s.join("\n"))
+                        .unwrap_or_default();
                     let logs = vec![ExecutedSql {
-                        sql: statements.join("\n"),
+                        sql,
                         duration_ms: 0,
                         error: Some(error.to_string()),
                     }];

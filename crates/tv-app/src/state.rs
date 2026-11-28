@@ -10,13 +10,14 @@ use rune_kit::shell::TabDragState;
 use rune_kit::{PaneState, SortDir, TableState};
 use tv_core::{
     AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionId,
-    ConnectionProfile, ConnectionStore, DatabaseInfo, DbEngine, DbObject, DbObjectKind, DraftRowId, EnvTag,
+    ConnectionProfile, ConnectionStore, DatabaseInfo, DbEngine, DbError, DbObject, DbObjectKind, DraftRowId, EnvTag,
     ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, PageRequest, PasswordMode, QueryBatchResult,
-    QueryHistoryEntry, QueryStatementResult, RequestId, SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId,
-    SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue, StagedChanges,
-    StatementInspection, StorageError, StoreData, TabId, TablePage, TableStructure, atomic_write_bytes,
-    build_explain_sql_for_engine, build_fk_where_clause_for_engine, default_export_filename,
+    QueryHistoryEntry, QueryStatementResult, RawCellValue, RequestId, SafetyDecision, SafetyPolicy, SavedQuery,
+    SavedQueryId, SchemaInfo, SessionId, SettingsStore, SortOrder, SortSpec, SslMode, StagedCellValue, StagedChanges,
+    StatementInspection, StorageError, StoreData, TabId, TablePage, TableStructure, TableTransactionSupport,
+    atomic_write_bytes, build_explain_sql_for_engine, build_fk_where_clause_for_engine, default_export_filename,
     evaluate_sql_safety_for_engine_with_session_mode, evaluate_staged_commit_safety, export_rows_for_engine,
+    validate_row_editable,
 };
 use tv_core::sql::{
     MysqlQuoteMode, PostgresSessionMode, SqlSessionMode, batch_sets_credentials_with_session_mode, cursor_line_col,
@@ -765,14 +766,51 @@ impl TableTabState {
             .or_else(|| self.structure.as_ref().map(|s| s.columns.as_slice()))
     }
 
-    pub fn can_edit_table(&self, policy: SafetyPolicy) -> Result<(), &'static str> {
+    pub fn transaction_support(&self) -> TableTransactionSupport {
+        if self.engine != DbEngine::Mysql {
+            return TableTransactionSupport::Supported;
+        }
+        if let Some(page) = &self.page
+            && page.transaction_support != TableTransactionSupport::Unknown
+        {
+            return page.transaction_support.clone();
+        }
+        if let Some(st) = &self.structure
+            && st.stats.transaction_support != TableTransactionSupport::Unknown
+        {
+            return st.stats.transaction_support.clone();
+        }
+        TableTransactionSupport::Unknown
+    }
+
+    pub fn can_edit_table(&self, policy: SafetyPolicy) -> Result<(), String> {
         if policy == SafetyPolicy::ReadOnly {
-            return Err("Connection is Read-Only; editing is disabled");
+            return Err("Connection is Read-Only; editing is disabled".to_owned());
         }
         if self.object_kind != DbObjectKind::Table {
-            return Err("Only base tables support inline row editing");
+            return Err("Only base tables support inline row editing".to_owned());
         }
-        Ok(())
+        match self.transaction_support() {
+            TableTransactionSupport::Supported => Ok(()),
+            TableTransactionSupport::Unsupported { engine } => Err(format!(
+                "Table uses non-transactional storage engine '{engine}'; inline row edits are disabled to prevent partial commits"
+            )),
+            TableTransactionSupport::Unknown => Err(
+                "Table storage engine transaction support is not yet verified; inline row edits are disabled"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    pub fn can_edit_existing_row(&self, policy: SafetyPolicy, row_idx: usize) -> Result<(), String> {
+        self.can_edit_table(policy)?;
+        let Some(page) = &self.page else {
+            return Err("Load table page before editing existing rows".to_owned());
+        };
+        let Some(row) = page.rows.get(row_idx) else {
+            return Err("Selected row is no longer present on this page".to_owned());
+        };
+        validate_row_editable(self.engine, &page.columns, row, page.raw_row(row_idx))
     }
 
     pub fn has_primary_key(&self) -> bool {
@@ -3712,8 +3750,10 @@ impl AppState {
             self.set_notice(reason, true);
             return false;
         }
-        if matches!(row_key, RowKey::Existing(_)) && !tab.has_primary_key() {
-            self.set_notice("Table requires a primary key to edit existing rows safely", true);
+        if let RowKey::Existing(idx) = row_key
+            && let Err(reason) = tab.can_edit_existing_row(policy, idx)
+        {
+            self.set_notice(reason, true);
             return false;
         }
         let current = tab.effective_cell(row_key, col_idx);
@@ -3761,10 +3801,11 @@ impl AppState {
     }
 
     pub fn commit_inline_cell_edit(&mut self) {
-        let blocked_reason = {
+        let blocked_reason: Option<String> = {
             let Some(session) = self.active_session_mut() else {
                 return;
             };
+            let policy = session.profile.safety;
             let db_switching = session.pending_db_switch_req.is_some();
             let Some(tab) = session.active_table_tab_mut() else {
                 return;
@@ -3772,37 +3813,54 @@ impl AppState {
             if tab.committing || db_switching {
                 tab.editing_cell = None;
                 Some(if tab.committing {
-                    "Wait for staged changes commit to finish before editing"
+                    "Wait for staged changes commit to finish before editing".to_owned()
                 } else {
-                    "Wait for database switch to finish before editing"
+                    "Wait for database switch to finish before editing".to_owned()
                 })
+            } else if let Err(reason) = tab.can_edit_table(policy) {
+                tab.editing_cell = None;
+                Some(reason)
             } else {
                 let Some(editing) = tab.editing_cell.take() else {
                     return;
                 };
-                let new_val = if editing.set_null {
-                    StagedCellValue::Null
-                } else if editing.set_default {
-                    StagedCellValue::DefaultExpr
+                if let RowKey::Existing(idx) = editing.row_key
+                    && let Err(reason) = tab.can_edit_existing_row(policy, idx)
+                {
+                    Some(reason)
                 } else {
-                    StagedCellValue::Literal(editing.edit.text.clone())
-                };
-                match editing.row_key {
-                    RowKey::Draft(id) => {
-                        tab.staged.stage_insert_cell_edit(id, editing.col_idx, new_val);
-                    }
-                    RowKey::Existing(idx) => {
-                        if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned()
-                        {
-                            tab.staged.stage_cell_edit(idx, &orig_row, editing.col_idx, new_val);
+                    let new_val = if editing.set_null {
+                        StagedCellValue::Null
+                    } else if editing.set_default {
+                        StagedCellValue::DefaultExpr
+                    } else {
+                        StagedCellValue::Literal(editing.edit.text.clone())
+                    };
+                    match editing.row_key {
+                        RowKey::Draft(id) => {
+                            tab.staged.stage_insert_cell_edit(id, editing.col_idx, new_val);
+                        }
+                        RowKey::Existing(idx) => {
+                            if let Some(page) = tab.page.as_ref()
+                                && let Some(orig_row) = page.rows.get(idx).cloned()
+                            {
+                                let orig_raw = page.raw_row(idx).map(<[RawCellValue]>::to_vec);
+                                tab.staged.stage_cell_edit_with_raw(
+                                    idx,
+                                    &orig_row,
+                                    orig_raw.as_deref(),
+                                    editing.col_idx,
+                                    new_val,
+                                );
+                            }
                         }
                     }
+                    tab.mark_staged_mutated();
+                    tab.commit_error = None;
+                    tab.rebuild_diff_state();
+                    tab.apply_pending_page_if_clean();
+                    None
                 }
-                tab.mark_staged_mutated();
-                tab.commit_error = None;
-                tab.rebuild_diff_state();
-                tab.apply_pending_page_if_clean();
-                None
             }
         };
         if let Some(reason) = blocked_reason {
@@ -3811,7 +3869,7 @@ impl AppState {
     }
 
     pub fn stage_cell_null(&mut self, row_key: RowKey, col_idx: usize) {
-        let error_notice = {
+        let error_notice: Option<String> = {
             let Some(session) = self.active_session_mut() else {
                 return;
             };
@@ -3821,19 +3879,21 @@ impl AppState {
                 return;
             };
             if tab.committing {
-                Some("Wait for staged changes commit to finish before editing")
+                Some("Wait for staged changes commit to finish before editing".to_owned())
             } else if db_switching {
-                Some("Wait for database switch to finish before editing")
+                Some("Wait for database switch to finish before editing".to_owned())
             } else if let Err(reason) = tab.can_edit_table(policy) {
                 Some(reason)
-            } else if matches!(row_key, RowKey::Existing(_)) && !tab.has_primary_key() {
-                Some("Table requires a primary key to edit existing rows safely")
+            } else if let RowKey::Existing(idx) = row_key
+                && let Err(reason) = tab.can_edit_existing_row(policy, idx)
+            {
+                Some(reason)
             } else if tab
                 .columns()
                 .and_then(|c| c.get(col_idx))
                 .is_some_and(|c| !c.nullable)
             {
-                Some("Column is NOT NULL")
+                Some("Column is NOT NULL".to_owned())
             } else {
                 tab.editing_cell = None;
                 match row_key {
@@ -3841,10 +3901,17 @@ impl AppState {
                         tab.staged.stage_insert_cell_edit(id, col_idx, StagedCellValue::Null);
                     }
                     RowKey::Existing(idx) => {
-                        if let Some(orig_row) = tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned()
+                        if let Some(page) = tab.page.as_ref()
+                            && let Some(orig_row) = page.rows.get(idx).cloned()
                         {
-                            tab.staged
-                                .stage_cell_edit(idx, &orig_row, col_idx, StagedCellValue::Null);
+                            let orig_raw = page.raw_row(idx).map(<[RawCellValue]>::to_vec);
+                            tab.staged.stage_cell_edit_with_raw(
+                                idx,
+                                &orig_row,
+                                orig_raw.as_deref(),
+                                col_idx,
+                                StagedCellValue::Null,
+                            );
                         }
                     }
                 }
@@ -3861,7 +3928,7 @@ impl AppState {
     }
 
     pub fn insert_staged_row(&mut self, tx: &mut Tx) -> bool {
-        let outcome: Result<(RowKey, usize), &'static str> = {
+        let outcome: Result<(RowKey, usize), String> = {
             let Some(session) = self.active_session_mut() else {
                 return false;
             };
@@ -3871,9 +3938,9 @@ impl AppState {
                 return false;
             };
             if tab.committing {
-                Err("Wait for staged changes commit to finish before editing")
+                Err("Wait for staged changes commit to finish before editing".to_owned())
             } else if db_switching {
-                Err("Wait for database switch to finish before editing")
+                Err("Wait for database switch to finish before editing".to_owned())
             } else if let Err(reason) = tab.can_edit_table(policy) {
                 Err(reason)
             } else if let Some(cols) = tab.columns().map(|c| c.to_vec()) {
@@ -3889,7 +3956,7 @@ impl AppState {
                 tab.rebuild_diff_state();
                 Ok((RowKey::Draft(draft_id), col_idx))
             } else {
-                Err("Load table columns before inserting a row")
+                Err("Load table columns before inserting a row".to_owned())
             }
         };
         match outcome {
@@ -3902,7 +3969,7 @@ impl AppState {
     }
 
     pub fn toggle_delete_row(&mut self, row_key: RowKey) {
-        let error_notice = {
+        let error_notice: Option<String> = {
             let Some(session) = self.active_session_mut() else {
                 return;
             };
@@ -3912,9 +3979,9 @@ impl AppState {
                 return;
             };
             if tab.committing {
-                Some("Wait for staged changes commit to finish before editing")
+                Some("Wait for staged changes commit to finish before editing".to_owned())
             } else if db_switching {
-                Some("Wait for database switch to finish before editing")
+                Some("Wait for database switch to finish before editing".to_owned())
             } else if let Err(reason) = tab.can_edit_table(policy) {
                 Some(reason)
             } else {
@@ -3935,15 +4002,22 @@ impl AppState {
                         None
                     }
                     RowKey::Existing(idx) => {
-                        if !tab.has_primary_key() {
-                            Some("Table requires a primary key to delete existing rows safely")
+                        if !tab.staged.is_row_deleted(idx)
+                            && let Err(reason) = tab.can_edit_existing_row(policy, idx)
+                        {
+                            Some(reason)
                         } else {
                             tab.editing_cell = None;
                             tab.row_menu = None;
-                            if let Some(orig_row) =
-                                tab.page.as_ref().and_then(|p| p.rows.get(idx)).cloned()
+                            if let Some(page) = tab.page.as_ref()
+                                && let Some(orig_row) = page.rows.get(idx).cloned()
                             {
-                                tab.staged.toggle_delete_row(idx, &orig_row);
+                                let orig_raw = page.raw_row(idx).map(<[RawCellValue]>::to_vec);
+                                tab.staged.toggle_delete_row_with_raw(
+                                    idx,
+                                    &orig_row,
+                                    orig_raw.as_deref(),
+                                );
                                 tab.mark_staged_mutated();
                             }
                             tab.commit_error = None;
@@ -4050,6 +4124,11 @@ impl AppState {
                 if tab.committing {
                     return;
                 }
+                if let Err(msg) = tab.can_edit_table(policy) {
+                    tab.commit_error = Some(msg);
+                    tab.diff_drawer_open = true;
+                    return;
+                }
                 if let Err(msg) = evaluate_staged_commit_safety(policy) {
                     tab.commit_error = Some(msg);
                     return;
@@ -4058,11 +4137,11 @@ impl AppState {
                     tab.commit_error = Some("Missing table columns metadata".to_owned());
                     return;
                 };
-                let stmts = match tab
+                let batch = match tab
                     .staged
-                    .build_statements_for_engine(engine, &tab.schema, &tab.object_name, &cols)
+                    .build_commit_batch(engine, &tab.schema, &tab.object_name, &cols)
                 {
-                    Ok(s) => s,
+                    Ok(b) => b,
                     Err(err) => {
                         tab.commit_error = Some(err.to_string());
                         return;
@@ -4073,11 +4152,11 @@ impl AppState {
                 tab.commit_req_id = Some(req_id);
                 tab.commit_staged_gen = Some(tab.staged_gen);
                 tab.commit_error = None;
-                Some((tab_id, connect_req_id, stmts))
+                Some((tab_id, connect_req_id, batch))
             }
         };
 
-        let Some((tab_id, connect_req_id, statements)) = dispatch else {
+        let Some((tab_id, connect_req_id, batch)) = dispatch else {
             if self
                 .sessions
                 .get(&session_id)
@@ -4093,7 +4172,7 @@ impl AppState {
                 tab_id,
                 req_id,
                 connect_req_id,
-                statements,
+                batch,
             });
         } else if let Some(tab) = self.active_session_mut().and_then(SessionState::active_table_tab_mut) {
             tab.committing = false;
@@ -6086,6 +6165,15 @@ impl AppState {
                                 ));
                             }
                             Err(err) => {
+                                if let DbError::NonTransactionalTable { ref support, .. } = err {
+                                    if let Some(page) = &mut tab.page {
+                                        page.transaction_support = support.clone();
+                                    }
+                                    if let Some(st) = &mut tab.structure {
+                                        st.stats.transaction_support = support.clone();
+                                    }
+                                    tab.editing_cell = None;
+                                }
                                 let msg = err.to_string();
                                 tab.commit_error = Some(msg.clone());
                                 tab.diff_drawer_open = true;

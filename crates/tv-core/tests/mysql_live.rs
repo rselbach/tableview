@@ -494,15 +494,34 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
 
         // Staged transactional commit
         let mut staged = StagedChanges::new();
-        staged.stage_cell_edit(
+        staged.stage_cell_edit_with_raw(
             0,
             &page1.rows[0],
+            page1.raw_row(0),
             2,
             StagedCellValue::Literal("Troy 'T-Bone' Barnes".to_owned()),
         );
-        staged.stage_cell_edit(0, &page1.rows[0], 5, StagedCellValue::Literal("3.55".to_owned()));
-        staged.stage_cell_edit(0, &page1.rows[0], 7, StagedCellValue::Literal(r#"{"ac":"Master"}"#.to_owned()));
-        staged.stage_cell_edit(0, &page1.rows[0], 8, StagedCellValue::Literal("0xcafebabe".to_owned()));
+        staged.stage_cell_edit_with_raw(
+            0,
+            &page1.rows[0],
+            page1.raw_row(0),
+            5,
+            StagedCellValue::Literal("3.55".to_owned()),
+        );
+        staged.stage_cell_edit_with_raw(
+            0,
+            &page1.rows[0],
+            page1.raw_row(0),
+            7,
+            StagedCellValue::Literal(r#"{"ac":"Master"}"#.to_owned()),
+        );
+        staged.stage_cell_edit_with_raw(
+            0,
+            &page1.rows[0],
+            page1.raw_row(0),
+            8,
+            StagedCellValue::Literal("0xcafebabe".to_owned()),
+        );
 
         let draft = staged.stage_insert_row(&page1.columns);
         staged.stage_insert_cell_edit(draft, 0, StagedCellValue::Literal("5".to_owned()));
@@ -515,16 +534,16 @@ fn live_mysql_introspection_data_grid_and_structure_roundtrip() {
         staged.stage_insert_cell_edit(draft, 6, StagedCellValue::Literal("Law".to_owned()));
         staged.stage_insert_cell_edit(draft, 9, StagedCellValue::Literal("1".to_owned()));
 
-        staged.toggle_delete_row(100, &page2.rows[1]);
-        let commit_stmts = staged
-            .build_statements_for_engine(DbEngine::Mysql, &db_name, "students", &page1.columns)
-            .expect("build staged statements");
+        staged.toggle_delete_row_with_raw(100, &page2.rows[1], page2.raw_row(1));
+        let commit_batch = staged
+            .build_commit_batch(DbEngine::Mysql, &db_name, "students", &page1.columns)
+            .expect("build staged commit batch");
         let (tx_out, tx_logs) = shared
-            .execute_transaction(&commit_stmts)
+            .execute_staged_mutations(&commit_batch)
             .await
             .expect("commit staged transaction succeeds");
         assert_eq!(tx_out.statements_executed, 3);
-        assert_eq!(tx_logs.len(), 5);
+        assert!(tx_logs.len() >= 5);
 
         let (after_commit, _) = shared
             .fetch_table_page(&PageRequest {

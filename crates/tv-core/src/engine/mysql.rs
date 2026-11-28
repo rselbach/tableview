@@ -9,18 +9,22 @@ use chrono::{DateTime, Utc};
 use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::Queryable;
 use mysql_async::{
-    ClientIdentity, Column, DriverError, Error as MysqlError, IoError, Opts, OptsBuilder, Row, SslOpts, Value,
+    ClientIdentity, Column, DriverError, Error as MysqlError, IoError, Opts, OptsBuilder, Params, Row, SslOpts, Value,
 };
 use uuid::Uuid;
 
 use crate::connection::{ConnectionProfile, DbEngine, PasswordMode, SslConfig, SslMode};
 use crate::engine::{
     CellValue, ColumnMeta, ColumnSummary, DatabaseInfo, DbError, DbObject, DbObjectKind, DbSession, ExecutedSql,
-    FkPeekRow, ForeignKeyRef, IndexInfo, PageRequest, QueryBatchResult, QueryStatementResult, SchemaInfo, ServerInfo,
-    TablePage, TableStats, TableStructure, TransactionOutcome,
+    FkPeekRow, ForeignKeyRef, IndexInfo, MysqlRawValue, PageRequest, QueryBatchResult, QueryStatementResult,
+    RawCellValue, SchemaInfo, ServerInfo, TablePage, TableStats, TableStructure, TableTransactionSupport,
+    TransactionOutcome, decode_hex,
 };
 use crate::explain::{ExplainPlan, build_explain_sql_for_engine};
-use crate::staging::build_fk_where_clause_for_engine;
+use crate::staging::{
+    LogicalColType, StagedCellValue, StagedColumnValue, StagedCommitBatch, StagedMutation,
+    build_fk_where_clause_for_engine, classify_column_type, is_mysql_text_col, strip_hex_prefix,
+};
 
 static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -947,6 +951,8 @@ impl DbSession for MysqlSession {
                 TablePage {
                     columns,
                     rows: Vec::new(),
+                    raw_rows: Vec::new(),
+                    transaction_support: TableTransactionSupport::Supported,
                     offset,
                     limit,
                     total_rows_estimate: Some(0),
@@ -983,15 +989,19 @@ impl DbSession for MysqlSession {
         let has_more = mysql_rows.len() > limit as usize;
         let row_count = mysql_rows.len().min(limit as usize);
         let mut decoded_rows = Vec::with_capacity(row_count);
+        let mut raw_rows = Vec::with_capacity(row_count);
         for row in mysql_rows.into_iter().take(limit as usize) {
             let wire_cols = row.columns_ref();
             let mut cells = Vec::with_capacity(columns.len());
+            let mut raw_cells = Vec::with_capacity(columns.len());
             for (idx, col) in columns.iter().enumerate() {
                 let val = row.as_ref(idx).unwrap_or(&Value::NULL);
                 let wire_col = wire_cols.get(idx);
+                raw_cells.push(RawCellValue::Mysql(mysql_val_to_raw(val)));
                 cells.push(decode_mysql_cell(val, wire_col, Some(col)));
             }
             decoded_rows.push(cells);
+            raw_rows.push(raw_cells);
         }
 
         let filter_active = req
@@ -999,31 +1009,19 @@ impl DbSession for MysqlSession {
             .as_deref()
             .is_some_and(|w| !w.trim().is_empty());
 
+        let (transaction_support, table_rows_est, meta_log) =
+            self.fetch_mysql_table_meta(conn, &req.schema, &req.table).await?;
+        if let Some(log) = meta_log
+            && has_more
+            && !filter_active
+        {
+            logs.push(log);
+        }
+
         let (total_rows_estimate, total_is_exact) = if !has_more {
             (Some(offset + decoded_rows.len() as i64), true)
         } else if !filter_active {
-            let est_sql = "SELECT TABLE_ROWS FROM information_schema.TABLES \
-                           WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
-            let est_start = Instant::now();
-            let est_row: Option<Row> = conn
-                .exec_first(est_sql, (&req.schema, &req.table))
-                .await
-                .ok()
-                .flatten();
-            let est = est_row
-                .as_ref()
-                .and_then(|r| r.as_ref(0))
-                .and_then(value_to_opt_i64);
-            logs.push(ExecutedSql {
-                sql: format!(
-                    "{est_sql} -- ? = '{}', ? = '{}'",
-                    req.schema.replace('\'', "''"),
-                    req.table.replace('\'', "''")
-                ),
-                duration_ms: est_start.elapsed().as_millis() as u64,
-                error: None,
-            });
-            (est, false)
+            (table_rows_est, false)
         } else {
             (None, false)
         };
@@ -1032,6 +1030,8 @@ impl DbSession for MysqlSession {
             TablePage {
                 columns,
                 rows: decoded_rows,
+                raw_rows,
+                transaction_support,
                 offset,
                 limit,
                 total_rows_estimate,
@@ -1116,14 +1116,30 @@ impl DbSession for MysqlSession {
             })
             .collect();
 
-        let stats_sql = "SELECT TABLE_TYPE, DATA_LENGTH, INDEX_LENGTH, TABLE_ROWS, TABLE_COMMENT \
-                         FROM information_schema.TABLES \
-                         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+        let stats_sql = "SELECT t.TABLE_TYPE, t.DATA_LENGTH, t.INDEX_LENGTH, t.TABLE_ROWS, \
+                         t.TABLE_COMMENT, t.ENGINE, e.TRANSACTIONS \
+                         FROM information_schema.TABLES t \
+                         LEFT JOIN information_schema.ENGINES e ON UPPER(e.ENGINE) = UPPER(t.ENGINE) \
+                         WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?";
         let stats_start = Instant::now();
-        let stats_row: Option<Row> = conn.exec_first(stats_sql, (schema, table)).await.map_err(|e| self.map_session_err(e))?;
+        let (stats_row, used_stats_sql) = match conn.exec_first::<Row, _, _>(stats_sql, (schema, table)).await {
+            Ok(row) => (row, stats_sql),
+            Err(err) if is_mysql_permission_error(&err) => {
+                let fallback_sql = "SELECT TABLE_TYPE, DATA_LENGTH, INDEX_LENGTH, TABLE_ROWS, \
+                                    TABLE_COMMENT, ENGINE, NULL \
+                                    FROM information_schema.TABLES \
+                                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+                let row = conn
+                    .exec_first(fallback_sql, (schema, table))
+                    .await
+                    .map_err(|e| self.map_session_err(e))?;
+                (row, fallback_sql)
+            }
+            Err(err) => return Err(self.map_session_err(err)),
+        };
         logs.push(ExecutedSql {
             sql: format!(
-                "{stats_sql} -- ? = '{}', ? = '{}'",
+                "{used_stats_sql} -- ? = '{}', ? = '{}'",
                 schema.replace('\'', "''"),
                 table.replace('\'', "''")
             ),
@@ -1131,19 +1147,28 @@ impl DbSession for MysqlSession {
             error: None,
         });
 
-        let (is_view, data_bytes, index_bytes, estimated_rows, comment) = if let Some(row) = stats_row {
-            let table_type = value_to_string(row.as_ref(0).unwrap_or(&Value::NULL)).to_ascii_uppercase();
-            let is_view = table_type.contains("VIEW");
-            let data_bytes = value_to_opt_i64(row.as_ref(1).unwrap_or(&Value::NULL));
-            let index_bytes = value_to_opt_i64(row.as_ref(2).unwrap_or(&Value::NULL));
-            let estimated_rows = value_to_opt_i64(row.as_ref(3).unwrap_or(&Value::NULL));
-            let comment = value_to_opt_string(row.as_ref(4).unwrap_or(&Value::NULL))
-                .filter(|s| !s.trim().is_empty())
-                .filter(|s| !(is_view && s.eq_ignore_ascii_case("VIEW")));
-            (is_view, data_bytes, index_bytes, estimated_rows, comment)
-        } else {
-            (false, None, None, None, None)
-        };
+        let (is_view, data_bytes, index_bytes, estimated_rows, comment, transaction_support) =
+            if let Some(row) = stats_row {
+                let table_type_raw = value_to_string(row.as_ref(0).unwrap_or(&Value::NULL));
+                let table_type = table_type_raw.to_ascii_uppercase();
+                let is_view = table_type.contains("VIEW");
+                let data_bytes = value_to_opt_i64(row.as_ref(1).unwrap_or(&Value::NULL));
+                let index_bytes = value_to_opt_i64(row.as_ref(2).unwrap_or(&Value::NULL));
+                let estimated_rows = value_to_opt_i64(row.as_ref(3).unwrap_or(&Value::NULL));
+                let comment = value_to_opt_string(row.as_ref(4).unwrap_or(&Value::NULL))
+                    .filter(|s| !s.trim().is_empty())
+                    .filter(|s| !(is_view && s.eq_ignore_ascii_case("VIEW")));
+                let engine_name = value_to_opt_string(row.as_ref(5).unwrap_or(&Value::NULL));
+                let tx_flag = value_to_opt_string(row.as_ref(6).unwrap_or(&Value::NULL));
+                let tx_support = classify_mysql_table_transaction_support(
+                    Some(table_type_raw.as_str()),
+                    engine_name.as_deref(),
+                    tx_flag.as_deref(),
+                );
+                (is_view, data_bytes, index_bytes, estimated_rows, comment, tx_support)
+            } else {
+                (false, None, None, None, None, TableTransactionSupport::Unknown)
+            };
 
         let total_bytes = match (data_bytes, index_bytes) {
             (Some(d), Some(i)) => Some(d.saturating_add(i)),
@@ -1207,6 +1232,7 @@ impl DbSession for MysqlSession {
                     estimated_rows,
                     comment,
                     ddl,
+                    transaction_support,
                 },
             },
             logs,
@@ -1296,6 +1322,191 @@ impl DbSession for MysqlSession {
                     executed += 1;
                     logs.push(ExecutedSql {
                         sql: stmt.to_owned(),
+                        duration_ms: stmt_start.elapsed().as_millis() as u64,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    let mapped = self.map_session_err(err);
+                    drop(conn.query_drop("ROLLBACK").await);
+                    return Err(mapped);
+                }
+            }
+        }
+
+        let commit_start = Instant::now();
+        match conn.query_drop("COMMIT").await {
+            Ok(()) => {
+                logs.push(ExecutedSql {
+                    sql: "COMMIT;".to_owned(),
+                    duration_ms: commit_start.elapsed().as_millis() as u64,
+                    error: None,
+                });
+                Ok((
+                    TransactionOutcome {
+                        statements_executed: executed,
+                        total_rows_affected,
+                        elapsed_ms: total_start.elapsed().as_millis() as u64,
+                    },
+                    logs,
+                ))
+            }
+            Err(err) => {
+                let mapped = self.map_session_err(err);
+                drop(conn.query_drop("ROLLBACK").await);
+                Err(mapped)
+            }
+        }
+    }
+
+    async fn execute_staged_mutations(
+        &self,
+        batch: &StagedCommitBatch,
+    ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError> {
+        if batch.mutations.is_empty() {
+            return Err(DbError::InvalidInput("no staged changes to execute".to_owned()));
+        }
+
+        let target_schema = if batch.schema.trim().is_empty() {
+            self.server_info.current_database.trim().to_owned()
+        } else {
+            batch.schema.clone()
+        };
+        if target_schema.is_empty() {
+            return Err(DbError::NonTransactionalTable {
+                support: TableTransactionSupport::Unknown,
+                message: "Cannot verify storage engine transaction support without an active schema".to_owned(),
+            });
+        }
+
+        let _tx_guard = self.tx_lock.lock().await;
+        let mut lease = self.get_checked_conn(true, true, None).await?;
+        let conn = lease.conn_mut()?;
+        let total_start = Instant::now();
+        let mut logs = Vec::with_capacity(batch.mutations.len() + 4);
+
+        let (tx_support, _, meta_log) = self
+            .fetch_mysql_table_meta(conn, &target_schema, &batch.table)
+            .await?;
+        if let Some(log) = meta_log {
+            logs.push(log);
+        }
+        ensure_mysql_table_transactional(tx_support, &target_schema, &batch.table)?;
+
+        let mut plans = Vec::with_capacity(batch.mutations.len());
+        for mutation in &batch.mutations {
+            plans.push(build_mysql_staged_mutation_plan(&target_schema, &batch.table, mutation)?);
+        }
+
+        let begin_start = Instant::now();
+        if let Err(err) = conn.query_drop("START TRANSACTION").await {
+            let mapped = self.map_session_err(err);
+            logs.push(ExecutedSql {
+                sql: "START TRANSACTION;".to_owned(),
+                duration_ms: begin_start.elapsed().as_millis() as u64,
+                error: Some(mapped.to_string()),
+            });
+            return Err(mapped);
+        }
+        logs.push(ExecutedSql {
+            sql: "START TRANSACTION;".to_owned(),
+            duration_ms: begin_start.elapsed().as_millis() as u64,
+            error: None,
+        });
+
+        // Acquire transactional MDL with plain SELECT (works even without UPDATE/LOCK TABLES grants),
+        // then re-verify the storage engine before any write so concurrent ALTER TABLE cannot slip through.
+        let fq_target = DbEngine::Mysql.qualify_ident(&target_schema, &batch.table);
+        if let Err(err) = conn
+            .query_first::<Row, _>(format!("SELECT 1 FROM {fq_target} WHERE 1 = 0"))
+            .await
+        {
+            let mapped = self.map_session_err(err);
+            drop(conn.query_drop("ROLLBACK").await);
+            return Err(mapped);
+        }
+        let (post_mdl_support, _, post_mdl_log) = match self
+            .fetch_mysql_table_meta(conn, &target_schema, &batch.table)
+            .await
+        {
+            Ok(meta) => meta,
+            Err(err) => {
+                drop(conn.query_drop("ROLLBACK").await);
+                return Err(err);
+            }
+        };
+        if let Some(log) = post_mdl_log {
+            logs.push(log);
+        }
+        if let Err(err) = ensure_mysql_table_transactional(post_mdl_support, &target_schema, &batch.table) {
+            drop(conn.query_drop("ROLLBACK").await);
+            return Err(err);
+        }
+
+        let mut total_rows_affected = 0u64;
+        let mut executed = 0usize;
+        for plan in plans {
+            let (op_kind, row_label, lock_opt, exec_sql, exec_params, require_exact_affected) = match plan {
+                MysqlMutationPlan::Update {
+                    row_label,
+                    lock_sql,
+                    lock_params,
+                    exec_sql,
+                    exec_params,
+                } => ("update", row_label, Some((lock_sql, lock_params)), exec_sql, exec_params, false),
+                MysqlMutationPlan::Insert {
+                    row_label,
+                    exec_sql,
+                    exec_params,
+                } => ("insert", row_label, None, exec_sql, exec_params, true),
+                MysqlMutationPlan::Delete {
+                    row_label,
+                    lock_sql,
+                    lock_params,
+                    exec_sql,
+                    exec_params,
+                } => ("delete", row_label, Some((lock_sql, lock_params)), exec_sql, exec_params, true),
+            };
+
+            if let Some((lock_sql, lock_params)) = lock_opt {
+                let count_row: Option<Row> = match conn
+                    .exec_first(lock_sql, Params::Positional(lock_params))
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(err) => {
+                        let mapped = self.map_session_err(err);
+                        drop(conn.query_drop("ROLLBACK").await);
+                        return Err(mapped);
+                    }
+                };
+                let matched = count_row
+                    .as_ref()
+                    .and_then(|r| r.as_ref(0))
+                    .and_then(value_to_opt_i64)
+                    .unwrap_or(0);
+                if matched != 1 {
+                    drop(conn.query_drop("ROLLBACK").await);
+                    return Err(DbError::StaleRowConflict(stale_conflict_msg(
+                        op_kind, &row_label, matched.max(0) as u64,
+                    )));
+                }
+            }
+
+            let stmt_start = Instant::now();
+            match conn.exec_drop(&exec_sql, Params::Positional(exec_params)).await {
+                Ok(()) => {
+                    let affected = conn.affected_rows();
+                    if (require_exact_affected && affected != 1) || affected > 1 {
+                        drop(conn.query_drop("ROLLBACK").await);
+                        return Err(DbError::StaleRowConflict(stale_conflict_msg(
+                            op_kind, &row_label, affected,
+                        )));
+                    }
+                    total_rows_affected = total_rows_affected.saturating_add(affected);
+                    executed += 1;
+                    logs.push(ExecutedSql {
+                        sql: exec_sql,
                         duration_ms: stmt_start.elapsed().as_millis() as u64,
                         error: None,
                     });
@@ -2718,6 +2929,490 @@ fn parse_mysql_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+fn stale_conflict_msg(op_kind: &str, row_label: &str, count: u64) -> String {
+    if count == 0 {
+        format!(
+            "Staged {op_kind} ({row_label}) matched 0 rows: the row was modified or deleted since it was loaded. Transaction rolled back; review your staged changes and reload."
+        )
+    } else {
+        format!(
+            "Staged {op_kind} ({row_label}) matched {count} rows instead of 1. Transaction rolled back to prevent unintended changes."
+        )
+    }
+}
+
+pub(crate) fn classify_mysql_table_transaction_support(
+    table_type: Option<&str>,
+    engine: Option<&str>,
+    transactions: Option<&str>,
+) -> TableTransactionSupport {
+    if let Some(tt) = table_type
+        && tt.to_ascii_uppercase().contains("VIEW")
+    {
+        return TableTransactionSupport::Unsupported {
+            engine: "VIEW".to_owned(),
+        };
+    }
+    if let Some(tx) = transactions.map(str::trim).filter(|s| !s.is_empty()) {
+        if tx.eq_ignore_ascii_case("YES") {
+            return TableTransactionSupport::Supported;
+        }
+        if tx.eq_ignore_ascii_case("NO") {
+            let eng = engine
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown")
+                .to_owned();
+            return TableTransactionSupport::Unsupported { engine: eng };
+        }
+    }
+    let Some(eng) = engine.map(str::trim).filter(|s| !s.is_empty()) else {
+        return TableTransactionSupport::Unknown;
+    };
+    match eng.to_ascii_uppercase().as_str() {
+        "INNODB" | "XTRADB" | "TOKUDB" | "ROCKSDB" | "MYROCKS" | "NDB" | "NDBCLUSTER" => {
+            TableTransactionSupport::Supported
+        }
+        "MYISAM" | "MEMORY" | "HEAP" | "CSV" | "ARCHIVE" | "BLACKHOLE" | "MERGE" | "MRG_MYISAM" | "FEDERATED"
+        | "ARIA" | "ISAM" => TableTransactionSupport::Unsupported {
+            engine: eng.to_owned(),
+        },
+        _ => TableTransactionSupport::Unknown,
+    }
+}
+
+impl MysqlSession {
+    async fn fetch_mysql_table_meta(
+        &self,
+        conn: &mut mysql_async::Conn,
+        schema: &str,
+        table: &str,
+    ) -> Result<(TableTransactionSupport, Option<i64>, Option<ExecutedSql>), DbError> {
+        let meta_sql = "SELECT t.TABLE_TYPE, t.ENGINE, e.TRANSACTIONS, t.TABLE_ROWS \
+                        FROM information_schema.TABLES t \
+                        LEFT JOIN information_schema.ENGINES e ON UPPER(e.ENGINE) = UPPER(t.ENGINE) \
+                        WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?";
+        let start = Instant::now();
+        let (row, used_sql): (Option<Row>, &str) = match conn.exec_first::<Row, _, _>(meta_sql, (schema, table)).await {
+            Ok(r) => (r, meta_sql),
+            Err(err) if is_mysql_permission_error(&err) => {
+                let fallback_sql = "SELECT TABLE_TYPE, ENGINE, NULL, TABLE_ROWS \
+                                    FROM information_schema.TABLES \
+                                    WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+                match conn.exec_first::<Row, _, _>(fallback_sql, (schema, table)).await {
+                    Ok(r) => (r, fallback_sql),
+                    Err(err2) if is_mysql_permission_error(&err2) => {
+                        return Ok((TableTransactionSupport::Unknown, None, None));
+                    }
+                    Err(err2) => return Err(self.map_session_err(err2)),
+                }
+            }
+            Err(err) => return Err(self.map_session_err(err)),
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let log = ExecutedSql {
+            sql: format!(
+                "{used_sql} -- ? = '{}', ? = '{}'",
+                schema.replace('\'', "''"),
+                table.replace('\'', "''")
+            ),
+            duration_ms,
+            error: None,
+        };
+        let Some(row) = row else {
+            return Ok((TableTransactionSupport::Unknown, None, Some(log)));
+        };
+        let table_type = value_to_opt_string(row.as_ref(0).unwrap_or(&Value::NULL));
+        let engine_name = value_to_opt_string(row.as_ref(1).unwrap_or(&Value::NULL));
+        let tx_flag = value_to_opt_string(row.as_ref(2).unwrap_or(&Value::NULL));
+        let table_rows = row.as_ref(3).and_then(value_to_opt_i64);
+        let support = classify_mysql_table_transaction_support(
+            table_type.as_deref(),
+            engine_name.as_deref(),
+            tx_flag.as_deref(),
+        );
+        Ok((support, table_rows, Some(log)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum MysqlMutationPlan {
+    Update {
+        row_label: String,
+        lock_sql: String,
+        lock_params: Vec<Value>,
+        exec_sql: String,
+        exec_params: Vec<Value>,
+    },
+    Insert {
+        row_label: String,
+        exec_sql: String,
+        exec_params: Vec<Value>,
+    },
+    Delete {
+        row_label: String,
+        lock_sql: String,
+        lock_params: Vec<Value>,
+        exec_sql: String,
+        exec_params: Vec<Value>,
+    },
+}
+
+fn mysql_val_to_raw(val: &Value) -> MysqlRawValue {
+    match val {
+        Value::NULL => MysqlRawValue::Null,
+        Value::Int(i) => MysqlRawValue::Int(*i),
+        Value::UInt(u) => MysqlRawValue::UInt(*u),
+        Value::Float(f) => MysqlRawValue::Float(*f),
+        Value::Double(d) => MysqlRawValue::Double(*d),
+        Value::Bytes(b) => MysqlRawValue::Bytes(b.clone()),
+        Value::Date(year, month, day, hour, minute, second, micros) => MysqlRawValue::Date {
+            year: *year,
+            month: *month,
+            day: *day,
+            hour: *hour,
+            minute: *minute,
+            second: *second,
+            micros: *micros,
+        },
+        Value::Time(neg, days, hour, minute, second, micros) => MysqlRawValue::Time {
+            neg: *neg,
+            days: *days,
+            hour: *hour,
+            minute: *minute,
+            second: *second,
+            micros: *micros,
+        },
+    }
+}
+
+fn ensure_mysql_table_transactional(
+    support: TableTransactionSupport,
+    schema: &str,
+    table: &str,
+) -> Result<(), DbError> {
+    match support {
+        TableTransactionSupport::Supported => Ok(()),
+        TableTransactionSupport::Unsupported { ref engine } => Err(DbError::NonTransactionalTable {
+            message: format!(
+                "Table `{schema}`.`{table}` uses non-transactional storage engine '{engine}'; staged commits require a transactional engine (such as InnoDB)."
+            ),
+            support,
+        }),
+        TableTransactionSupport::Unknown => Err(DbError::NonTransactionalTable {
+            support,
+            message: format!(
+                "Could not verify transactional storage engine support for `{schema}`.`{table}`; staged commits are blocked to avoid partial writes."
+            ),
+        }),
+    }
+}
+
+fn mysql_assignment_value(col: &ColumnMeta, val: &StagedCellValue) -> (&'static str, Option<Value>) {
+    match val {
+        StagedCellValue::Null => ("NULL", None),
+        StagedCellValue::DefaultExpr => ("DEFAULT", None),
+        StagedCellValue::Literal(raw) => {
+            let trimmed = raw.trim();
+            match classify_column_type(col) {
+                LogicalColType::Bool => match trimmed.to_ascii_lowercase().as_str() {
+                    "true" | "t" | "1" | "yes" | "y" | "on" => ("?", Some(Value::Int(1))),
+                    "false" | "f" | "0" | "no" | "n" | "off" => ("?", Some(Value::Int(0))),
+                    _ => ("?", Some(Value::Bytes(trimmed.as_bytes().to_vec()))),
+                },
+                LogicalColType::Int => match trimmed.parse::<i64>() {
+                    Ok(i) => ("?", Some(Value::Int(i))),
+                    Err(_) => ("?", Some(Value::Bytes(trimmed.as_bytes().to_vec()))),
+                },
+                LogicalColType::Float => match trimmed.parse::<f64>() {
+                    Ok(d) if d.is_finite() => ("?", Some(Value::Double(d))),
+                    _ => ("?", Some(Value::Bytes(trimmed.as_bytes().to_vec()))),
+                },
+                LogicalColType::Bytes => {
+                    let hex = strip_hex_prefix(trimmed);
+                    match decode_hex(hex) {
+                        Some(bytes) => ("?", Some(Value::Bytes(bytes))),
+                        None => ("?", Some(Value::Bytes(raw.as_bytes().to_vec()))),
+                    }
+                }
+                LogicalColType::Json => ("CAST(? AS JSON)", Some(Value::Bytes(raw.as_bytes().to_vec()))),
+                LogicalColType::Numeric
+                | LogicalColType::Date
+                | LogicalColType::Time
+                | LogicalColType::Timestamp
+                | LogicalColType::TimestampTz
+                | LogicalColType::Uuid => ("?", Some(Value::Bytes(trimmed.as_bytes().to_vec()))),
+                LogicalColType::Text | LogicalColType::Array => {
+                    ("?", Some(Value::Bytes(raw.as_bytes().to_vec())))
+                }
+            }
+        }
+    }
+}
+
+fn mysql_col_val_to_value(val: &StagedColumnValue) -> Value {
+    if let Some(RawCellValue::Mysql(raw)) = &val.raw {
+        return match raw {
+            MysqlRawValue::Null => Value::NULL,
+            MysqlRawValue::Int(i) => Value::Int(*i),
+            MysqlRawValue::UInt(u) => Value::UInt(*u),
+            MysqlRawValue::Float(f) => Value::Float(*f),
+            MysqlRawValue::Double(d) => Value::Double(*d),
+            MysqlRawValue::Date {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+                micros,
+            } => Value::Date(*year, *month, *day, *hour, *minute, *second, *micros),
+            MysqlRawValue::Time {
+                neg,
+                days,
+                hour,
+                minute,
+                second,
+                micros,
+            } => Value::Time(*neg, *days, *hour, *minute, *second, *micros),
+            MysqlRawValue::Bytes(b) => {
+                if classify_column_type(&val.column) == LogicalColType::Float
+                    && let Ok(s) = std::str::from_utf8(b)
+                {
+                    let trimmed = s.trim();
+                    if val.column.udt_name.eq_ignore_ascii_case("float")
+                        && let Ok(f) = trimmed.parse::<f32>()
+                        && f.is_finite()
+                    {
+                        return Value::Float(f);
+                    }
+                    if let Ok(d) = trimmed.parse::<f64>()
+                        && d.is_finite()
+                    {
+                        return Value::Double(d);
+                    }
+                }
+                Value::Bytes(b.clone())
+            }
+        };
+    }
+    match &val.display {
+        CellValue::Null => Value::NULL,
+        CellValue::Bool(b) => Value::Int(i64::from(*b)),
+        CellValue::Int(i) => Value::Int(*i),
+        CellValue::Float(d) => {
+            if val.column.udt_name.eq_ignore_ascii_case("float") {
+                Value::Float(*d as f32)
+            } else {
+                Value::Double(*d)
+            }
+        }
+        CellValue::Bytes(b) => Value::Bytes(b.clone()),
+        other => Value::Bytes(other.copy_text().into_bytes()),
+    }
+}
+
+fn mysql_decimal_cast_type(data_type: &str) -> Option<String> {
+    let lower = data_type.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("decimal")
+        .or_else(|| lower.strip_prefix("numeric"))?
+        .trim_start();
+    let open = rest.strip_prefix('(')?;
+    let close = open.find(')')?;
+    let inner = &open[..close];
+    let mut parts = inner.split(',').map(str::trim);
+    let precision: u16 = parts.next()?.parse().ok()?;
+    if !(1..=65).contains(&precision) {
+        return None;
+    }
+    match parts.next() {
+        Some(scale_str) if parts.next().is_none() => {
+            let scale: u16 = scale_str.parse().ok()?;
+            if scale <= precision.min(30) {
+                Some(format!("DECIMAL({precision}, {scale})"))
+            } else {
+                None
+            }
+        }
+        None => Some(format!("DECIMAL({precision})")),
+        _ => None,
+    }
+}
+
+fn push_mysql_value_predicate(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    col: &ColumnMeta,
+    bound: Value,
+    is_pk: bool,
+) {
+    let q = DbEngine::Mysql.quote_ident(&col.name);
+    if matches!(bound, Value::NULL) {
+        clauses.push(format!("{q} IS NULL"));
+        return;
+    }
+    if classify_column_type(col) == LogicalColType::Json {
+        clauses.push(format!("{q} = CAST(? AS JSON)"));
+        params.push(bound);
+    } else if matches!(
+        col.udt_name.trim().to_ascii_lowercase().as_str(),
+        "decimal" | "numeric"
+    ) && let Some(cast_ty) = mysql_decimal_cast_type(&col.data_type)
+    {
+        clauses.push(format!("{q} = CAST(? AS {cast_ty})"));
+        params.push(bound);
+    } else if is_mysql_text_col(col) {
+        // Compare utf8mb4 bytes as BINARY so PAD SPACE trailing-space and case drift are detected.
+        let exact_eq = format!(
+            "CAST(CONVERT({q} USING utf8mb4) AS BINARY) = CAST(CONVERT(? USING utf8mb4) AS BINARY)"
+        );
+        if is_pk {
+            clauses.push(format!("{q} = ? AND {exact_eq}"));
+            params.push(bound.clone());
+            params.push(bound);
+        } else {
+            clauses.push(exact_eq);
+            params.push(bound);
+        }
+    } else {
+        clauses.push(format!("{q} = ?"));
+        params.push(bound);
+    }
+}
+
+fn append_mysql_predicates(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<Value>,
+    pk_predicates: &[StagedColumnValue],
+    concurrency_predicates: &[StagedColumnValue],
+) -> Result<(), DbError> {
+    if pk_predicates.is_empty() {
+        return Err(DbError::InvalidInput(
+            "table requires a primary key to update or delete existing rows safely".to_owned(),
+        ));
+    }
+    for pk in pk_predicates {
+        let bound = mysql_col_val_to_value(pk);
+        if matches!(bound, Value::NULL) {
+            return Err(DbError::InvalidInput(format!(
+                "primary key column '{}' cannot be NULL",
+                pk.column.name
+            )));
+        }
+        push_mysql_value_predicate(clauses, params, &pk.column, bound, true);
+    }
+    for col in concurrency_predicates {
+        let bound = mysql_col_val_to_value(col);
+        push_mysql_value_predicate(clauses, params, &col.column, bound, false);
+    }
+    Ok(())
+}
+
+pub(crate) fn build_mysql_staged_mutation_plan(
+    schema: &str,
+    table: &str,
+    mutation: &StagedMutation,
+) -> Result<MysqlMutationPlan, DbError> {
+    let fq_table = DbEngine::Mysql.qualify_ident(schema, table);
+    match mutation {
+        StagedMutation::Update {
+            row_label,
+            assignments,
+            pk_predicates,
+            concurrency_predicates,
+        } => {
+            if assignments.is_empty() {
+                return Err(DbError::InvalidInput("update has no column assignments".to_owned()));
+            }
+            let mut set_clauses = Vec::with_capacity(assignments.len());
+            let mut exec_params = Vec::new();
+            for a in assignments {
+                let (expr, maybe_param) = mysql_assignment_value(&a.column, &a.value);
+                set_clauses.push(format!("{} = {expr}", DbEngine::Mysql.quote_ident(&a.column.name)));
+                if let Some(p) = maybe_param {
+                    exec_params.push(p);
+                }
+            }
+            let mut where_clauses = Vec::new();
+            let mut lock_params = Vec::new();
+            append_mysql_predicates(
+                &mut where_clauses,
+                &mut lock_params,
+                pk_predicates,
+                concurrency_predicates,
+            )?;
+            exec_params.extend(lock_params.iter().cloned());
+            let where_sql = where_clauses.join(" AND ");
+            Ok(MysqlMutationPlan::Update {
+                row_label: row_label.clone(),
+                lock_sql: format!("SELECT COUNT(*) FROM {fq_table} WHERE {where_sql} FOR UPDATE"),
+                lock_params,
+                exec_sql: format!(
+                    "UPDATE {fq_table} SET {} WHERE {where_sql};",
+                    set_clauses.join(", ")
+                ),
+                exec_params,
+            })
+        }
+        StagedMutation::Insert {
+            row_label,
+            assignments,
+        } => {
+            if assignments.is_empty() {
+                return Ok(MysqlMutationPlan::Insert {
+                    row_label: row_label.clone(),
+                    exec_sql: format!("INSERT INTO {fq_table} () VALUES ();"),
+                    exec_params: Vec::new(),
+                });
+            }
+            let mut col_names = Vec::with_capacity(assignments.len());
+            let mut val_exprs = Vec::with_capacity(assignments.len());
+            let mut exec_params = Vec::new();
+            for a in assignments {
+                col_names.push(DbEngine::Mysql.quote_ident(&a.column.name));
+                let (expr, maybe_param) = mysql_assignment_value(&a.column, &a.value);
+                val_exprs.push(expr);
+                if let Some(p) = maybe_param {
+                    exec_params.push(p);
+                }
+            }
+            Ok(MysqlMutationPlan::Insert {
+                row_label: row_label.clone(),
+                exec_sql: format!(
+                    "INSERT INTO {fq_table} ({}) VALUES ({});",
+                    col_names.join(", "),
+                    val_exprs.join(", ")
+                ),
+                exec_params,
+            })
+        }
+        StagedMutation::Delete {
+            row_label,
+            pk_predicates,
+            concurrency_predicates,
+        } => {
+            let mut where_clauses = Vec::new();
+            let mut lock_params = Vec::new();
+            append_mysql_predicates(
+                &mut where_clauses,
+                &mut lock_params,
+                pk_predicates,
+                concurrency_predicates,
+            )?;
+            let where_sql = where_clauses.join(" AND ");
+            let exec_params = lock_params.clone();
+            Ok(MysqlMutationPlan::Delete {
+                row_label: row_label.clone(),
+                lock_sql: format!("SELECT COUNT(*) FROM {fq_table} WHERE {where_sql} FOR UPDATE"),
+                lock_params,
+                exec_sql: format!("DELETE FROM {fq_table} WHERE {where_sql};"),
+                exec_params,
+            })
+        }
+    }
+}
+
 fn value_to_string(val: &Value) -> String {
     match val {
         Value::NULL => String::new(),
@@ -3426,5 +4121,102 @@ mod tests {
         assert!(!should_run_cleanup_global_mode_refresh(true, false));
         assert!(!should_run_cleanup_global_mode_refresh(false, true));
         assert!(!should_run_cleanup_global_mode_refresh(true, true));
+    }
+
+    #[test]
+    fn mysql_tx_support_classifier_and_bound_mutation_planner() {
+        assert_eq!(
+            classify_mysql_table_transaction_support(Some("BASE TABLE"), Some("InnoDB"), Some("YES")),
+            TableTransactionSupport::Supported
+        );
+        assert_eq!(
+            classify_mysql_table_transaction_support(Some("BASE TABLE"), Some("MyISAM"), Some("NO")),
+            TableTransactionSupport::Unsupported {
+                engine: "MyISAM".to_owned(),
+            }
+        );
+        assert_eq!(
+            classify_mysql_table_transaction_support(Some("BASE TABLE"), Some("MEMORY"), None),
+            TableTransactionSupport::Unsupported {
+                engine: "MEMORY".to_owned(),
+            }
+        );
+        assert_eq!(
+            classify_mysql_table_transaction_support(Some("BASE TABLE"), Some("Aria"), Some("NO")),
+            TableTransactionSupport::Unsupported {
+                engine: "Aria".to_owned(),
+            }
+        );
+        assert_eq!(
+            classify_mysql_table_transaction_support(Some("BASE TABLE"), None, None),
+            TableTransactionSupport::Unknown
+        );
+        assert!(ensure_mysql_table_transactional(TableTransactionSupport::Supported, "greendale", "students").is_ok());
+        assert!(matches!(
+            ensure_mysql_table_transactional(
+                TableTransactionSupport::Unsupported {
+                    engine: "MyISAM".to_owned(),
+                },
+                "greendale",
+                "students",
+            ),
+            Err(DbError::NonTransactionalTable {
+                support: TableTransactionSupport::Unsupported { engine },
+                ..
+            }) if engine == "MyISAM"
+        ));
+
+        let mut pk_col = test_col("code", "varchar(32)", "varchar");
+        pk_col.is_primary_key = true;
+        let name_col = test_col("full_name", "varchar(128)", "varchar");
+        let meta_col = test_col("meta", "json", "json");
+        let dec_col = test_col("precise_id", "decimal(20,0)", "decimal");
+        let cols = vec![pk_col, name_col, meta_col, dec_col];
+
+        let orig_row = vec![
+            CellValue::Text("Study\\A".to_owned()),
+            CellValue::Text("Troy Barnes".to_owned()),
+            CellValue::Json(r#"{"dorm":"A"}"#.to_owned()),
+            CellValue::Numeric("9007199254740993".to_owned()),
+        ];
+        let mut staged = crate::staging::StagedChanges::new();
+        staged.stage_cell_edit(
+            0,
+            &orig_row,
+            1,
+            StagedCellValue::Literal(r"C:\greendale\troy's".to_owned()),
+        );
+        let batch = staged
+            .build_commit_batch(DbEngine::Mysql, "greendale", "students", &cols)
+            .expect("build commit batch");
+        let plan = build_mysql_staged_mutation_plan("greendale", "students", &batch.mutations[0])
+            .expect("build mysql plan");
+        match plan {
+            MysqlMutationPlan::Update {
+                lock_sql,
+                lock_params,
+                exec_sql,
+                exec_params,
+                ..
+            } => {
+                assert!(lock_sql.contains("SELECT COUNT(*) FROM `greendale`.`students` WHERE "));
+                assert!(lock_sql.ends_with(" FOR UPDATE"));
+                assert!(lock_sql.contains("CAST(CONVERT(`code` USING utf8mb4) AS BINARY) = CAST(CONVERT(? USING utf8mb4) AS BINARY)"));
+                assert!(lock_sql.contains("CAST(CONVERT(`full_name` USING utf8mb4) AS BINARY) = CAST(CONVERT(? USING utf8mb4) AS BINARY)"));
+                assert!(lock_sql.contains("`meta` = CAST(? AS JSON)"));
+                assert!(lock_sql.contains("`precise_id` = CAST(? AS DECIMAL(20, 0))"));
+                assert_eq!(
+                    lock_params[0],
+                    Value::Bytes(b"Study\\A".to_vec()),
+                );
+                assert!(exec_sql.starts_with("UPDATE `greendale`.`students` SET `full_name` = ? WHERE "));
+                assert!(!exec_sql.contains(r"\\"));
+                assert_eq!(
+                    exec_params[0],
+                    Value::Bytes(br"C:\greendale\troy's".to_vec()),
+                );
+            }
+            other => panic!("expected Update plan, got {other:?}"),
+        }
     }
 }

@@ -9,20 +9,22 @@ use tv_core::{
     AccentColor, AppSettings, AppearancePreference, CellValue, ColumnMeta, ConnectionId, ConnectionProfile,
     ConnectionStore, DbEngine, EnvTag, ExplainError, ExplainPlan, ExportFormat, ForeignKeyRef, IndexInfo,
     MysqlQuoteMode, NewHistoryEntry, PasswordMode, PostgresServerEncoding, PostgresSessionMode, QueryStatementResult,
-    QueryStore,
-    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SettingsStore, SortOrder, SqlSessionMode, SslMode,
-    StagedCellValue, StagedChanges, StagingError, StatementRisk, StoreData, UrlParseError, ValidationError,
+    QueryStore, RawCellValue,
+    SafetyDecision, SafetyPolicy, SavedQuery, SavedQueryId, SettingsStore, SortOrder, SqlSessionMode, SqliteRawValue,
+    SslMode, StagedCellValue, StagedChanges, StagedMutation, StagingError, StatementRisk, StoreData, UrlParseError,
+    ValidationError,
     atomic_write_bytes, batch_sets_credentials_with_mysql_mode, batch_sets_credentials_with_session_mode,
     build_explain_sql, build_explain_sql_for_engine, build_fk_where_clause, build_fk_where_clause_for_engine,
     cursor_line_col, evaluate_sql_safety, evaluate_sql_safety_for_engine,
     evaluate_sql_safety_for_engine_with_mysql_mode, evaluate_sql_safety_for_engine_with_session_mode,
     evaluate_staged_commit_safety, export_csv, export_json, export_rows, export_rows_for_engine, export_sql_inserts,
-    export_sql_inserts_for_engine, format_sql, has_executable_sql_for_engine, inspect_statement,
-    inspect_statement_for_engine, inspect_statement_for_engine_with_session_mode,
+    export_sql_inserts_for_engine, format_mysql_string_literal, format_sql, has_executable_sql_for_engine,
+    inspect_statement, inspect_statement_for_engine, inspect_statement_for_engine_with_session_mode,
     postgres_slice_has_multiple_statements, split_statements, split_statements_for_engine,
     split_statements_for_engine_with_mysql_mode, split_statements_for_engine_with_session_mode, sql_sets_credentials,
     sql_sets_credentials_with_session_mode, statement_at_cursor, statement_at_cursor_for_engine,
     statement_at_cursor_for_engine_with_mysql_mode, statement_at_cursor_for_engine_with_session_mode,
+    validate_row_editable,
 };
 
 #[test]
@@ -648,9 +650,9 @@ fn staged_changes_build_transaction_diff_and_revert_cleanly() {
         .build_transaction_sql("public", "students", &cols)
         .expect("build tx sql");
     assert!(tx_sql.starts_with("BEGIN;\n"));
-    assert!(tx_sql.contains("UPDATE \"public\".\"students\" SET \"full_name\" = 'Troy ''T-Bone'' Barnes' WHERE \"student_id\" = 1;"));
+    assert!(tx_sql.contains("UPDATE \"public\".\"students\" SET \"full_name\" = 'Troy ''T-Bone'' Barnes' WHERE \"student_id\" = 1 AND \"full_name\"::text COLLATE \"C\" = 'Troy Barnes' COLLATE \"C\" AND \"email\"::text COLLATE \"C\" = 'troy@greendale.edu' COLLATE \"C\" AND \"gpa\"::text COLLATE \"C\" = '3.45' COLLATE \"C\" AND \"profile\"::text COLLATE \"C\" = '{\"handshake\":true}' COLLATE \"C\" AND \"badge\" = '\\xdead'::bytea;"));
     assert!(tx_sql.contains("INSERT INTO \"public\".\"students\" (\"full_name\", \"email\", \"gpa\", \"profile\", \"badge\") VALUES ('Pierce Hawthorne', NULL, 2.15, NULL, '\\xcafe'::bytea);"));
-    assert!(tx_sql.contains("DELETE FROM \"public\".\"students\" WHERE \"student_id\" = 2;"));
+    assert!(tx_sql.contains("DELETE FROM \"public\".\"students\" WHERE \"student_id\" = 2 AND \"full_name\"::text COLLATE \"C\" = 'Abed Nadir' COLLATE \"C\" AND \"email\" IS NULL AND \"gpa\"::text COLLATE \"C\" = '3.92' COLLATE \"C\" AND \"profile\" IS NULL AND \"badge\" IS NULL;"));
     assert!(tx_sql.ends_with("COMMIT;\n"));
 
     let (before, after) = staged.build_diff_texts("public", "students", &cols);
@@ -1192,18 +1194,22 @@ fn staged_changes_build_statements_and_transactions_for_mysql_and_sqlite() {
     assert_eq!(my_stmts.len(), 3);
     assert_eq!(
         my_stmts[0],
-        "UPDATE `greendale`.`students` SET `full_name` = 'Britta''s \\\\protest', `enrolled` = FALSE, `badge` = X'cafe', `metadata` = '{\"note\":\"a''b\\\\c\"}' WHERE `student_id` = 1;"
+        "UPDATE `greendale`.`students` SET `full_name` = CONCAT('Britta''s ', CHAR(92 USING utf8mb4), 'protest'), `enrolled` = FALSE, `badge` = X'cafe', `metadata` = CONCAT('{\"note\":\"a''b', CHAR(92 USING utf8mb4), 'c\"}') WHERE `student_id` = 1 AND CAST(CONVERT(`full_name` USING utf8mb4) AS BINARY) = CAST(CONVERT('Britta Perry' USING utf8mb4) AS BINARY) AND `enrolled` = TRUE AND `gpa` = 2.85 AND `badge` = X'abcd' AND `metadata` = CAST('{\"major\":\"psych\"}' AS JSON);"
     );
     assert_eq!(
         my_stmts[1],
         "INSERT INTO `greendale`.`students` (`full_name`, `enrolled`, `gpa`, `badge`, `metadata`) VALUES ('Shirley Bennett', TRUE, 3.88, X'beef', '{\"club\":\"baking\"}');"
     );
-    assert_eq!(my_stmts[2], "DELETE FROM `greendale`.`students` WHERE `student_id` = 2;");
+    assert_eq!(
+        my_stmts[2],
+        "DELETE FROM `greendale`.`students` WHERE `student_id` = 2 AND CAST(CONVERT(`full_name` USING utf8mb4) AS BINARY) = CAST(CONVERT('Pierce Hawthorne' USING utf8mb4) AS BINARY) AND `enrolled` = FALSE AND `gpa` IS NULL AND `badge` IS NULL AND `metadata` IS NULL;"
+    );
 
     let my_tx = staged
         .build_transaction_sql_for_engine(DbEngine::Mysql, "greendale", "students", &cols)
         .expect("mysql tx sql");
     assert!(my_tx.starts_with("START TRANSACTION;\n\n"));
+    assert!(!my_tx.contains('\\'));
     assert!(my_tx.ends_with("\n\nCOMMIT;\n"));
 
     // SQLite dialect (double-quoted identifiers, 1/0 bools, X'...' bytes, no `::` casts)
@@ -1213,13 +1219,16 @@ fn staged_changes_build_statements_and_transactions_for_mysql_and_sqlite() {
     assert_eq!(sl_stmts.len(), 3);
     assert_eq!(
         sl_stmts[0],
-        "UPDATE \"students\" SET \"full_name\" = 'Britta''s \\protest', \"enrolled\" = 0, \"badge\" = X'cafe', \"metadata\" = '{\"note\":\"a''b\\c\"}' WHERE \"student_id\" = 1;"
+        "UPDATE \"students\" SET \"full_name\" = 'Britta''s \\protest', \"enrolled\" = 0, \"badge\" = X'cafe', \"metadata\" = '{\"note\":\"a''b\\c\"}' WHERE \"student_id\" = 1 AND \"full_name\" COLLATE BINARY = 'Britta Perry' AND \"enrolled\" = 1 AND \"gpa\" = 2.85 AND \"badge\" = X'abcd' AND \"metadata\" COLLATE BINARY = '{\"major\":\"psych\"}';"
     );
     assert_eq!(
         sl_stmts[1],
         "INSERT INTO \"students\" (\"full_name\", \"enrolled\", \"gpa\", \"badge\", \"metadata\") VALUES ('Shirley Bennett', 1, 3.88, X'beef', '{\"club\":\"baking\"}');"
     );
-    assert_eq!(sl_stmts[2], "DELETE FROM \"students\" WHERE \"student_id\" = 2;");
+    assert_eq!(
+        sl_stmts[2],
+        "DELETE FROM \"students\" WHERE \"student_id\" = 2 AND \"full_name\" COLLATE BINARY = 'Pierce Hawthorne' AND \"enrolled\" = 0 AND \"gpa\" IS NULL AND \"badge\" IS NULL AND \"metadata\" IS NULL;"
+    );
     for stmt in &sl_stmts {
         assert!(!stmt.contains("::"), "sqlite SQL must not contain :: casts: {stmt}");
     }
@@ -1255,7 +1264,7 @@ fn staged_changes_build_statements_and_transactions_for_mysql_and_sqlite() {
             &CellValue::Text(r"Troy's \Fort".to_owned()),
             &cols[1],
         ),
-        Some("`full_name` = 'Troy''s \\\\Fort'".to_owned())
+        Some("`full_name` = CONCAT('Troy''s ', CHAR(92 USING utf8mb4), 'Fort')".to_owned())
     );
     assert_eq!(
         build_fk_where_clause_for_engine(DbEngine::Sqlite, "enrolled", &CellValue::Bool(true), &cols[2]),
@@ -1278,8 +1287,9 @@ fn export_rows_and_sql_inserts_support_mysql_and_sqlite() {
     let mysql_inserts = export_sql_inserts_for_engine(DbEngine::Mysql, Some("greendale"), "students", &cols, &rows);
     assert_eq!(
         mysql_inserts,
-        "INSERT INTO `greendale`.`students` (`student_id`, `full_name`, `enrolled`, `gpa`, `badge`, `metadata`) VALUES (1, 'Troy ''T-Bone'' \\\\Barnes', TRUE, 3.45, X'cafe', '{\"campus\":\"Greendale\"}');\n"
+        "INSERT INTO `greendale`.`students` (`student_id`, `full_name`, `enrolled`, `gpa`, `badge`, `metadata`) VALUES (1, CONCAT('Troy ''T-Bone'' ', CHAR(92 USING utf8mb4), 'Barnes'), TRUE, 3.45, X'cafe', '{\"campus\":\"Greendale\"}');\n"
     );
+    assert!(!mysql_inserts.contains('\\'));
     assert_eq!(
         export_rows_for_engine(
             DbEngine::Mysql,
@@ -1312,6 +1322,93 @@ fn export_rows_and_sql_inserts_support_mysql_and_sqlite() {
         export_rows_for_engine(DbEngine::Sqlite, ExportFormat::Json, None, "students", &cols, &rows),
         export_json(&cols, &rows)
     );
+}
+
+#[test]
+fn staging_validation_rejects_null_pks_non_utf8_sqlite_and_preserves_mysql_backslashes() {
+    let cols = sample_multi_engine_columns();
+    let null_pk_row = vec![
+        CellValue::Null,
+        CellValue::Text("Chang".to_owned()),
+        CellValue::Bool(true),
+        CellValue::Null,
+        CellValue::Null,
+        CellValue::Null,
+    ];
+    let null_pk_raw = vec![
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+        RawCellValue::Sqlite(SqliteRawValue::Text("Chang".to_owned())),
+        RawCellValue::Sqlite(SqliteRawValue::Integer(1)),
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+    ];
+    assert!(validate_row_editable(DbEngine::Sqlite, &cols, &null_pk_row, Some(&null_pk_raw)).is_err());
+
+    let mut null_staged = StagedChanges::new();
+    null_staged.stage_cell_edit_with_raw(
+        0,
+        &null_pk_row,
+        Some(&null_pk_raw),
+        1,
+        StagedCellValue::Literal("Kevin".to_owned()),
+    );
+    assert!(matches!(
+        null_staged.build_commit_batch(DbEngine::Sqlite, "main", "students", &cols),
+        Err(StagingError::NullPrimaryKey { .. })
+    ));
+
+    let valid_row = vec![
+        CellValue::Int(7),
+        CellValue::Text("Chang".to_owned()),
+        CellValue::Bool(true),
+        CellValue::Null,
+        CellValue::Null,
+        CellValue::Null,
+    ];
+    let non_utf8_raw = vec![
+        RawCellValue::Sqlite(SqliteRawValue::Integer(7)),
+        RawCellValue::Sqlite(SqliteRawValue::NonUtf8Text(vec![0xff, 0xfe])),
+        RawCellValue::Sqlite(SqliteRawValue::Integer(1)),
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+        RawCellValue::Sqlite(SqliteRawValue::Null),
+    ];
+    assert!(validate_row_editable(DbEngine::Sqlite, &cols, &valid_row, Some(&non_utf8_raw)).is_err());
+    let mut non_utf8_staged = StagedChanges::new();
+    non_utf8_staged.toggle_delete_row_with_raw(0, &valid_row, Some(&non_utf8_raw));
+    assert!(matches!(
+        non_utf8_staged.build_commit_batch(DbEngine::Sqlite, "main", "students", &cols),
+        Err(StagingError::UnbindableSqliteText { .. })
+    ));
+
+    // MySQL backslash expressions never contain raw `\` across 1, 2, and >=3 consecutive slashes.
+    assert_eq!(format_mysql_string_literal(r"\"), "CHAR(92 USING utf8mb4)");
+    assert_eq!(format_mysql_string_literal(r"\\"), "CHAR(92, 92 USING utf8mb4)");
+    assert_eq!(
+        format_mysql_string_literal(r"\\\"),
+        "REPEAT(CHAR(92 USING utf8mb4), 3)"
+    );
+    let mut bs_staged = StagedChanges::new();
+    let bs_row = vec![
+        CellValue::Int(9),
+        CellValue::Text(r"C:\greendale\\a'b".to_owned()),
+        CellValue::Bool(true),
+        CellValue::Null,
+        CellValue::Null,
+        CellValue::Null,
+    ];
+    bs_staged.stage_cell_edit(0, &bs_row, 1, StagedCellValue::Literal(r"D:\study\\\room".to_owned()));
+    let batch = bs_staged
+        .build_commit_batch(DbEngine::Mysql, "greendale", "students", &cols)
+        .expect("build mysql batch");
+    assert_eq!(batch.mutations.len(), 1);
+    assert!(matches!(&batch.mutations[0], StagedMutation::Update { .. }));
+    let sql = batch.render_sql(DbEngine::Mysql).expect("render mysql sql");
+    assert!(!sql[0].contains('\\'), "mysql rendered SQL must not depend on NO_BACKSLASH_ESCAPES: {}", sql[0]);
+    assert!(sql[0].contains(
+        "CAST(CONVERT(`full_name` USING utf8mb4) AS BINARY) = CAST(CONVERT(CONCAT('C:', CHAR(92 USING utf8mb4), 'greendale', CHAR(92, 92 USING utf8mb4), 'a''b') USING utf8mb4) AS BINARY)"
+    ));
 }
 
 #[test]

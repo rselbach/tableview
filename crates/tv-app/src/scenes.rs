@@ -7,7 +7,7 @@ use tv_core::{
     DbObjectKind, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow, ForeignKeyRef, IndexInfo,
     PasswordMode, QueryHistoryEntry, QueryStatementResult, RequestId, SafetyPolicy, SavedQuery, SavedQueryId,
     SchemaInfo, SessionId, SortSpec, SslMode, StagedCellValue, StatementRisk, StoreData, TablePage, TableStats,
-    TableStructure, inspect_statement,
+    TableStructure, TableTransactionSupport, inspect_statement,
 };
 
 use crate::state::{
@@ -1204,6 +1204,8 @@ fn sample_students_page(columns: Vec<ColumnMeta>) -> TablePage {
     TablePage {
         columns,
         rows,
+        raw_rows: Vec::new(),
+        transaction_support: TableTransactionSupport::Supported,
         offset: 0,
         limit: 300,
         total_rows_estimate: Some(8),
@@ -1249,6 +1251,8 @@ fn sample_courses_page() -> TablePage {
                 CellValue::Text("Introduction to Anthropology".to_owned()),
             ],
         ],
+        raw_rows: Vec::new(),
+        transaction_support: TableTransactionSupport::Supported,
         offset: 0,
         limit: 300,
         total_rows_estimate: Some(2),
@@ -1299,6 +1303,7 @@ fn sample_students_structure(columns: Vec<ColumnMeta>) -> TableStructure {
             estimated_rows: Some(8),
             comment: Some("Greendale Community College active roster".to_owned()),
             ddl,
+            transaction_support: TableTransactionSupport::Supported,
         },
     }
 }

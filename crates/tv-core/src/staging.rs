@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::connection::DbEngine;
-use crate::engine::{CellValue, ColumnMeta};
+use crate::engine::{CellValue, ColumnMeta, RawCellValue, SqliteRawValue};
 
 /// Identifier for a newly inserted unsaved row inside a table tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -29,7 +29,7 @@ pub enum StagedCellValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogicalColType {
+pub(crate) enum LogicalColType {
     Bool,
     Int,
     Float,
@@ -45,7 +45,7 @@ enum LogicalColType {
     Text,
 }
 
-fn classify_column_type(col: &ColumnMeta) -> LogicalColType {
+pub(crate) fn classify_column_type(col: &ColumnMeta) -> LogicalColType {
     let udt = col.udt_name.trim().to_ascii_lowercase();
     let dtype = col.data_type.trim().to_ascii_lowercase();
     if udt.starts_with("tinyint(1)")
@@ -161,7 +161,15 @@ fn format_cell_for_diff(val: &CellValue) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StagedRowUpdate {
     pub original_row: Vec<CellValue>,
+    pub original_raw_row: Option<Vec<RawCellValue>>,
     pub edits: BTreeMap<usize, StagedCellValue>,
+}
+
+/// Staged deletion targeting one existing fetched page row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedRowDelete {
+    pub original_row: Vec<CellValue>,
+    pub original_raw_row: Option<Vec<RawCellValue>>,
 }
 
 /// Staged unsaved insert row awaiting transactional commit.
@@ -171,20 +179,112 @@ pub struct StagedInsertRow {
     pub values: Vec<StagedCellValue>,
 }
 
-/// Validation errors returned when generating SQL from staged table changes.
+/// Validation errors returned when generating SQL or bound mutations from staged table changes.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StagingError {
     #[error("table {schema}.{table} requires a primary key to update or delete existing rows safely")]
     MissingPrimaryKey { schema: String, table: String },
+    #[error("cannot safely identify {schema}.{table} ({row_label}): primary key contains NULL")]
+    NullPrimaryKey {
+        schema: String,
+        table: String,
+        row_label: String,
+    },
+    #[error("cannot safely target {schema}.{table} ({row_label}): row contains non-UTF-8 SQLite TEXT")]
+    UnbindableSqliteText {
+        schema: String,
+        table: String,
+        row_label: String,
+    },
     #[error("no staged changes to commit")]
     EmptyChanges,
+}
+
+/// Captured original value for an existing row column used in PK identity or optimistic concurrency predicates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedColumnValue {
+    pub column: ColumnMeta,
+    pub display: CellValue,
+    pub raw: Option<RawCellValue>,
+}
+
+/// One pending column assignment inside a staged update or insert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedColumnAssignment {
+    pub column: ColumnMeta,
+    pub value: StagedCellValue,
+}
+
+/// One bound-safe mutation inside a transactional staged commit batch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StagedMutation {
+    Update {
+        row_label: String,
+        assignments: Vec<StagedColumnAssignment>,
+        pk_predicates: Vec<StagedColumnValue>,
+        concurrency_predicates: Vec<StagedColumnValue>,
+    },
+    Insert {
+        row_label: String,
+        assignments: Vec<StagedColumnAssignment>,
+    },
+    Delete {
+        row_label: String,
+        pk_predicates: Vec<StagedColumnValue>,
+        concurrency_predicates: Vec<StagedColumnValue>,
+    },
+}
+
+/// Structured batch of staged row updates, inserts, and deletes executed inside a single transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedCommitBatch {
+    pub schema: String,
+    pub table: String,
+    pub mutations: Vec<StagedMutation>,
+}
+
+/// Checks whether an existing row has a reliable non-NULL primary key and bindable raw values before staging edits.
+pub fn validate_row_editable(
+    engine: DbEngine,
+    columns: &[ColumnMeta],
+    row: &[CellValue],
+    raw_row: Option<&[RawCellValue]>,
+) -> Result<(), String> {
+    let pk_indices: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| col.is_primary_key.then_some(idx))
+        .collect();
+    if pk_indices.is_empty() {
+        return Err("Table requires a primary key to edit existing rows safely".to_owned());
+    }
+    for &idx in &pk_indices {
+        let raw_is_null = raw_row.is_some_and(|raw| raw.get(idx).is_none_or(RawCellValue::is_null));
+        let display_is_null = row.get(idx).is_none_or(CellValue::is_null);
+        if raw_is_null || display_is_null {
+            return Err(format!(
+                "Row cannot be safely edited or deleted because primary key column '{}' is NULL",
+                columns[idx].name
+            ));
+        }
+    }
+    if engine == DbEngine::Sqlite
+        && let Some(raw) = raw_row
+        && raw.iter().any(|cell| matches!(cell, RawCellValue::Sqlite(SqliteRawValue::NonUtf8Text(_))))
+    {
+        return Err(
+            "Row contains non-UTF-8 SQLite TEXT bytes and cannot be safely edited or deleted"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Pending inline cell edits, inserted draft rows, and marked-for-delete rows for one table tab.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StagedChanges {
     pub updates: BTreeMap<usize, StagedRowUpdate>,
-    pub deletes: BTreeMap<usize, Vec<CellValue>>,
+    pub deletes: BTreeMap<usize, StagedRowDelete>,
     pub inserts: Vec<StagedInsertRow>,
     next_draft_id: u64,
 }
@@ -233,6 +333,18 @@ impl StagedChanges {
         col_idx: usize,
         value: StagedCellValue,
     ) {
+        self.stage_cell_edit_with_raw(row_idx, original_row, None, col_idx, value);
+    }
+
+    /// Stages or reverts a single cell edit on an existing fetched row while retaining its original raw wire values.
+    pub fn stage_cell_edit_with_raw(
+        &mut self,
+        row_idx: usize,
+        original_row: &[CellValue],
+        original_raw_row: Option<&[RawCellValue]>,
+        col_idx: usize,
+        value: StagedCellValue,
+    ) {
         let Some(orig_cell) = original_row.get(col_idx) else {
             return;
         };
@@ -247,8 +359,14 @@ impl StagedChanges {
         }
         let entry = self.updates.entry(row_idx).or_insert_with(|| StagedRowUpdate {
             original_row: original_row.to_vec(),
+            original_raw_row: original_raw_row.map(<[RawCellValue]>::to_vec),
             edits: BTreeMap::new(),
         });
+        if entry.original_raw_row.is_none()
+            && let Some(raw) = original_raw_row
+        {
+            entry.original_raw_row = Some(raw.to_vec());
+        }
         entry.edits.insert(col_idx, value);
     }
 
@@ -290,11 +408,27 @@ impl StagedChanges {
 
     /// Toggles deletion status on an existing row. Marking deleted discards pending field updates on that row.
     pub fn toggle_delete_row(&mut self, row_idx: usize, original_row: &[CellValue]) -> bool {
+        self.toggle_delete_row_with_raw(row_idx, original_row, None)
+    }
+
+    /// Toggles deletion status on an existing row while retaining its original raw wire values.
+    pub fn toggle_delete_row_with_raw(
+        &mut self,
+        row_idx: usize,
+        original_row: &[CellValue],
+        original_raw_row: Option<&[RawCellValue]>,
+    ) -> bool {
         if self.deletes.remove(&row_idx).is_some() {
             false
         } else {
             self.updates.remove(&row_idx);
-            self.deletes.insert(row_idx, original_row.to_vec());
+            self.deletes.insert(
+                row_idx,
+                StagedRowDelete {
+                    original_row: original_row.to_vec(),
+                    original_raw_row: original_raw_row.map(<[RawCellValue]>::to_vec),
+                },
+            );
             true
         }
     }
@@ -325,14 +459,14 @@ impl StagedChanges {
         self.build_statements_for_engine(DbEngine::Postgres, schema, table, columns)
     }
 
-    /// Generates dialect-aware SQL statements (single transaction order: updates, inserts, deletes).
-    pub fn build_statements_for_engine(
+    /// Validates staged changes and builds a bound-safe commit batch with PK and optimistic concurrency checks.
+    pub fn build_commit_batch(
         &self,
         engine: DbEngine,
         schema: &str,
         table: &str,
         columns: &[ColumnMeta],
-    ) -> Result<Vec<String>, StagingError> {
+    ) -> Result<StagedCommitBatch, StagingError> {
         if self.is_empty() {
             return Err(StagingError::EmptyChanges);
         }
@@ -350,71 +484,106 @@ impl StagedChanges {
             });
         }
 
-        let fq_table = engine.qualify_ident(schema, table);
-        let mut stmts = Vec::with_capacity(self.updates.len() + self.inserts.len() + self.deletes.len());
+        let mut mutations = Vec::with_capacity(self.updates.len() + self.inserts.len() + self.deletes.len());
 
         // 1. Updates
         for (row_idx, upd) in &self.updates {
             if self.deletes.contains_key(row_idx) || upd.edits.is_empty() {
                 continue;
             }
-            let set_clauses: Vec<String> = upd
+            let assignments: Vec<StagedColumnAssignment> = upd
                 .edits
                 .iter()
                 .filter_map(|(&col_idx, val)| {
                     let col = columns.get(col_idx)?;
-                    Some(format!(
-                        "{} = {}",
-                        engine.quote_ident(&col.name),
-                        format_literal(engine, col, val)
-                    ))
+                    Some(StagedColumnAssignment {
+                        column: col.clone(),
+                        value: val.clone(),
+                    })
                 })
                 .collect();
-            if set_clauses.is_empty() {
+            if assignments.is_empty() {
                 continue;
             }
-            let where_sql = build_pk_where(engine, &pk_indices, columns, &upd.original_row);
-            stmts.push(format!("UPDATE {fq_table} SET {} WHERE {where_sql};", set_clauses.join(", ")));
+            let row_label = format_row_label(*row_idx, &pk_indices, columns, &upd.original_row);
+            let (pk_predicates, concurrency_predicates) = build_row_predicates(
+                engine,
+                schema,
+                table,
+                &row_label,
+                &pk_indices,
+                columns,
+                &upd.original_row,
+                upd.original_raw_row.as_deref(),
+            )?;
+            mutations.push(StagedMutation::Update {
+                row_label,
+                assignments,
+                pk_predicates,
+                concurrency_predicates,
+            });
         }
 
         // 2. Inserts
         for draft in &self.inserts {
-            let mut col_names = Vec::new();
-            let mut val_exprs = Vec::new();
+            let mut assignments = Vec::new();
             for (col_idx, col) in columns.iter().enumerate() {
                 let staged_val = draft.values.get(col_idx).unwrap_or(&StagedCellValue::DefaultExpr);
                 if matches!(staged_val, StagedCellValue::DefaultExpr) {
                     continue;
                 }
-                col_names.push(engine.quote_ident(&col.name));
-                val_exprs.push(format_literal(engine, col, staged_val));
+                assignments.push(StagedColumnAssignment {
+                    column: col.clone(),
+                    value: staged_val.clone(),
+                });
             }
-            if col_names.is_empty() {
-                match engine {
-                    DbEngine::Mysql => stmts.push(format!("INSERT INTO {fq_table} () VALUES ();")),
-                    DbEngine::Postgres | DbEngine::Sqlite => {
-                        stmts.push(format!("INSERT INTO {fq_table} DEFAULT VALUES;"));
-                    }
-                }
-            } else {
-                stmts.push(format!(
-                    "INSERT INTO {fq_table} ({}) VALUES ({});",
-                    col_names.join(", "),
-                    val_exprs.join(", ")
-                ));
-            }
+            mutations.push(StagedMutation::Insert {
+                row_label: format!("New Row #{}", draft.id.get()),
+                assignments,
+            });
         }
 
         // 3. Deletes
-        for original_row in self.deletes.values() {
-            let where_sql = build_pk_where(engine, &pk_indices, columns, original_row);
-            stmts.push(format!("DELETE FROM {fq_table} WHERE {where_sql};"));
+        for (row_idx, del) in &self.deletes {
+            let row_label = format_row_label(*row_idx, &pk_indices, columns, &del.original_row);
+            let (pk_predicates, concurrency_predicates) = build_row_predicates(
+                engine,
+                schema,
+                table,
+                &row_label,
+                &pk_indices,
+                columns,
+                &del.original_row,
+                del.original_raw_row.as_deref(),
+            )?;
+            mutations.push(StagedMutation::Delete {
+                row_label,
+                pk_predicates,
+                concurrency_predicates,
+            });
         }
 
-        if stmts.is_empty() {
+        if mutations.is_empty() {
             return Err(StagingError::EmptyChanges);
         }
-        Ok(stmts)
+
+        Ok(StagedCommitBatch {
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+            mutations,
+        })
+    }
+
+    /// Generates dialect-aware SQL statements (single transaction order: updates, inserts, deletes).
+    pub fn build_statements_for_engine(
+        &self,
+        engine: DbEngine,
+        schema: &str,
+        table: &str,
+        columns: &[ColumnMeta],
+    ) -> Result<Vec<String>, StagingError> {
+        self.build_commit_batch(engine, schema, table, columns)?
+            .render_sql(engine)
     }
 
     /// Formats all staged changes as a readable `BEGIN; ... COMMIT;` SQL script.
@@ -490,11 +659,11 @@ impl StagedChanges {
             after.push('\n');
         }
 
-        for (row_idx, original_row) in &self.deletes {
-            let row_tag = format_row_label(*row_idx, &pk_indices, columns, original_row);
-            before.push_str(&format!("-- {schema}.{table} {row_tag} [DELETE]\n"));
+        for (row_idx, del) in &self.deletes {
+            let row_label = format_row_label(*row_idx, &pk_indices, columns, &del.original_row);
+            before.push_str(&format!("-- {schema}.{table} {row_label} [DELETE]\n"));
             for (col_idx, col) in columns.iter().enumerate() {
-                let orig = original_row.get(col_idx).unwrap_or(&CellValue::Null);
+                let orig = del.original_row.get(col_idx).unwrap_or(&CellValue::Null);
                 before.push_str(&format!("  {} = {}\n", col.name, format_cell_for_diff(orig)));
             }
             before.push('\n');
@@ -524,24 +693,319 @@ fn format_row_label(
     parts.join(", ")
 }
 
-fn build_pk_where(engine: DbEngine, pk_indices: &[usize], columns: &[ColumnMeta], row: &[CellValue]) -> String {
-    let clauses: Vec<String> = pk_indices
-        .iter()
-        .filter_map(|&idx| {
-            let col = columns.get(idx)?;
-            let val = row.get(idx).unwrap_or(&CellValue::Null);
-            if val.is_null() {
-                Some(format!("{} IS NULL", engine.quote_ident(&col.name)))
-            } else {
-                Some(format!(
-                    "{} = {}",
-                    engine.quote_ident(&col.name),
-                    format_cell_literal(engine, col, val)
-                ))
+#[allow(clippy::too_many_arguments)]
+fn build_row_predicates(
+    engine: DbEngine,
+    schema: &str,
+    table: &str,
+    row_label: &str,
+    pk_indices: &[usize],
+    columns: &[ColumnMeta],
+    row: &[CellValue],
+    raw_row: Option<&[RawCellValue]>,
+) -> Result<(Vec<StagedColumnValue>, Vec<StagedColumnValue>), StagingError> {
+    let mut pk_predicates = Vec::with_capacity(pk_indices.len());
+    for &idx in pk_indices {
+        let Some(col) = columns.get(idx) else {
+            continue;
+        };
+        let raw = raw_row.and_then(|r| r.get(idx)).cloned();
+        let display = row.get(idx).cloned().unwrap_or(CellValue::Null);
+        if raw.as_ref().is_some_and(RawCellValue::is_null) || display.is_null() {
+            return Err(StagingError::NullPrimaryKey {
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+                row_label: row_label.to_owned(),
+            });
+        }
+        if engine == DbEngine::Sqlite
+            && matches!(raw, Some(RawCellValue::Sqlite(SqliteRawValue::NonUtf8Text(_))))
+        {
+            return Err(StagingError::UnbindableSqliteText {
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+                row_label: row_label.to_owned(),
+            });
+        }
+        pk_predicates.push(StagedColumnValue {
+            column: col.clone(),
+            display,
+            raw,
+        });
+    }
+
+    let mut concurrency_predicates = Vec::with_capacity(columns.len().saturating_sub(pk_indices.len()));
+    for (idx, col) in columns.iter().enumerate() {
+        if col.is_primary_key {
+            continue;
+        }
+        let raw = raw_row.and_then(|r| r.get(idx)).cloned();
+        let display = row.get(idx).cloned().unwrap_or(CellValue::Null);
+        if engine == DbEngine::Sqlite
+            && matches!(raw, Some(RawCellValue::Sqlite(SqliteRawValue::NonUtf8Text(_))))
+        {
+            return Err(StagingError::UnbindableSqliteText {
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+                row_label: row_label.to_owned(),
+            });
+        }
+        concurrency_predicates.push(StagedColumnValue {
+            column: col.clone(),
+            display,
+            raw,
+        });
+    }
+
+    Ok((pk_predicates, concurrency_predicates))
+}
+
+impl StagedCommitBatch {
+    /// Renders SQL statements for display in diffs / copy-SQL or generic fallback execution.
+    pub fn render_sql(&self, engine: DbEngine) -> Result<Vec<String>, StagingError> {
+        if self.mutations.is_empty() {
+            return Err(StagingError::EmptyChanges);
+        }
+        let fq_table = engine.qualify_ident(&self.schema, &self.table);
+        let mut stmts = Vec::with_capacity(self.mutations.len());
+
+        for mutation in &self.mutations {
+            match mutation {
+                StagedMutation::Update {
+                    row_label,
+                    assignments,
+                    pk_predicates,
+                    concurrency_predicates,
+                } => {
+                    let set_clauses: Vec<String> = assignments
+                        .iter()
+                        .map(|a| {
+                            format!(
+                                "{} = {}",
+                                engine.quote_ident(&a.column.name),
+                                format_literal(engine, &a.column, &a.value)
+                            )
+                        })
+                        .collect();
+                    let where_sql = render_predicates_where(
+                        engine,
+                        &self.schema,
+                        &self.table,
+                        row_label,
+                        pk_predicates,
+                        concurrency_predicates,
+                    )?;
+                    stmts.push(format!(
+                        "UPDATE {fq_table} SET {} WHERE {where_sql};",
+                        set_clauses.join(", ")
+                    ));
+                }
+                StagedMutation::Insert { assignments, .. } => {
+                    if assignments.is_empty() {
+                        match engine {
+                            DbEngine::Mysql => stmts.push(format!("INSERT INTO {fq_table} () VALUES ();")),
+                            DbEngine::Postgres | DbEngine::Sqlite => {
+                                stmts.push(format!("INSERT INTO {fq_table} DEFAULT VALUES;"));
+                            }
+                        }
+                    } else {
+                        let col_names: Vec<String> = assignments
+                            .iter()
+                            .map(|a| engine.quote_ident(&a.column.name))
+                            .collect();
+                        let val_exprs: Vec<String> = assignments
+                            .iter()
+                            .map(|a| format_literal(engine, &a.column, &a.value))
+                            .collect();
+                        stmts.push(format!(
+                            "INSERT INTO {fq_table} ({}) VALUES ({});",
+                            col_names.join(", "),
+                            val_exprs.join(", ")
+                        ));
+                    }
+                }
+                StagedMutation::Delete {
+                    row_label,
+                    pk_predicates,
+                    concurrency_predicates,
+                } => {
+                    let where_sql = render_predicates_where(
+                        engine,
+                        &self.schema,
+                        &self.table,
+                        row_label,
+                        pk_predicates,
+                        concurrency_predicates,
+                    )?;
+                    stmts.push(format!("DELETE FROM {fq_table} WHERE {where_sql};"));
+                }
             }
-        })
-        .collect();
-    clauses.join(" AND ")
+        }
+
+        Ok(stmts)
+    }
+}
+
+fn render_predicates_where(
+    engine: DbEngine,
+    schema: &str,
+    table: &str,
+    row_label: &str,
+    pk_predicates: &[StagedColumnValue],
+    concurrency_predicates: &[StagedColumnValue],
+) -> Result<String, StagingError> {
+    if pk_predicates.is_empty() {
+        return Err(StagingError::MissingPrimaryKey {
+            schema: schema.to_owned(),
+            table: table.to_owned(),
+        });
+    }
+    let mut clauses = Vec::with_capacity(pk_predicates.len() + concurrency_predicates.len());
+    for pk in pk_predicates {
+        if pk.raw.as_ref().is_some_and(RawCellValue::is_null) || pk.display.is_null() {
+            return Err(StagingError::NullPrimaryKey {
+                schema: schema.to_owned(),
+                table: table.to_owned(),
+                row_label: row_label.to_owned(),
+            });
+        }
+        clauses.push(render_predicate_clause(engine, pk, true));
+    }
+    for col in concurrency_predicates {
+        clauses.push(render_predicate_clause(engine, col, false));
+    }
+    Ok(clauses.join(" AND "))
+}
+
+pub(crate) fn is_mysql_text_col(col: &ColumnMeta) -> bool {
+    matches!(
+        col.udt_name.trim().to_ascii_lowercase().as_str(),
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set"
+    )
+}
+
+fn render_predicate_clause(engine: DbEngine, val: &StagedColumnValue, is_pk: bool) -> String {
+    let quote = engine.quote_ident(&val.column.name);
+    if val.raw.as_ref().is_some_and(RawCellValue::is_null) || val.display.is_null() {
+        return format!("{quote} IS NULL");
+    }
+    match engine {
+        DbEngine::Postgres => {
+            let raw_text = match &val.raw {
+                Some(RawCellValue::Postgres(crate::engine::PostgresRawValue::Text(s))) => s.clone(),
+                _ => val.display.copy_text(),
+            };
+            if is_pk || val.column.udt_name == "bytea" {
+                let base = format!("{quote} = {}", format_pg_cell_literal(&val.column, &val.display));
+                if is_pk
+                    && matches!(
+                        val.column.udt_name.as_str(),
+                        "text" | "varchar" | "bpchar" | "name" | "citext"
+                    )
+                {
+                    format!(
+                        "{base} AND {quote}::text COLLATE \"C\" = '{}' COLLATE \"C\"",
+                        escape_sql_string(&raw_text)
+                    )
+                } else {
+                    base
+                }
+            } else {
+                format!(
+                    "{quote}::text COLLATE \"C\" = '{}' COLLATE \"C\"",
+                    escape_sql_string(&raw_text)
+                )
+            }
+        }
+        DbEngine::Mysql => {
+            let lit = format_mysql_cell_literal(&val.display);
+            if classify_column_type(&val.column) == LogicalColType::Json {
+                format!("{quote} = CAST({lit} AS JSON)")
+            } else if is_mysql_text_col(&val.column) {
+                let exact_eq = format!(
+                    "CAST(CONVERT({quote} USING utf8mb4) AS BINARY) = CAST(CONVERT({lit} USING utf8mb4) AS BINARY)"
+                );
+                if is_pk {
+                    format!("{quote} = {lit} AND {exact_eq}")
+                } else {
+                    exact_eq
+                }
+            } else {
+                format!("{quote} = {lit}")
+            }
+        }
+        DbEngine::Sqlite => {
+            if let Some(RawCellValue::Sqlite(raw)) = &val.raw {
+                let lhs = if matches!(raw, SqliteRawValue::Text(_) | SqliteRawValue::NonUtf8Text(_)) {
+                    format!("{quote} COLLATE BINARY")
+                } else {
+                    quote.clone()
+                };
+                format!(
+                    "{lhs} = {} AND typeof({quote}) = '{}'",
+                    format_sqlite_raw_literal(raw),
+                    raw.typeof_name()
+                )
+            } else {
+                let lit = format_sqlite_cell_literal(&val.display);
+                if lit.starts_with('\'') || lit.starts_with("char(") {
+                    format!("{quote} COLLATE BINARY = {lit}")
+                } else {
+                    format!("{quote} = {lit}")
+                }
+            }
+        }
+    }
+}
+
+fn format_sqlite_string_literal(raw: &str) -> String {
+    if !raw.contains('\0') {
+        return format!("'{}'", escape_sql_string(raw));
+    }
+    let mut parts = Vec::new();
+    let mut i = 0usize;
+    let bytes = raw.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == 0 {
+            let start = i;
+            while i < bytes.len() && bytes[i] == 0 {
+                i += 1;
+            }
+            let zeros = std::iter::repeat_n("0", i - start).collect::<Vec<_>>().join(", ");
+            parts.push(format!("char({zeros})"));
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i] != 0 {
+                i += 1;
+            }
+            parts.push(format!("'{}'", escape_sql_string(&raw[start..i])));
+        }
+    }
+    parts.join(" || ")
+}
+
+fn format_sqlite_raw_literal(raw: &SqliteRawValue) -> String {
+    match raw {
+        SqliteRawValue::Null => "NULL".to_owned(),
+        SqliteRawValue::Integer(i) => i.to_string(),
+        SqliteRawValue::Real(f) => {
+            if f.is_finite() {
+                let s = f.to_string();
+                if s.contains(['.', 'e', 'E']) {
+                    s
+                } else {
+                    format!("{s}.0")
+                }
+            } else {
+                format_sqlite_string_literal(&f.to_string())
+            }
+        }
+        SqliteRawValue::Text(s) => format_sqlite_string_literal(s),
+        SqliteRawValue::NonUtf8Text(bytes) => {
+            format!("CAST(X'{}' AS TEXT)", crate::engine::encode_hex(bytes))
+        }
+        SqliteRawValue::Blob(bytes) => format!("X'{}'", crate::engine::encode_hex(bytes)),
+    }
 }
 
 /// Escapes single quotes inside SQL string literals by doubling `'`.
@@ -554,7 +1018,43 @@ pub fn escape_mysql_string(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('\'', "''")
 }
 
-fn strip_hex_prefix(raw: &str) -> &str {
+/// Formats a MySQL text literal so embedded backslashes evaluate identically regardless of `NO_BACKSLASH_ESCAPES`.
+pub fn format_mysql_string_literal(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return format!("'{}'", escape_sql_string(raw));
+    }
+    let bytes = raw.as_bytes();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'\\' {
+                i += 1;
+            }
+            let count = i - start;
+            match count {
+                1 => parts.push("CHAR(92 USING utf8mb4)".to_owned()),
+                2 => parts.push("CHAR(92, 92 USING utf8mb4)".to_owned()),
+                n => parts.push(format!("REPEAT(CHAR(92 USING utf8mb4), {n})")),
+            }
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\\' {
+                i += 1;
+            }
+            let seg = &raw[start..i];
+            parts.push(format!("'{}'", escape_sql_string(seg)));
+        }
+    }
+    if parts.len() == 1 {
+        parts.pop().unwrap_or_else(|| "''".to_owned())
+    } else {
+        format!("CONCAT({})", parts.join(", "))
+    }
+}
+
+pub(crate) fn strip_hex_prefix(raw: &str) -> &str {
     raw.strip_prefix("\\x")
         .or_else(|| raw.strip_prefix("\\X"))
         .or_else(|| raw.strip_prefix("0x"))
@@ -638,7 +1138,7 @@ fn format_mysql_cell_literal(val: &CellValue) -> String {
             if f.is_finite() {
                 f.to_string()
             } else {
-                format!("'{}'", escape_mysql_string(&f.to_string()))
+                format_mysql_string_literal(&f.to_string())
             }
         }
         CellValue::Numeric(s) => {
@@ -646,7 +1146,7 @@ fn format_mysql_cell_literal(val: &CellValue) -> String {
             if is_plain_decimal(trimmed) {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_mysql_string(trimmed))
+                format_mysql_string_literal(trimmed)
             }
         }
         CellValue::Uuid(u) => format!("'{u}'"),
@@ -655,7 +1155,7 @@ fn format_mysql_cell_literal(val: &CellValue) -> String {
         | CellValue::Time(raw)
         | CellValue::Json(raw)
         | CellValue::Array(raw)
-        | CellValue::Text(raw) => format!("'{}'", escape_mysql_string(raw)),
+        | CellValue::Text(raw) => format_mysql_string_literal(raw),
         CellValue::Bytes(bytes) => format!("X'{}'", crate::engine::encode_hex(bytes)),
     }
 }
@@ -669,7 +1169,7 @@ fn format_sqlite_cell_literal(val: &CellValue) -> String {
             if f.is_finite() {
                 f.to_string()
             } else {
-                format!("'{}'", escape_sql_string(&f.to_string()))
+                format_sqlite_string_literal(&f.to_string())
             }
         }
         CellValue::Numeric(s) => {
@@ -677,7 +1177,7 @@ fn format_sqlite_cell_literal(val: &CellValue) -> String {
             if is_plain_decimal(trimmed) {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_sql_string(trimmed))
+                format_sqlite_string_literal(trimmed)
             }
         }
         CellValue::Uuid(u) => format!("'{u}'"),
@@ -686,7 +1186,7 @@ fn format_sqlite_cell_literal(val: &CellValue) -> String {
         | CellValue::Time(raw)
         | CellValue::Json(raw)
         | CellValue::Array(raw)
-        | CellValue::Text(raw) => format!("'{}'", escape_sql_string(raw)),
+        | CellValue::Text(raw) => format_sqlite_string_literal(raw),
         CellValue::Bytes(bytes) => format!("X'{}'", crate::engine::encode_hex(bytes)),
     }
 }
@@ -697,27 +1197,27 @@ fn format_raw_mysql_literal(col: &ColumnMeta, raw: &str) -> String {
         LogicalColType::Bool => match trimmed.to_ascii_lowercase().as_str() {
             "true" | "t" | "1" | "yes" | "y" | "on" => "TRUE".to_owned(),
             "false" | "f" | "0" | "no" | "n" | "off" => "FALSE".to_owned(),
-            _ => format!("'{}'", escape_mysql_string(trimmed)),
+            _ => format_mysql_string_literal(trimmed),
         },
         LogicalColType::Int => {
             if trimmed.parse::<i64>().is_ok() {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_mysql_string(trimmed))
+                format_mysql_string_literal(trimmed)
             }
         }
         LogicalColType::Float => {
             if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_mysql_string(trimmed))
+                format_mysql_string_literal(trimmed)
             }
         }
         LogicalColType::Numeric => {
             if is_plain_decimal(trimmed) {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_mysql_string(trimmed))
+                format_mysql_string_literal(trimmed)
             }
         }
         LogicalColType::Bytes => {
@@ -725,17 +1225,17 @@ fn format_raw_mysql_literal(col: &ColumnMeta, raw: &str) -> String {
             if hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 format!("X'{hex}'")
             } else {
-                format!("'{}'", escape_mysql_string(raw))
+                format_mysql_string_literal(raw)
             }
         }
         LogicalColType::Json | LogicalColType::Text | LogicalColType::Array => {
-            format!("'{}'", escape_mysql_string(raw))
+            format_mysql_string_literal(raw)
         }
         LogicalColType::Date
         | LogicalColType::Time
         | LogicalColType::Timestamp
         | LogicalColType::TimestampTz
-        | LogicalColType::Uuid => format!("'{}'", escape_mysql_string(trimmed)),
+        | LogicalColType::Uuid => format_mysql_string_literal(trimmed),
     }
 }
 
@@ -745,27 +1245,27 @@ fn format_raw_sqlite_literal(col: &ColumnMeta, raw: &str) -> String {
         LogicalColType::Bool => match trimmed.to_ascii_lowercase().as_str() {
             "true" | "t" | "1" | "yes" | "y" | "on" => "1".to_owned(),
             "false" | "f" | "0" | "no" | "n" | "off" => "0".to_owned(),
-            _ => format!("'{}'", escape_sql_string(trimmed)),
+            _ => format_sqlite_string_literal(trimmed),
         },
         LogicalColType::Int => {
             if trimmed.parse::<i64>().is_ok() {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_sql_string(trimmed))
+                format_sqlite_string_literal(trimmed)
             }
         }
         LogicalColType::Float => {
             if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_sql_string(trimmed))
+                format_sqlite_string_literal(trimmed)
             }
         }
         LogicalColType::Numeric => {
             if is_plain_decimal(trimmed) {
                 trimmed.to_owned()
             } else {
-                format!("'{}'", escape_sql_string(trimmed))
+                format_sqlite_string_literal(trimmed)
             }
         }
         LogicalColType::Bytes => {
@@ -773,17 +1273,17 @@ fn format_raw_sqlite_literal(col: &ColumnMeta, raw: &str) -> String {
             if hex.len().is_multiple_of(2) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 format!("X'{hex}'")
             } else {
-                format!("'{}'", escape_sql_string(raw))
+                format_sqlite_string_literal(raw)
             }
         }
         LogicalColType::Json | LogicalColType::Text | LogicalColType::Array => {
-            format!("'{}'", escape_sql_string(raw))
+            format_sqlite_string_literal(raw)
         }
         LogicalColType::Date
         | LogicalColType::Time
         | LogicalColType::Timestamp
         | LogicalColType::TimestampTz
-        | LogicalColType::Uuid => format!("'{}'", escape_sql_string(trimmed)),
+        | LogicalColType::Uuid => format_sqlite_string_literal(trimmed),
     }
 }
 
@@ -920,6 +1420,11 @@ mod tests {
         ];
 
         assert_eq!(escape_mysql_string(r"a\b'c"), r"a\\b''c");
+        assert_eq!(
+            format_mysql_string_literal(r"a\b'c"),
+            "CONCAT('a', CHAR(92 USING utf8mb4), 'b''c')"
+        );
+        assert!(!format_mysql_string_literal(r"\\a\b").contains('\\'));
 
         let mut staged = StagedChanges::new();
         let row0 = vec![
@@ -937,14 +1442,15 @@ mod tests {
             .build_transaction_sql_for_engine(DbEngine::Mysql, "greendale", "students", &cols)
             .expect("mysql tx");
         assert!(mysql_tx.starts_with("START TRANSACTION;\n"));
-        assert!(mysql_tx.contains("UPDATE `greendale`.`students` SET `active` = FALSE, `note` = 'it''s \\\\ok' WHERE `id` = 1;"));
+        assert!(mysql_tx.contains("UPDATE `greendale`.`students` SET `active` = FALSE, `note` = CONCAT('it''s ', CHAR(92 USING utf8mb4), 'ok') WHERE `id` = 1 AND `active` = TRUE AND CAST(CONVERT(`note` USING utf8mb4) AS BINARY) = CAST(CONVERT('hi' USING utf8mb4) AS BINARY) AND `badge` = X'cafe';"));
+        assert!(!mysql_tx.contains('\\'));
         assert!(mysql_tx.contains("INSERT INTO `greendale`.`students` (`active`, `note`, `badge`) VALUES (NULL, NULL, NULL);"));
 
         let sqlite_tx = staged
             .build_transaction_sql_for_engine(DbEngine::Sqlite, "", "students", &cols)
             .expect("sqlite tx");
         assert!(sqlite_tx.starts_with("BEGIN;\n"));
-        assert!(sqlite_tx.contains("UPDATE \"students\" SET \"active\" = 0, \"note\" = 'it''s \\ok' WHERE \"id\" = 1;"));
+        assert!(sqlite_tx.contains("UPDATE \"students\" SET \"active\" = 0, \"note\" = 'it''s \\ok' WHERE \"id\" = 1 AND \"active\" = 1 AND \"note\" COLLATE BINARY = 'hi' AND \"badge\" = X'cafe';"));
 
         let mut default_only = StagedChanges::new();
         default_only.stage_insert_row(&[col("id", "int", true, Some("1"))]);

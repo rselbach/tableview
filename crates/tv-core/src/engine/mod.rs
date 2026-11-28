@@ -117,7 +117,17 @@ pub struct IndexInfo {
     pub definition: String,
 }
 
-/// Relation size estimates, comment, and synthesized DDL for a database object.
+/// Relation size estimates, transaction capability, comment, and synthesized DDL for a database object.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TableTransactionSupport {
+    #[default]
+    Supported,
+    Unsupported {
+        engine: String,
+    },
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableStats {
     pub total_bytes: Option<i64>,
@@ -126,6 +136,7 @@ pub struct TableStats {
     pub estimated_rows: Option<i64>,
     pub comment: Option<String>,
     pub ddl: String,
+    pub transaction_support: TableTransactionSupport,
 }
 
 /// Complete structural inspection payload for the Structure and Indexes views and inspector details.
@@ -154,17 +165,103 @@ pub struct PageRequest {
     pub offset: i64,
 }
 
-/// One page of rows decoded into typed [`CellValue`]s alongside column definitions and timing.
+/// Raw wire/storage value preserved per engine so staged writes bind exact identity & concurrency tokens.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SqliteRawValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    NonUtf8Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl SqliteRawValue {
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    pub const fn typeof_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Integer(_) => "integer",
+            Self::Real(_) => "real",
+            Self::Text(_) | Self::NonUtf8Text(_) => "text",
+            Self::Blob(_) => "blob",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PostgresRawValue {
+    Null,
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MysqlRawValue {
+    Null,
+    Int(i64),
+    UInt(u64),
+    Float(f32),
+    Double(f64),
+    Bytes(Vec<u8>),
+    Date {
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        micros: u32,
+    },
+    Time {
+        neg: bool,
+        days: u32,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        micros: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RawCellValue {
+    Sqlite(SqliteRawValue),
+    Postgres(PostgresRawValue),
+    Mysql(MysqlRawValue),
+}
+
+impl RawCellValue {
+    pub const fn is_null(&self) -> bool {
+        match self {
+            Self::Sqlite(v) => v.is_null(),
+            Self::Postgres(v) => matches!(v, PostgresRawValue::Null),
+            Self::Mysql(v) => matches!(v, MysqlRawValue::Null),
+        }
+    }
+}
+
+/// One page of rows decoded into typed [`CellValue`]s alongside raw snapshots, columns, and timing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TablePage {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<CellValue>>,
+    pub raw_rows: Vec<Vec<RawCellValue>>,
+    pub transaction_support: TableTransactionSupport,
     pub offset: i64,
     pub limit: i64,
     pub total_rows_estimate: Option<i64>,
     pub total_is_exact: bool,
     pub has_more: bool,
     pub elapsed_ms: u64,
+}
+
+impl TablePage {
+    pub fn raw_row(&self, idx: usize) -> Option<&[RawCellValue]> {
+        self.raw_rows.get(idx).map(Vec::as_slice)
+    }
 }
 
 /// Typed representation of a PostgreSQL column cell preserving `NULL` vs empty strings and wire semantics.
@@ -350,7 +447,7 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn decode_hex(raw: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(raw: &str) -> Option<Vec<u8>> {
     let hex = raw.strip_prefix("\\x").unwrap_or(raw);
     if !hex.len().is_multiple_of(2) {
         return None;
@@ -419,6 +516,13 @@ pub enum DbError {
     MysqlModeMismatch,
     #[error("PostgreSQL string escaping mode changed before dispatch; re-run to inspect under the current mode")]
     PostgresStringModeMismatch,
+    #[error("{0}")]
+    StaleRowConflict(String),
+    #[error("{message}")]
+    NonTransactionalTable {
+        support: TableTransactionSupport,
+        message: String,
+    },
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -610,6 +714,10 @@ pub trait DbSession: Send + Sync {
     async fn execute_transaction(
         &self,
         statements: &[String],
+    ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError>;
+    async fn execute_staged_mutations(
+        &self,
+        batch: &crate::staging::StagedCommitBatch,
     ) -> Result<(TransactionOutcome, Vec<ExecutedSql>), DbError>;
     async fn explain_sql(&self, statement: &str, analyze: bool) -> Result<(ExplainPlan, ExecutedSql), DbError>;
     /// Explains SQL after verifying that any live MySQL quote mode/version or PostgreSQL

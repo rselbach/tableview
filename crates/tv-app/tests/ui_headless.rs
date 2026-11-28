@@ -20,8 +20,9 @@ use tv_core::{
     AppearancePreference, CellValue, ColumnMeta, ColumnSummary, ConnectionProfile, ConnectionStore, DatabaseInfo,
     DbEngine, DbError, DbObject, DbObjectKind, DbSession, EnvTag, ExecutedSql, ExplainPlan, ExportFormat, FkPeekRow,
     ForeignKeyRef, IndexInfo, MysqlQuoteMode, PageRequest, PasswordMode, PostgresSessionMode, QueryBatchResult,
-    QueryStatementResult, SafetyPolicy, SchemaInfo, ServerInfo, SettingsStore, SqlSessionMode, StoreData, TablePage,
-    TableStats, TableStructure, TransactionOutcome, connect_session,
+    QueryStatementResult, RawCellValue, SafetyPolicy, SchemaInfo, ServerInfo, SettingsStore, SqlSessionMode,
+    SqliteRawValue, StagedCommitBatch, StoreData, TablePage, TableStats, TableStructure, TableTransactionSupport,
+    TransactionOutcome, connect_session,
 };
 use tv_update::{UpdateFailure, UpdateStatus};
 
@@ -2616,6 +2617,11 @@ struct MockSession {
     objects_delay_once: Mutex<Option<Duration>>,
     columns_delay_once: Mutex<Option<Duration>>,
     columns_override: Mutex<Option<Vec<ColumnSummary>>>,
+    table_tx_support: Mutex<TableTransactionSupport>,
+    rows_override: Mutex<Option<Vec<Vec<CellValue>>>>,
+    raw_rows_override: Mutex<Option<Vec<Vec<RawCellValue>>>>,
+    fail_next_staged_commit: Mutex<Option<DbError>>,
+    last_staged_batch: Mutex<Option<StagedCommitBatch>>,
     cancelled_keys: Mutex<Vec<u64>>,
     executed_batches: Mutex<Vec<Vec<String>>>,
     ping_calls: AtomicUsize,
@@ -2660,6 +2666,11 @@ impl MockSession {
             objects_delay_once: Mutex::new(None),
             columns_delay_once: Mutex::new(None),
             columns_override: Mutex::new(None),
+            table_tx_support: Mutex::new(TableTransactionSupport::Supported),
+            rows_override: Mutex::new(None),
+            raw_rows_override: Mutex::new(None),
+            fail_next_staged_commit: Mutex::new(None),
+            last_staged_batch: Mutex::new(None),
             cancelled_keys: Mutex::new(Vec::new()),
             executed_batches: Mutex::new(Vec::new()),
             ping_calls: AtomicUsize::new(0),
@@ -3185,7 +3196,11 @@ impl DbSession for MockSession {
                 tokio::time::sleep(delay).await;
             }
             let columns = mock_columns_for(&req.table);
-            let rows = if req.table == "courses" {
+            let rows = if let Some(custom) =
+                self.rows_override.lock().expect("rows_override lock").clone()
+            {
+                custom
+            } else if req.table == "courses" {
                 vec![vec![CellValue::Int(101), CellValue::Text("Spanish 101".to_owned())]]
             } else {
                 vec![
@@ -3193,12 +3208,25 @@ impl DbSession for MockSession {
                     vec![CellValue::Int(2), CellValue::Text("Abed Nadir".to_owned())],
                 ]
             };
+            let raw_rows = self
+                .raw_rows_override
+                .lock()
+                .expect("raw_rows_override lock")
+                .clone()
+                .unwrap_or_default();
+            let transaction_support = self
+                .table_tx_support
+                .lock()
+                .expect("table_tx_support lock")
+                .clone();
             let len = rows.len() as i64;
             let sql = format!("SELECT * FROM \"{}\".\"{}\"", req.schema, req.table);
             Ok((
                 TablePage {
                     columns,
                     rows,
+                    raw_rows,
+                    transaction_support,
                     offset: req.offset,
                     limit: req.limit,
                     total_rows_estimate: Some(len),
@@ -3250,6 +3278,11 @@ impl DbSession for MockSession {
                         estimated_rows: Some(2),
                         comment: None,
                         ddl: format!("CREATE TABLE \"{schema}\".\"{table}\" ();"),
+                        transaction_support: self
+                            .table_tx_support
+                            .lock()
+                            .expect("table_tx_support lock")
+                            .clone(),
                     },
                 },
                 vec![ExecutedSql {
@@ -3703,6 +3736,87 @@ impl DbSession for MockSession {
                 TransactionOutcome {
                     statements_executed: statements.len(),
                     total_rows_affected: statements.len() as u64,
+                    elapsed_ms: 2,
+                },
+                logs,
+            ))
+        })
+    }
+
+    fn execute_staged_mutations<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        batch: &'life1 StagedCommitBatch,
+    ) -> BoxFuture<'async_trait, Result<(TransactionOutcome, Vec<ExecutedSql>), DbError>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            *self
+                .last_staged_batch
+                .lock()
+                .expect("last_staged_batch lock") = Some(batch.clone());
+            self.tx_calls.fetch_add(1, Ordering::AcqRel);
+            self.check_transport()?;
+            if let Some(err) = self
+                .fail_next_staged_commit
+                .lock()
+                .expect("fail_next_staged_commit lock")
+                .take()
+            {
+                return Err(err);
+            }
+            if self.engine == DbEngine::Mysql {
+                let support = self
+                    .table_tx_support
+                    .lock()
+                    .expect("table_tx_support lock")
+                    .clone();
+                match &support {
+                    TableTransactionSupport::Supported => {}
+                    TableTransactionSupport::Unsupported { engine } => {
+                        let message = format!("non-transactional engine '{engine}'");
+                        return Err(DbError::NonTransactionalTable { support, message });
+                    }
+                    TableTransactionSupport::Unknown => {
+                        return Err(DbError::NonTransactionalTable {
+                            support,
+                            message: "unverified transactional storage engine".to_owned(),
+                        });
+                    }
+                }
+            }
+            let stmts = batch
+                .render_sql(self.engine)
+                .map_err(|e| DbError::InvalidInput(e.to_string()))?;
+            if self.engine == DbEngine::Postgres
+                && let Some(ref mut mode) = *self
+                    .postgres_session_mode
+                    .lock()
+                    .expect("postgres_session_mode lock")
+            {
+                mode.tx_state = Some(tv_core::PostgresTxState::Idle);
+                if let Some(sess) = mode.session_standard_conforming_strings {
+                    mode.standard_conforming_strings = sess;
+                }
+                mode.pre_tx_standard_conforming_strings =
+                    mode.session_standard_conforming_strings;
+                mode.savepoints.clear();
+                mode.has_untracked_savepoints = false;
+            }
+            let logs = stmts
+                .iter()
+                .map(|sql| ExecutedSql {
+                    sql: sql.clone(),
+                    duration_ms: 1,
+                    error: None,
+                })
+                .collect();
+            Ok((
+                TransactionOutcome {
+                    statements_executed: batch.mutations.len(),
+                    total_rows_affected: batch.mutations.len() as u64,
                     elapsed_ms: 2,
                 },
                 logs,
@@ -9744,4 +9858,243 @@ fn profile_edits_bind_active_session_and_guard_pending_writes() {
             .and_then(|(pw, _)| pw.as_deref()),
         None
     );
+}
+
+#[test]
+fn nontransactional_tables_null_pk_and_stale_conflicts_guard_staged_edits() {
+    // 1. Non-transactional MySQL table (MyISAM) surfaces banner and blocks staged writes before sending any SQL.
+    let mut mysql_profile = ConnectionProfile::new_mysql("greendale_mysql", "127.0.0.1", "troy_barnes");
+    mysql_profile.database = Some("greendale".to_owned());
+    let mysql_id = mysql_profile.id;
+
+    let sqlite_dir = tempfile::tempdir().expect("tempdir");
+    let sqlite_profile =
+        ConnectionProfile::new_sqlite("greendale_sqlite", sqlite_dir.path().join("identity.db"));
+    let sqlite_id = sqlite_profile.id;
+
+    let cluster = MockCluster::new(Duration::ZERO);
+    let mut state = AppState::init_in_memory(StoreData {
+        connections: vec![mysql_profile, sqlite_profile],
+        ..StoreData::default()
+    });
+    state.appearance = ColorScheme::Dark;
+    state.worker = Some(WorkerBridge::spawn_with_connector(cluster.connector()).expect("spawn worker"));
+    let mut rt = Runtime::new(state, views::view, (1280.0, 800.0), Env::new(true, 1.0));
+    rt.on_key = Some(tv_app::platform::handle_global_key);
+    rt.poll = Some(AppState::poll);
+
+    rt.update(|s, tx| s.start_or_focus_connection(mysql_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .is_some_and(|sess| matches!(sess.status, ConnectionState::Connected(_)))
+    });
+    let mysql_mock = cluster.latest_session();
+    *mysql_mock
+        .table_tx_support
+        .lock()
+        .expect("table_tx_support") = TableTransactionSupport::Unsupported {
+        engine: "MyISAM".to_owned(),
+    };
+
+    rt.update(|s, tx| s.select_object("greendale".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+    rt.update(|s, _| s.select_table_cell(RowKey::Existing(0), 1));
+    rt.frame(0.1);
+    assert!(rt.find("table-nontransactional-banner").is_some());
+    assert!(rt.elements().iter().any(|e| {
+        e.text
+            .as_deref()
+            .is_some_and(|t| t.contains("MyISAM") && t.contains("non-transactional"))
+    }));
+    rt.update(|s, tx| {
+        assert!(!s.insert_staged_row(tx));
+        assert!(!s.begin_cell_edit(RowKey::Existing(0), 1, tx));
+        s.stage_cell_null(RowKey::Existing(0), 1);
+        s.toggle_delete_row(RowKey::Existing(0));
+    });
+    let my_tab = rt
+        .state
+        .active_session()
+        .expect("mysql session")
+        .active_table_tab()
+        .expect("mysql table tab");
+    assert!(my_tab.staged.is_empty());
+    assert!(
+        rt.state
+            .status_notice
+            .as_ref()
+            .is_some_and(|n| n.message.contains("MyISAM"))
+    );
+    assert_eq!(mysql_mock.tx_calls.load(Ordering::Acquire), 0);
+
+    // 1b. Table initially loads as Supported, user stages an edit, and commit recheck detects switch
+    // to MyISAM: tab immediately updates to Unsupported, renders banner, blocks edits, and keeps drafts.
+    *mysql_mock
+        .table_tx_support
+        .lock()
+        .expect("table_tx_support") = TableTransactionSupport::Supported;
+    rt.update(|s, tx| s.select_object("greendale".to_owned(), "grades".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| t.object_name == "grades" && !t.page_loading && t.page.is_some())
+    });
+    rt.frame(0.1);
+    assert!(rt.find("table-nontransactional-banner").is_none());
+
+    rt.update(|s, tx| {
+        assert!(s.begin_cell_edit(RowKey::Existing(0), 1, tx));
+        if let Some(tab) = s.active_session_mut().and_then(SessionState::active_table_tab_mut)
+            && let Some(ref mut edit) = tab.editing_cell
+        {
+            edit.edit = rune::TextEdit::new("Dean Pelton");
+        }
+        s.commit_inline_cell_edit();
+    });
+    *mysql_mock
+        .fail_next_staged_commit
+        .lock()
+        .expect("fail_next_staged_commit") = Some(DbError::NonTransactionalTable {
+        support: TableTransactionSupport::Unsupported {
+            engine: "MyISAM".to_owned(),
+        },
+        message: "Table `greendale`.`grades` uses non-transactional storage engine 'MyISAM'; staged commits require a transactional engine (such as InnoDB).".to_owned(),
+    });
+    rt.update(|s, _| s.commit_staged_changes());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.committing)
+    });
+    rt.frame(0.1);
+    let grades_tab = rt
+        .state
+        .active_session()
+        .expect("mysql session")
+        .active_table_tab()
+        .expect("grades table tab");
+    assert_eq!(
+        grades_tab.transaction_support(),
+        TableTransactionSupport::Unsupported {
+            engine: "MyISAM".to_owned(),
+        }
+    );
+    assert_eq!(grades_tab.staged.update_count(), 1);
+    assert!(grades_tab.diff_drawer_open);
+    assert!(
+        grades_tab
+            .commit_error
+            .as_deref()
+            .is_some_and(|e| e.contains("MyISAM"))
+    );
+    assert!(rt.find("table-nontransactional-banner").is_some());
+    rt.update(|s, tx| {
+        assert!(!s.begin_cell_edit(RowKey::Existing(0), 1, tx));
+    });
+
+    // 2. SQLite table with NULL-PK row rejects edits on NULL-PK row while allowing valid non-NULL PK row,
+    // and StaleRowConflict preserves staged edits for user review.
+    rt.update(|s, tx| s.start_or_focus_connection(sqlite_id, None, None, tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state.active_session().is_some_and(|sess| {
+            sess.profile.id == sqlite_id && matches!(sess.status, ConnectionState::Connected(_))
+        })
+    });
+    let sqlite_mock = cluster.latest_session();
+    *sqlite_mock.rows_override.lock().expect("rows_override") = Some(vec![
+        vec![CellValue::Null, CellValue::Text("Nullable Chang".to_owned())],
+        vec![CellValue::Int(1), CellValue::Text("Troy Barnes".to_owned())],
+    ]);
+    *sqlite_mock
+        .raw_rows_override
+        .lock()
+        .expect("raw_rows_override") = Some(vec![
+        vec![
+            RawCellValue::Sqlite(SqliteRawValue::Null),
+            RawCellValue::Sqlite(SqliteRawValue::Text("Nullable Chang".to_owned())),
+        ],
+        vec![
+            RawCellValue::Sqlite(SqliteRawValue::Integer(1)),
+            RawCellValue::Sqlite(SqliteRawValue::Text("Troy Barnes".to_owned())),
+        ],
+    ]);
+
+    rt.update(|s, tx| s.select_object("main".to_owned(), "students".to_owned(), tx));
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.page_loading && t.page.is_some())
+    });
+
+    rt.update(|s, tx| {
+        assert!(!s.begin_cell_edit(RowKey::Existing(0), 1, tx));
+        s.toggle_delete_row(RowKey::Existing(0));
+    });
+    assert!(
+        rt.state
+            .status_notice
+            .as_ref()
+            .is_some_and(|n| n.message.contains("NULL")),
+        "expected NULL PK rejection notice, got {:?}",
+        rt.state.status_notice
+    );
+    assert!(
+        rt.state
+            .active_session()
+            .expect("sqlite session")
+            .active_table_tab()
+            .expect("sqlite tab")
+            .staged
+            .is_empty()
+    );
+
+    // Valid non-NULL PK row can be staged, and StaleRowConflict preserves drafts cleanly.
+    rt.update(|s, tx| {
+        assert!(s.begin_cell_edit(RowKey::Existing(1), 1, tx));
+        if let Some(tab) = s.active_session_mut().and_then(SessionState::active_table_tab_mut)
+            && let Some(ref mut edit) = tab.editing_cell
+        {
+            edit.edit = rune::TextEdit::new("Troy 'T-Bone' Barnes");
+        }
+        s.commit_inline_cell_edit();
+    });
+    *sqlite_mock
+        .fail_next_staged_commit
+        .lock()
+        .expect("fail_next_staged_commit") = Some(DbError::StaleRowConflict(
+        "Staged update (student_id=1) matched 0 rows: the row was modified or deleted since it was loaded."
+            .to_owned(),
+    ));
+    rt.update(|s, _| s.commit_staged_changes());
+    poll_until(&mut rt, Duration::from_secs(3), |rt| {
+        rt.state
+            .active_session()
+            .and_then(SessionState::active_table_tab)
+            .is_some_and(|t| !t.committing)
+    });
+
+    let sl_tab = rt
+        .state
+        .active_session()
+        .expect("sqlite session")
+        .active_table_tab()
+        .expect("sqlite tab");
+    assert_eq!(sl_tab.staged.update_count(), 1);
+    assert!(sl_tab.diff_drawer_open);
+    assert!(
+        sl_tab
+            .commit_error
+            .as_deref()
+            .is_some_and(|e| e.contains("matched 0 rows"))
+    );
+    assert_eq!(sqlite_mock.tx_calls.load(Ordering::Acquire), 1);
 }
